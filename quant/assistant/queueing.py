@@ -1,0 +1,525 @@
+"""排队 / 后台 worker / 数据刷新（自 research.py 逐字搬迁，docs/重构计划.md 阶段 1）。
+
+跨模块名字来源约定：定义在 research.py 的常量与工具（DATA_DIR、RUNS_DIR、
+ASSISTANT_RESULTS_DIR、_now、_run_id、_process_exists、_universe、_jsonable、
+_fetch_summary）经 ``research.`` 属性访问，使 patch.object(research, ...)
+对搬入的函数继续生效；_data_file 来自 data_layer，其余名字为模块内自有或
+直接来自 paths/config/scripts。
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+from . import research
+from .config import config_snapshot
+from .data_layer import _data_file
+from .paths import atomic_write_json, read_json, run_directory, validate_symbol
+
+try:
+    from scripts.fetch_state import FetchState
+    from scripts.fetch_targets import asset_target_dates
+    from scripts.universe import load_asset_metadata
+except ImportError:
+    scripts_root = Path(__file__).resolve().parents[1] / "scripts"
+    if str(scripts_root) not in sys.path:
+        sys.path.insert(0, str(scripts_root))
+    from fetch_state import FetchState
+    from fetch_targets import asset_target_dates
+    from universe import load_asset_metadata
+
+def _fetch_state(config: Mapping[str, Any]) -> FetchState:
+    configured = config.get("fetch", {}).get(
+        "state_db",
+        research.DATA_DIR / "fetch_state.sqlite3",
+    )
+    return FetchState(Path(str(configured)))
+
+
+def _target_dates_for_job(
+    asset_types: Iterable[str],
+    target_date: str,
+    config: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None = None,
+ ) -> dict[str, str]:
+    selected_types = tuple(str(value) for value in asset_types)
+    configured = (metadata or {}).get("target_dates")
+    if isinstance(configured, Mapping) and all(
+        asset_type in configured for asset_type in selected_types
+    ):
+        return {
+            asset_type: str(configured[asset_type])
+            for asset_type in selected_types
+        }
+    return asset_target_dates(
+        selected_types,
+        target_date,
+        lag_trading_days=config.get("fetch", {}).get(
+            "target_lag_trading_days",
+            {},
+        ),
+    )
+
+
+def _cached_end_date(asset_type: str, symbol: str) -> str | None:
+    path = _data_file(asset_type, symbol)
+    metadata = load_asset_metadata(path) if path.exists() else {}
+    cached = metadata.get("data_end_date") if isinstance(metadata, Mapping) else None
+    if cached:
+        return str(cached)
+    if not path.exists():
+        return None
+    try:
+        frame = pd.read_csv(path)
+        date_column = next(
+            (
+                column
+                for column in frame.columns
+                if str(column).strip() in {"date", "日期", "净值日期"}
+            ),
+            None,
+        )
+        if date_column is None:
+            return None
+        latest = pd.to_datetime(frame[date_column], errors="coerce").max()
+        return None if pd.isna(latest) else latest.date().isoformat()
+    except Exception:
+        return None
+
+
+def _normalize_symbol_routes(
+    asset_types: Iterable[str],
+    symbols_by_type: Mapping[str, Iterable[str]],
+ ) -> dict[str, list[str]]:
+    return {
+        asset_type: sorted(
+            {validate_symbol(symbol) for symbol in symbols_by_type.get(asset_type, [])}
+        )
+        for asset_type in asset_types
+        if symbols_by_type.get(asset_type)
+    }
+
+
+def _queue_research(
+    *,
+    mode: str,
+    asset_scope: str,
+    asset_types: tuple[str, ...],
+    config: Mapping[str, Any],
+    symbols_by_type: Mapping[str, Iterable[str]] | None = None,
+    target_date: str | None = None,
+    start_background_worker: bool = True,
+) -> dict[str, Any]:
+    """Persist a research request without holding the MCP call open."""
+    state = _fetch_state(config)
+    full_universe = symbols_by_type is None
+    requested_routes = (
+        {}
+        if full_universe
+        else _normalize_symbol_routes(asset_types, symbols_by_type)
+    )
+    selected_types = (
+        asset_types
+        if full_universe
+        else tuple(
+            asset_type for asset_type in asset_types if requested_routes.get(asset_type)
+        )
+    )
+    if not selected_types:
+        raise ValueError("no requested symbols matched the selected asset scope")
+    effective_target_date = str(target_date or research._now().date().isoformat())
+    try:
+        datetime.fromisoformat(effective_target_date).date()
+    except ValueError as exc:
+        raise ValueError(f"invalid target_date: {effective_target_date}") from exc
+    requested_target_dates = _target_dates_for_job(
+        selected_types, effective_target_date, config
+    )
+    for existing in state.list_jobs(limit=50):
+        if not existing or existing.get("kind") != "research":
+            continue
+        if existing.get("status") not in {"queued", "running", "partial"}:
+            continue
+        metadata = existing.get("metadata", {})
+        if (
+            metadata.get("asset_scope") != asset_scope
+            or metadata.get("mode") != mode
+            or bool(metadata.get("full_universe", True)) != full_universe
+        ):
+            continue
+        existing_target_date = metadata.get("target_date")
+        if str(existing_target_date or "") != effective_target_date:
+            continue
+        existing_routes = {
+            asset_type: list(values)
+            for asset_type, values in metadata.get("symbols", {}).items()
+        }
+        if not full_universe and existing_routes != requested_routes:
+            continue
+        existing_id = str(existing["job_id"])
+        effective_target_dates = _target_dates_for_job(
+            selected_types,
+            effective_target_date,
+            config,
+            metadata,
+        )
+        if metadata.get("target_dates") != effective_target_dates:
+            metadata = {**metadata, "target_dates": effective_target_dates}
+            state.update_job(existing_id, metadata=metadata)
+        progress = state.progress(
+            selected_types,
+            symbols=existing_routes,
+            target_date=effective_target_dates,
+            max_age_days=int(config["fetch"]["max_data_age_days"]),
+        )
+        existing_status = read_json(run_directory(existing_id) / "status.json", {})
+        worker_pid = int(existing_status.get("worker_pid", 0) or 0)
+        if existing.get("status") == "running" and research._process_exists(worker_pid):
+            worker_info = {"started": False, "reason": "already_running", "pid": worker_pid}
+        else:
+            worker_info = (
+                _start_background_worker(existing_id, config)
+                if start_background_worker
+                else {"started": False, "reason": "caller_will_start_worker"}
+            )
+        scope_label = "全市场" if full_universe else "定向"
+        return research._jsonable(
+            {
+                "run_id": existing_id,
+                "job_id": existing_id,
+                "status": existing.get("status", "queued"),
+                "phase": existing_status.get("phase", "cache_check"),
+                "completed": progress.get("completed", 0),
+                "pending": progress.get("pending", 0),
+                "failed": progress.get("failed", 0),
+                "coverage": progress.get("coverage", 0.0),
+                "target_date": effective_target_date,
+                "target_dates": effective_target_dates,
+                "result_path": str(run_directory(existing_id)),
+                "current_path": str(research.ASSISTANT_RESULTS_DIR / "current.json"),
+                "message": f"已有同范围{scope_label}任务在推进，已复用原 run_id。",
+                "worker": worker_info,
+            }
+        )
+    run_id = research._run_id()
+    started = research._now()
+    run_dir = (
+        research.RUNS_DIR
+        / started.strftime("%Y")
+        / started.strftime("%m")
+        / started.strftime("%d")
+        / run_id
+    )
+    run_dir.mkdir(parents=True, exist_ok=False)
+    if full_universe:
+        routes: dict[str, list[str]] = {}
+        for asset_type in selected_types:
+            routes[asset_type] = research._universe(asset_type, None)
+            state.register_assets(asset_type, routes[asset_type])
+    else:
+        routes = requested_routes
+        for asset_type, scoped_symbols in routes.items():
+            cached_end_dates = {
+                symbol: _cached_end_date(asset_type, symbol)
+                for symbol in scoped_symbols
+            }
+            state.register_assets(
+                asset_type, scoped_symbols, data_end_dates=cached_end_dates
+            )
+    target_dates = requested_target_dates
+    progress = state.progress(
+        selected_types,
+        symbols=routes,
+        target_date=target_dates,
+        max_age_days=int(config["fetch"]["max_data_age_days"]),
+    )
+    state.create_job(
+        run_id,
+        kind="research",
+        asset_scope=asset_scope,
+        metadata={
+            "mode": mode,
+            "asset_scope": asset_scope,
+            "asset_types": list(selected_types),
+            "symbols": routes,
+            "full_universe": full_universe,
+            "target_date": effective_target_date,
+            "target_dates": target_dates,
+            "phase": "cache_check",
+        },
+    )
+    state.update_job(
+        run_id,
+        total=progress["total"],
+        completed=progress["completed"],
+        pending=progress["pending"],
+        failed=progress["failed"],
+        stale=progress["stale"],
+        coverage=progress["coverage"],
+    )
+    status = {
+        "run_id": run_id,
+        "job_id": run_id,
+        "status": "queued",
+        "started_at": started.isoformat(),
+        "asset_scope": asset_scope,
+        "asset_types": list(selected_types),
+        "full_universe": full_universe,
+        "target_date": effective_target_date,
+        "target_dates": target_dates,
+        "phase": "cache_check",
+        "completed": progress["completed"],
+        "pending": progress["pending"],
+        "failed": progress["failed"],
+        "coverage": progress["coverage"],
+        "progress_seq": 0,
+        "last_progress_at": started.isoformat(),
+        "last_heartbeat_at": started.isoformat(),
+        "result_path": str(run_dir),
+        "message": (
+            "全市场请求已入队；后台会按批次推进。"
+            if full_universe
+            else "定向请求已入队；后台只会检查和刷新指定代码。"
+        ),
+    }
+    atomic_write_json(run_dir / "status.json", status)
+    atomic_write_json(
+        run_dir / "manifest.json",
+        {
+            "run_id": run_id,
+            "job_id": run_id,
+            "status": "queued",
+            "started_at": started.isoformat(),
+            "mode": mode,
+            "asset_scope": asset_scope,
+            "asset_types": list(selected_types),
+            "symbols": routes,
+            "full_universe": full_universe,
+            "target_date": effective_target_date,
+            "target_dates": target_dates,
+            "config_snapshot": config_snapshot(dict(config)),
+        },
+    )
+    worker_info = (
+        _start_background_worker(run_id, config)
+        if start_background_worker
+        else {"started": False, "reason": "caller_will_start_worker"}
+    )
+    status["worker"] = worker_info
+    atomic_write_json(run_dir / "status.json", status)
+    return research._jsonable(
+        {
+            "run_id": run_id,
+            "job_id": run_id,
+            "status": "queued",
+            "phase": "cache_check",
+            "completed": progress["completed"],
+            "pending": progress["pending"],
+            "failed": progress["failed"],
+            "coverage": progress["coverage"],
+            "target_date": effective_target_date,
+            "target_dates": target_dates,
+            "result_path": str(run_dir),
+            "current_path": str(research.ASSISTANT_RESULTS_DIR / "current.json"),
+            "message": status["message"],
+            "worker": worker_info,
+        }
+    )
+
+
+def _queue_full_universe_research(**kwargs: Any) -> dict[str, Any]:
+    """Compatibility wrapper for existing schedulers and tests."""
+    return _queue_research(**kwargs)
+
+
+def _start_background_worker(
+    job_id: str,
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not config["fetch"].get("background_worker_enabled", True):
+        return {"started": False, "reason": "disabled_by_configuration"}
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_research_worker.py"
+    if not script.exists():
+        return {"started": False, "reason": "worker_script_missing"}
+    try:
+        creation_flags = 0
+        if os.name == "nt":
+            creation_flags = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            )
+        process = subprocess.Popen(
+            [sys.executable, str(script), "--job-id", job_id],
+            cwd=str(script.parents[1]),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+            close_fds=os.name != "nt",
+        )
+        return {"started": True, "pid": process.pid}
+    except Exception as exc:
+        return {
+            "started": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _run_refresh_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    config: Mapping[str, Any],
+    label: str,
+    log: list[str],
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    max_attempts = int(config["fetch"]["retries"]) + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=int(config["fetch"]["timeout_seconds"]),
+                check=False,
+            )
+            record = {
+                "attempt": attempt,
+                "returncode": completed.returncode,
+                "stdout_tail": completed.stdout[-2000:],
+                "stderr_tail": completed.stderr[-2000:],
+            }
+            summary = research._fetch_summary(completed.stdout)
+            if summary is not None:
+                record["summary"] = summary
+            attempts.append(record)
+            if completed.returncode == 0:
+                if summary is None:
+                    log.append(f"refresh {label}: success on attempt {attempt}")
+                    return {"status": "success", "attempts": attempts}
+                if (
+                    summary.get("status") in {"complete", "partial"}
+                    and int(summary.get("failed", 0) or 0) == 0
+                ):
+                    result_status = (
+                        "success"
+                        if summary.get("status") == "complete"
+                        and not summary.get("partial_failure", False)
+                        else "partial"
+                    )
+                    log.append(
+                        f"refresh {label}: {result_status} on attempt {attempt}"
+                    )
+                    return {"status": result_status, "attempts": attempts}
+        except Exception as exc:
+            attempts.append({
+                "attempt": attempt,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        log.append(f"refresh {label}: attempt {attempt} failed")
+        if attempt < max_attempts:
+            time.sleep(float(config["fetch"].get("retry_delay_seconds", 0)))
+    return {"status": "failed", "attempts": attempts}
+
+
+def _refresh_data(
+    asset_types: Iterable[str],
+    config: Mapping[str, Any],
+    log: list[str],
+    *,
+    symbols_by_type: Mapping[str, Iterable[str]] | None = None,
+) -> dict[str, Any]:
+    if not config["fetch"]["enabled"] or os.environ.get("DSH_STOCK_SKIP_FETCH") == "1":
+        log.append("data refresh skipped by configuration or DSH_STOCK_SKIP_FETCH=1")
+        return {"attempted": False, "passed": True, "results": []}
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    results: list[dict[str, Any]] = []
+    selected = set(asset_types)
+    routes = (
+        _normalize_symbol_routes(selected, symbols_by_type)
+        if symbols_by_type is not None
+        else {}
+    )
+    jobs: list[tuple[str, Path, list[str]]] = []
+    if "stock" in selected:
+        jobs.append(
+            ("stock", scripts / "fetch_stock_data.py", routes.get("stock", []))
+        )
+    for asset_type in ("etf", "otc_fund"):
+        if asset_type in selected:
+            jobs.append(
+                (
+                    asset_type,
+                    scripts / "fetch_fund_data.py",
+                    ["--asset-type", asset_type, *routes.get(asset_type, [])],
+                )
+            )
+    for label, script, extra_args in jobs:
+        if not script.exists():
+            results.append({"label": label, "status": "missing_script"})
+            continue
+        fetch_options = [
+            "--batch-size",
+            str(
+                config["fetch"]
+                .get("batch_size", {})
+                .get(label, 100)
+            ),
+            "--time-budget",
+            str(config["fetch"].get("batch_time_budget_seconds", 600)),
+            "--workers",
+            str(config["fetch"].get("max_workers", 3)),
+            "--retries",
+            str(config["fetch"].get("retries", 3)),
+            "--rate-limit",
+            str(config["fetch"].get("requests_per_second", 1.0)),
+            "--request-timeout",
+            str(config["fetch"].get("request_timeout_seconds", 30)),
+            "--backoff-base",
+            str(config["fetch"].get("backoff_base_seconds", 2)),
+            "--backoff-max",
+            str(config["fetch"].get("backoff_max_seconds", 120)),
+            "--lease-seconds",
+            str(config["fetch"].get("lease_seconds", 1800)),
+            "--state-db",
+            str(config["fetch"].get("state_db", research.DATA_DIR / "fetch_state.sqlite3")),
+        ]
+        result = _run_refresh_command(
+            [sys.executable, str(script), *fetch_options, *extra_args],
+            cwd=Path(__file__).resolve().parents[1],
+            config=config,
+            label=label,
+            log=log,
+        )
+        results.append({"label": label, **result})
+
+    stock_fetch_ok = any(
+        result.get("label") == "stock" and result.get("status") == "success"
+        for result in results
+    )
+    if "stock" in selected and stock_fetch_ok:
+        provider_result = _run_refresh_command(
+            [sys.executable, str(scripts / "build_qlib_data.py"), "--replace"],
+            cwd=Path(__file__).resolve().parents[1],
+            config=config,
+            label="qlib_provider",
+            log=log,
+        )
+        results.append({"label": "qlib_provider", **provider_result})
+    passed = bool(results) and all(
+        result.get("status") == "success" for result in results
+    )
+    return {
+        "attempted": True,
+        "passed": passed,
+        "results": results,
+        "max_attempts": int(config["fetch"]["retries"]) + 1,
+        "finished_at": research._now().isoformat(),
+    }
