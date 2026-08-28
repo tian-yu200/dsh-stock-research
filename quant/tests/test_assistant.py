@@ -594,5 +594,95 @@ class AssistantStateMachineTests(unittest.TestCase):
         )
 
 
+class StaleRunSweepTests(unittest.TestCase):
+    """Orphaned ``running`` status files must be reaped; live ones must not."""
+
+    def setUp(self) -> None:
+        # fixed_path() only allows writes below quant/, so temp dirs must
+        # live under tests/ (same convention as AssistantStateMachineTests).
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="stale-sweep-",
+            dir=ROOT / "tests",
+        )
+        self.runs_dir = pathlib.Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _make_run(
+        self,
+        day: str,
+        run_id: str,
+        status: str,
+        *,
+        age_seconds: int = 0,
+    ) -> pathlib.Path:
+        run_dir = self.runs_dir / "2026" / "08" / day / run_id
+        run_dir.mkdir(parents=True)
+        status_path = run_dir / "status.json"
+        paths.atomic_write_json(status_path, {"run_id": run_id, "status": status})
+        if age_seconds:
+            old = datetime.now(timezone.utc).timestamp() - age_seconds
+            os.utime(status_path, (old, old))
+        return status_path
+
+    def test_sweep_marks_silent_running_run_failed_and_keeps_fresh_ones(self) -> None:
+        stale_status = self._make_run(
+            "27",
+            "20260827T000000Z-aaaaaaaa",
+            "running",
+            age_seconds=10_000,
+        )
+        fresh_status = self._make_run(
+            "28",
+            "20260828T000000Z-bbbbbbbb",
+            "running",
+        )
+
+        log_lines: list[str] = []
+        swept = research._sweep_stale_runs(
+            {"runtime": {"lock_stale_seconds": 3600}},
+            log_lines,
+            runs_dir=self.runs_dir,
+        )
+
+        self.assertEqual(swept, ["20260827T000000Z-aaaaaaaa"])
+        self.assertEqual(len(log_lines), 1)
+        stale_record = paths.read_json(stale_status)
+        self.assertEqual(stale_record["status"], "failed")
+        self.assertEqual(
+            stale_record["failure_reasons"],
+            ["stale_run_heartbeat_timeout"],
+        )
+        self.assertIn("no heartbeat", stale_record["error"])
+        fresh_record = paths.read_json(fresh_status)
+        self.assertEqual(fresh_record["status"], "running")
+        self.assertNotIn("failure_reasons", fresh_record)
+
+    def test_sweep_ignores_terminal_status_and_missing_heartbeat_threshold(self) -> None:
+        done_status = self._make_run(
+            "27",
+            "20260827T000000Z-cccccccc",
+            "success",
+            age_seconds=10_000,
+        )
+        fresh_status = self._make_run(
+            "28",
+            "20260828T000000Z-dddddddd",
+            "running",
+            age_seconds=100,
+        )
+
+        swept = research._sweep_stale_runs(
+            {"runtime": {"lock_stale_seconds": 3600}},
+            [],
+            runs_dir=self.runs_dir,
+        )
+
+        self.assertEqual(swept, [])
+        self.assertEqual(paths.read_json(done_status)["status"], "success")
+        self.assertEqual(paths.read_json(fresh_status)["status"], "running")
+
+
 if __name__ == "__main__":
     unittest.main()

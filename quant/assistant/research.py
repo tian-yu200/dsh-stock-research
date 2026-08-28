@@ -1663,6 +1663,64 @@ def _write_run_files(
     return paths
 
 
+def _touch_status(status_path: Path, phase: str) -> None:
+    """Refresh the run heartbeat so the stale-run sweep never reaps a live run."""
+    record = read_json(status_path, {})
+    if not isinstance(record, dict):
+        record = {}
+    record["status"] = "running"
+    record["phase"] = phase
+    record["updated_at"] = _now().isoformat()
+    atomic_write_json(status_path, record)
+
+
+def _sweep_stale_runs(
+    config: Mapping[str, Any],
+    log_lines: list[str],
+    *,
+    runs_dir: Path | None = None,
+) -> list[str]:
+    """Fail orphaned runs whose status stayed ``running`` without a heartbeat.
+
+    A killed process never reaches the success/failed write, so its status
+    file would report ``running`` forever.  The heartbeat touch keeps the
+    status file mtime fresh while a run is alive; anything silent for longer
+    than ``runtime.lock_stale_seconds`` is treated as dead and marked failed
+    without touching ``current.json``.
+    """
+    threshold = int(config["runtime"]["lock_stale_seconds"])
+    current = _now().timestamp()
+    swept: list[str] = []
+    for status_path in sorted((runs_dir or RUNS_DIR).rglob("status.json")):
+        record = read_json(status_path, {})
+        if not isinstance(record, dict) or record.get("status") != "running":
+            continue
+        try:
+            silent_seconds = current - status_path.stat().st_mtime
+        except OSError:
+            continue
+        if silent_seconds < threshold:
+            continue
+        run_id = str(record.get("run_id") or status_path.parent.name)
+        atomic_write_json(
+            status_path,
+            {
+                **record,
+                "status": "failed",
+                "updated_at": _now().isoformat(),
+                "error": (
+                    f"stale run swept: no heartbeat for {int(silent_seconds)}s "
+                    f"(threshold {threshold}s)"
+                ),
+                "failure_reasons": ["stale_run_heartbeat_timeout"],
+            },
+        )
+        swept.append(run_id)
+    if swept:
+        log_lines.append(f"swept_stale_runs={swept}")
+    return swept
+
+
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1828,6 +1886,7 @@ def run_research(
     lock_descriptor: int | None = None
     log_lines = [f"started {started.isoformat()}", f"mode={mode}", f"asset_types={asset_types}"]
     status_path = run_dir / "status.json"
+    _sweep_stale_runs(config, log_lines)
     refresh: dict[str, Any] = {"attempted": False, "passed": True, "results": []}
     all_facts: list[dict[str, Any]] = []
     technical_signals: dict[str, Any] = {}
@@ -1857,7 +1916,12 @@ def run_research(
         run_dir.mkdir(parents=True, exist_ok=False)
         atomic_write_json(
             status_path,
-            {"run_id": run_id, "status": "running", "started_at": started.isoformat()},
+            {
+                "run_id": run_id,
+                "status": "running",
+                "started_at": started.isoformat(),
+                "updated_at": started.isoformat(),
+            },
         )
         symbol_routes = explicit_routes or {asset_type: [] for asset_type in asset_types}
         analyzed_types = tuple(
@@ -1878,6 +1942,7 @@ def run_research(
                 log_lines,
                 symbols_by_type=symbol_routes if explicit_routes else None,
             )
+        _touch_status(status_path, "refreshed")
         all_frames: dict[str, dict[str, pd.DataFrame]] = {}
         for asset_type in analyzed_types:
             scope_symbols = symbol_routes[asset_type] if explicit_routes else None
@@ -1941,6 +2006,7 @@ def run_research(
         if not all_facts:
             raise ValueError("no asset data found in fixed data directories")
 
+        _touch_status(status_path, "scanned")
         benchmark_series = None
         if analyzed_types:
             try:
@@ -1960,6 +2026,7 @@ def run_research(
                 benchmark_series,
             )
 
+        _touch_status(status_path, "signals")
         stock_model = {
             "model_available": False,
             "model_name": "Qlib Alpha158 + LightGBM",
@@ -2000,6 +2067,7 @@ def run_research(
                     key=lambda item: item.get("qlib_score", -math.inf), reverse=True
                 )
 
+        _touch_status(status_path, "gates")
         decision_support = {
             "allocation_basis": "基于假设资金/配置的目标权重",
             "hypothetical_capital": float(config["research"]["hypothetical_capital"]),
