@@ -33,6 +33,7 @@ from .paths import (
     read_json,
     validate_symbol,
 )
+from .portfolio import allocation_budget, build_target_weights
 from .risk import cash_only_decision, enforce_target_weights, model_gate_checks
 
 try:
@@ -460,10 +461,8 @@ def run_research(
             "target_weights": {},
             "cash_weight": 1.0,
         }
-        allocation_budget = min(
-            float(config["risk"]["max_daily_turnover"]),
-            1.0 - float(config["risk"]["min_cash_weight"]),
-        ) / max(len(analyzed_types), 1)
+        run_budget = allocation_budget(config["risk"], len(analyzed_types))
+        weight_strategy = str(config["research"]["weight_strategy"])
 
         if "stock" in analyzed_types:
             stock_facts = [item for item in all_facts if item["asset_type"] == "stock"]
@@ -483,13 +482,13 @@ def run_research(
             stock_requested = {}
             if gate_passed:
                 ranked = technical_signals["stock"]["signals"][: int(config["research"]["stock_topk"])]
-                if ranked:
-                    per_symbol = min(
-                        allocation_budget / len(ranked),
-                        float(config["risk"]["max_single_weight"]),
-                    )
-                    raw_weights = {item["symbol"]: per_symbol for item in ranked}
-                    stock_requested = raw_weights
+                stock_requested = build_target_weights(
+                    ranked,
+                    "stock",
+                    config["risk"],
+                    budget=run_budget,
+                    strategy=weight_strategy,
+                )
             asset_types_for_weights = {symbol: "stock" for symbol in stock_requested}
             risk_result = enforce_target_weights(
                 stock_requested,
@@ -528,11 +527,13 @@ def run_research(
             candidates = [item for item in analysis["signals"] if (item.get("trend_score") or -math.inf) > 0]
             candidates = candidates[:2]
             category = "etf" if asset_type == "etf" else "otc_fund"
-            per_symbol = min(
-                allocation_budget / len(candidates),
-                float(config["risk"]["max_single_weight"]),
-            ) if candidates else 0.0
-            requested = {item["symbol"]: per_symbol for item in candidates}
+            requested = build_target_weights(
+                candidates,
+                category,
+                config["risk"],
+                budget=run_budget,
+                strategy=weight_strategy,
+            )
             risk_result = enforce_target_weights(
                 requested,
                 {symbol: category for symbol in requested},
