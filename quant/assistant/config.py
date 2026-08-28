@@ -77,6 +77,7 @@ DEFAULTS: dict[str, Any] = {
     "research": {
         "stock_label_horizon": 20,
         "stock_topk": 3,
+        "weight_strategy": "equal_score",
         "technical_lookback_days": 260,
         "hypothetical_capital": 100000.0,
         "refresh_modes": ["daily", "monthly", "on_demand"],
