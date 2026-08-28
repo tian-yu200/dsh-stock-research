@@ -1,0 +1,28 @@
+qlib_init:
+  provider_uri: "qlib_data/cn_data"
+  region: cn
+
+dataset:
+  instruments: csi300
+  start_time: "2008-01-01"
+  end_time: "2020-09-24"
+  fit_start_time: "2008-01-01"
+  fit_end_time: "2014-12-31"
+  segments:
+    train: ["2008-01-01", "2014-12-31"]
+    valid: ["2015-01-01", "2016-12-31"]
+    test: ["2017-01-01", "2020-09-24"]
+
+backtest:
+  start_time: "2017-01-01"
+  end_time: "2020-09-24"
+  benchmark: "SH000300"
+  account: 100000
+  topk: 10
+  n_drop: 2
+  exchange_kwargs:
+    limit_threshold: 0.095
+    deal_price: "$close"
+    open_cost: 0.0003
+    close_cost: 0.0013
+    min_cost: 5

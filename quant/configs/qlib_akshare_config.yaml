@@ -1,0 +1,44 @@
+qlib_init:
+  provider_uri: qlib_data/akshare_data
+  region: cn
+
+dataset:
+  instruments: stocks
+  start_time: "2020-01-02"
+  end_time: "2026-08-21"
+  fit_start_time: "2020-04-01"
+  fit_end_time: "2022-12-28"
+  segments:
+    train: ["2020-04-01", "2022-12-28"]
+    valid: ["2023-01-03", "2024-06-26"]
+    test: ["2024-07-01", "2026-08-21"]
+
+model:
+  loss: mse
+  learning_rate: 0.03
+  num_leaves: 15
+  max_depth: 5
+  colsample_bytree: 0.8
+  subsample: 0.8
+  lambda_l1: 0.1
+  lambda_l2: 0.1
+  num_threads: 2
+  num_boost_round: 300
+  early_stopping_rounds: 30
+
+backtest:
+  start_time: "2024-07-01"
+  end_time: "2026-08-21"
+  benchmark: SH510300
+  account: 100000
+  topk: 3
+  n_drop: 1
+  exchange_kwargs:
+    limit_threshold: 0.095
+    deal_price: "$close"
+    open_cost: 0.0003
+    close_cost: 0.0013
+    min_cost: 5
+
+results:
+  output_dir: results/akshare

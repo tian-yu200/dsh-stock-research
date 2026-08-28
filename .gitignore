@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 运行时数据与结果（可再生成，体积大）
+quant/data/
+quant/qlib_data/
+quant/results/
+quant/logs/
+quant/mlruns/
+mlruns/
+*.sqlite3
+
+# 测试残留产物
+quant/tests/continuous-*/
+
+# DSH 运行时与凭据（含 .credentials.yaml，禁止入库）
+.dsh/
+.analysis-session/
+
+# 会话导出与压缩包
+codex-conversation-export-*
+*.zip
+
+# 系统/编辑器
+Thumbs.db
+.DS_Store
