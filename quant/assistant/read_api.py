@@ -2,7 +2,7 @@
 
 get_current_snapshot / get_run_status / 通知查询与确认。跨模块名字来源约定：
 定义在 research.py 的常量与工具（ASSISTANT_RESULTS_DIR、RUNS_DIR、
-ASSET_TYPES、_fixed_reference、_sanitize_result_record、load_config、_now、
+ASSET_TYPES、load_config、_now、
 _process_exists）经 ``research.`` 属性访问，使 patch.object(research, ...)
 对搬入的函数继续生效；_fetch_state/_target_dates_for_job 来自 queueing，
 其余名字直接来自 paths/notifications。
@@ -239,3 +239,27 @@ def list_notifications(
 
 def ack_notification(notification_id: str) -> dict[str, Any]:
     return acknowledge(validate_notification_id(notification_id))
+
+
+def _fixed_reference(value: Any) -> str | None:
+    """Validate a persisted path before returning it through the API."""
+    if value is None:
+        return None
+    return str(fixed_path(str(value)))
+
+
+def _sanitize_result_record(value: Any) -> Any:
+    """Keep persisted result references inside the fixed quant root."""
+    if not isinstance(value, dict):
+        return value
+    record = dict(value)
+    for key in ("result_path", "current_path"):
+        if key in record and record[key] is not None:
+            record[key] = _fixed_reference(record[key])
+    paths = record.get("paths")
+    if isinstance(paths, dict):
+        record["paths"] = {
+            str(key): _fixed_reference(path) if path is not None else None
+            for key, path in paths.items()
+        }
+    return record

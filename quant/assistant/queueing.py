@@ -1,4 +1,4 @@
-"""排队 / 后台 worker / 数据刷新（自 research.py 逐字搬迁，docs/重构计划.md 阶段 1）。
+"""排队 / 后台 worker / 数据刷新 / run 状态落盘与进程探活（自 research.py 逐字搬迁，docs/重构计划.md 阶段 1）。
 
 跨模块名字来源约定：定义在 research.py 的常量与工具（DATA_DIR、RUNS_DIR、
 ASSISTANT_RESULTS_DIR、_now、_run_id、_process_exists、_universe、_jsonable、
@@ -8,18 +8,29 @@ _fetch_summary）经 ``research.`` 属性访问，使 patch.object(research, ...
 """
 from __future__ import annotations
 
+import ctypes
+import json
 import os
 import subprocess
 import sys
 import time
 from datetime import datetime
+from errno import ESRCH
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+import yaml
 
 from . import research
 from .config import config_snapshot
 from .data_layer import _data_file
-from .paths import atomic_write_json, read_json, run_directory, validate_symbol
+from .paths import (
+    atomic_write_json,
+    atomic_write_text,
+    read_json,
+    run_directory,
+    validate_symbol,
+)
 
 try:
     from scripts.fetch_state import FetchState
@@ -523,3 +534,187 @@ def _refresh_data(
         "max_attempts": int(config["fetch"]["retries"]) + 1,
         "finished_at": research._now().isoformat(),
     }
+
+
+def _write_run_files(
+    run_dir: Path,
+    *,
+    manifest: dict[str, Any],
+    data_quality: dict[str, Any],
+    data_facts: list[dict[str, Any]],
+    model_signals: dict[str, Any],
+    rule_gates: dict[str, Any],
+    decision_support: dict[str, Any],
+    config: dict[str, Any],
+    model_metadata: dict[str, Any],
+    log_lines: list[str],
+) -> dict[str, str]:
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    files: dict[str, Any] = {
+        "manifest": manifest,
+        "data_quality": data_quality,
+        "data_facts": data_facts,
+        "model_signals": model_signals,
+        "rule_gates": rule_gates,
+        "decision_support": decision_support,
+        "model_metadata": model_metadata,
+    }
+    paths: dict[str, str] = {}
+    for name, value in files.items():
+        path = run_dir / f"{name}.json"
+        atomic_write_json(path, research._jsonable(value))
+        paths[name] = str(path)
+    config_path = run_dir / "run_config.yaml"
+    atomic_write_text(config_path, yaml.safe_dump(config_snapshot(config), allow_unicode=True, sort_keys=False))
+    paths["run_config"] = str(config_path)
+    summary_lines = [
+        "# 股票/基金私人研究助手运行摘要",
+        "",
+        f"- 运行 ID: `{manifest['run_id']}`",
+        f"- 状态: `{manifest['status']}`",
+        f"- 数据截止日期: `{data_quality.get('data_end_date') or 'unknown'}`",
+        f"- 资产数量: `{data_quality.get('asset_count', 0)}`",
+        f"- 个股模型门槛: `{'通过' if rule_gates.get('stock', {}).get('passed') else '未通过'}`",
+        "",
+        "## 使用规则",
+        "",
+        "- 个股模型门槛未通过时，不生成个股买入目标权重。",
+        "- 目标权重基于假设资金/配置，不连接券商，不自动下单。",
+        "- 场外基金使用净值序列，不输出盘中成交价或精确股数。",
+        "",
+        "## 本次建议",
+        "",
+        json.dumps(research._jsonable(decision_support), ensure_ascii=False, indent=2),
+        "",
+        "## 日志",
+        "",
+        *[f"- {line}" for line in log_lines],
+    ]
+    summary_path = run_dir / "summary.md"
+    atomic_write_text(summary_path, "\n".join(summary_lines) + "\n")
+    paths["summary"] = str(summary_path)
+    log_path = logs_dir / "research.log"
+    atomic_write_text(log_path, "\n".join(log_lines) + "\n")
+    paths["logs"] = str(log_path)
+    return paths
+
+
+def _touch_status(status_path: Path, phase: str) -> None:
+    """Refresh the run heartbeat so the stale-run sweep never reaps a live run."""
+    record = read_json(status_path, {})
+    if not isinstance(record, dict):
+        record = {}
+    record["status"] = "running"
+    record["phase"] = phase
+    record["updated_at"] = research._now().isoformat()
+    atomic_write_json(status_path, record)
+
+
+def _sweep_stale_runs(
+    config: Mapping[str, Any],
+    log_lines: list[str],
+    *,
+    runs_dir: Path | None = None,
+) -> list[str]:
+    """Fail orphaned runs whose status stayed ``running`` without a heartbeat.
+
+    A killed process never reaches the success/failed write, so its status
+    file would report ``running`` forever.  The heartbeat touch keeps the
+    status file mtime fresh while a run is alive; anything silent for longer
+    than ``runtime.lock_stale_seconds`` is treated as dead and marked failed
+    without touching ``current.json``.
+    """
+    threshold = int(config["runtime"]["lock_stale_seconds"])
+    current = research._now().timestamp()
+    swept: list[str] = []
+    for status_path in sorted((runs_dir or research.RUNS_DIR).rglob("status.json")):
+        record = read_json(status_path, {})
+        if not isinstance(record, dict) or record.get("status") != "running":
+            continue
+        try:
+            silent_seconds = current - status_path.stat().st_mtime
+        except OSError:
+            continue
+        if silent_seconds < threshold:
+            continue
+        run_id = str(record.get("run_id") or status_path.parent.name)
+        atomic_write_json(
+            status_path,
+            {
+                **record,
+                "status": "failed",
+                "updated_at": research._now().isoformat(),
+                "error": (
+                    f"stale run swept: no heartbeat for {int(silent_seconds)}s "
+                    f"(threshold {threshold}s)"
+                ),
+                "failure_reasons": ["stale_run_heartbeat_timeout"],
+            },
+        )
+        swept.append(run_id)
+    if swept:
+        log_lines.append(f"swept_stale_runs={swept}")
+    return swept
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        access_denied = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return ctypes.get_last_error() == access_denied
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno != ESRCH
+    return True
+
+
+def _fetch_summary(stdout: str) -> dict[str, Any] | None:
+    marker = "ASSISTANT_FETCH_SUMMARY="
+    for line in reversed((stdout or "").splitlines()):
+        if not line.startswith(marker):
+            continue
+        try:
+            value = json.loads(line[len(marker):])
+        except json.JSONDecodeError:
+            return {"parse_error": "invalid fetch summary JSON"}
+        return value if isinstance(value, dict) else {"parse_error": "fetch summary is not an object"}
+    return None
