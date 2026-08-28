@@ -1,8 +1,10 @@
-"""Qlib 训练与模型指标层（自 research.py 逐字搬迁，docs/重构计划.md 阶段 1）。
+"""Qlib 训练与模型指标层 + 共享训练入口（docs/重构计划.md 阶段 1/3）。
 
-Qlib 的导入刻意延迟到 _run_qlib_stock_model 内部，保证未安装可选依赖时
-ETF/基金快照链路仍可用。定义在 research.py 的工具（_iso_date）经
-``research.`` 属性访问；其余名字为模块内自有或直接来自 paths。
+阶段 3 起，provider 初始化（init_qlib）、数据集构建（build_dataset）、
+LGBModel 训练（train_lgbm）与分段预测（segment_prediction）是主路径与
+run_under50_research.py 共享的训练层；Qlib 的导入仍延迟到各函数内部，
+保证未安装可选依赖时 ETF/基金快照链路可用。定义在 research.py 的工具
+（_iso_date）经 ``research.`` 属性访问；其余名字为模块内自有或来自 paths。
 """
 from __future__ import annotations
 
@@ -126,12 +128,97 @@ def _fit_qlib_model_and_close_recorder(
     model: Any,
     dataset: Any,
     qlib_recorder: Any,
+    **fit_kwargs: Any,
 ) -> None:
     """Close Qlib's global recorder after model.fit, including failed fits."""
     try:
-        model.fit(dataset)
+        model.fit(dataset, **fit_kwargs)
     finally:
         qlib_recorder.end_exp()
+
+
+def init_qlib(provider_uri: str | Path, *, kernels: int = 1) -> Path:
+    """qlib.init on a fixed provider directory; returns the resolved path.
+
+    共享训练层入口（docs/重构计划.md 阶段 3）：主路径与 under50 脚本都以
+    固定 provider 目录初始化，kernels 按各自原值传入。
+    """
+    import qlib
+    from qlib.config import REG_CN
+
+    provider = Path(provider_uri).resolve()
+    if not provider.exists():
+        raise FileNotFoundError(f"Qlib provider does not exist: {provider}")
+    qlib.init(provider_uri=str(provider), region=REG_CN, kernels=kernels)
+    return provider
+
+
+def build_dataset(
+    *,
+    instruments: Any,
+    start_time: str,
+    end_time: str,
+    fit_start_time: str,
+    fit_end_time: str,
+    label_horizon: int,
+    segments: Mapping[str, Any],
+) -> Any:
+    """Alpha158 handler + DatasetH：两条训练路径共享的同一数据集构建。"""
+    from qlib.contrib.data.handler import Alpha158
+    from qlib.data.dataset import DatasetH
+
+    handler = Alpha158(
+        instruments=instruments,
+        start_time=start_time,
+        end_time=end_time,
+        fit_start_time=fit_start_time,
+        fit_end_time=fit_end_time,
+        label=([f"Ref($close, -{int(label_horizon) + 1})/Ref($close, -1) - 1"], ["LABEL0"]),
+        infer_processors=[
+            {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+            {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+        ],
+        learn_processors=[
+            {"class": "DropnaLabel"},
+            {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
+        ],
+    )
+    return DatasetH(handler=handler, segments=segments)
+
+
+def train_lgbm(
+    dataset: Any,
+    model_config: Mapping[str, Any],
+    *,
+    verbose_eval: int | None = None,
+) -> Any:
+    """LGBModel 训练并关闭全局 recorder；under50 传入 verbose_eval 保持原输出。"""
+    from qlib.contrib.model.gbdt import LGBModel
+    from qlib.workflow import R
+
+    model = LGBModel(**model_config)
+    if verbose_eval is None:
+        _fit_qlib_model_and_close_recorder(model, dataset, R)
+    else:
+        evals_result: dict = {}
+        _fit_qlib_model_and_close_recorder(
+            model,
+            dataset,
+            R,
+            evals_result=evals_result,
+            verbose_eval=verbose_eval,
+        )
+    return model
+
+
+def segment_prediction(dataset: Any, model: Any, segment: str) -> tuple[pd.Series, pd.Series]:
+    """单个段的预测分数与学习标签（两条路径的原逐字实现）。"""
+    from qlib.data.dataset.handler import DataHandlerLP
+
+    prediction = model.predict(dataset, segment=segment).dropna().sort_index()
+    prediction.name = "score"
+    labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L).iloc[:, 0]
+    return prediction, labels
 
 
 def _run_qlib_stock_model(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -161,18 +248,9 @@ def _run_qlib_stock_model(config: Mapping[str, Any]) -> dict[str, Any]:
         os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
         os.environ.setdefault("MLFLOW_TRACKING_URI", f"file:///{(Path(config['paths']['logs_dir']) / 'mlruns').as_posix()}")
         import qlib
-        from qlib.config import REG_CN
-        from qlib.contrib.data.handler import Alpha158
-        from qlib.contrib.model.gbdt import LGBModel
         from qlib.data import D
-        from qlib.data.dataset import DatasetH
-        from qlib.data.dataset.handler import DataHandlerLP
-        from qlib.workflow import R
 
-        provider = Path(config["paths"]["qlib_provider"]).resolve()
-        if not provider.exists():
-            raise FileNotFoundError(f"Qlib provider does not exist: {provider}")
-        qlib.init(provider_uri=str(provider), region=REG_CN, kernels=1)
+        provider = init_qlib(config["paths"]["qlib_provider"], kernels=1)
         dataset_config = config["dataset"]
         calendar = D.calendar(freq="day")
         provider_end = pd.Timestamp(calendar[-1]).date().isoformat()
@@ -182,32 +260,21 @@ def _run_qlib_stock_model(config: Mapping[str, Any]) -> dict[str, Any]:
             for name, values in dataset_config["segments"].items()
         }
         label_horizon = int(config["research"]["stock_label_horizon"])
-        handler = Alpha158(
+        dataset = build_dataset(
             instruments="stocks",
             start_time=dataset_config["start_time"],
             end_time=end_time,
             fit_start_time=dataset_config["fit_start_time"],
             fit_end_time=dataset_config["fit_end_time"],
-            label=([f"Ref($close, -{label_horizon + 1})/Ref($close, -1) - 1"], ["LABEL0"]),
-            infer_processors=[
-                {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-                {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-            ],
-            learn_processors=[
-                {"class": "DropnaLabel"},
-                {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
-            ],
+            label_horizon=label_horizon,
+            segments=segments,
         )
-        dataset = DatasetH(handler=handler, segments=segments)
-        model = LGBModel(**config["model"])
-        _fit_qlib_model_and_close_recorder(model, dataset, R)
+        model = train_lgbm(dataset, config["model"])
         predictions: dict[str, pd.Series] = {}
         labels_by_segment: dict[str, pd.Series] = {}
         metrics: dict[str, Any] = {}
         for segment in ("valid", "test"):
-            prediction = model.predict(dataset, segment=segment).dropna().sort_index()
-            prediction.name = "score"
-            labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L).iloc[:, 0]
+            prediction, labels = segment_prediction(dataset, model, segment)
             predictions[segment] = prediction
             labels_by_segment[segment] = labels
             metrics[segment] = _prediction_metrics(prediction, labels)

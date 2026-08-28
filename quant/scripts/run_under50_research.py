@@ -7,6 +7,7 @@ import json
 import math
 import os
 import pathlib
+import sys
 from dataclasses import dataclass
 
 os.environ.setdefault("OMP_NUM_THREADS", "2")
@@ -18,15 +19,19 @@ import numpy as np
 import pandas as pd
 import yaml
 
-import qlib
-from qlib.config import REG_CN
-from qlib.contrib.data.handler import Alpha158
-from qlib.contrib.model.gbdt import LGBModel
 from qlib.data import D
-from qlib.data.dataset import DatasetH
-from qlib.data.dataset.handler import DataHandlerLP
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from assistant.qlib_model import (  # noqa: E402
+    build_dataset,
+    init_qlib,
+    segment_prediction,
+    train_lgbm,
+)
+
 DEFAULT_CONFIG = ROOT / "configs" / "qlib_under50_6000.yaml"
 NAMES = {
     "SZ000651": "格力电器",
@@ -354,39 +359,25 @@ def run(config_path: pathlib.Path) -> None:
         config = yaml.safe_load(file)
     result_dir = project_path(config["results"]["output_dir"])
     result_dir.mkdir(parents=True, exist_ok=True)
-    provider = project_path(config["qlib_init"]["provider_uri"]).resolve()
-    qlib.init(provider_uri=str(provider), region=REG_CN, kernels=2)
+    init_qlib(project_path(config["qlib_init"]["provider_uri"]), kernels=2)
 
     dataset_config = config["dataset"]
     horizon = int(dataset_config["label_horizon"])
-    label = ([f"Ref($close, -{horizon + 1})/Ref($close, -1) - 1"], ["LABEL0"])
-    handler = Alpha158(
+    dataset = build_dataset(
         instruments=dataset_config["instruments"],
         start_time=dataset_config["start_time"],
         end_time=dataset_config["end_time"],
         fit_start_time=dataset_config["fit_start_time"],
         fit_end_time=dataset_config["fit_end_time"],
-        label=label,
-        infer_processors=[
-            {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-            {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-        ],
-        learn_processors=[
-            {"class": "DropnaLabel"},
-            {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
-        ],
+        label_horizon=horizon,
+        segments=dataset_config["segments"],
     )
-    dataset = DatasetH(handler=handler, segments=dataset_config["segments"])
-    model = LGBModel(**config["model"])
-    evals_result: dict = {}
-    model.fit(dataset, evals_result=evals_result, verbose_eval=25)
+    model = train_lgbm(dataset, config["model"], verbose_eval=25)
 
     predictions = {}
     metrics = {}
     for segment in ("valid", "test"):
-        prediction = model.predict(dataset, segment=segment).dropna().sort_index()
-        prediction.name = "score"
-        labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L).iloc[:, 0]
+        prediction, labels = segment_prediction(dataset, model, segment)
         predictions[segment] = prediction
         metrics[segment] = prediction_metrics(prediction, labels)
         prediction.to_csv(result_dir / f"predictions_{segment}.csv", encoding="utf-8-sig")
