@@ -696,13 +696,19 @@ def main(argv: list[str] | None = None) -> int:
             "stale": progress["stale"],
             "coverage": progress["coverage"],
         }
-        timeout_with_progress = (
-            any(result.get("status") == "timeout" for result in fetch_results)
-            and progress["completed"] > initial_progress["completed"]
+        # 抓取到达时间预算是每一轮的正常收尾方式（运行说明：下一轮从上次
+        # 成功日期之后继续）。逐标的进度已即时提交，因此只要仍有剩余工作，
+        # 预算耗尽就把作业送回队列，而不是把整次研究判死。
+        fetch_timed_out = any(
+            result.get("status") == "timeout" for result in fetch_results
         )
+        work_remains = (
+            int(progress["pending"]) + int(progress["failed"]) > 0
+        )
+        requeue_after_timeout = fetch_timed_out and work_remains
         final_status = (
             "queued"
-            if timeout_with_progress
+            if requeue_after_timeout
             else "timeout"
             if isinstance(exc, TimeoutError)
             else "failed"
@@ -717,8 +723,10 @@ def main(argv: list[str] | None = None) -> int:
                 **progress_fields,
             }
         )
-        if timeout_with_progress:
-            status_value["message"] = "抓取进程超时，但本轮已有进展，等待下一轮继续。"
+        if requeue_after_timeout:
+            status_value["message"] = (
+                "抓取进程到达本轮时间预算，仍有剩余工作，作业回到队列等待下一轮继续。"
+            )
         state.update_job(
             job_id,
             status=final_status,
@@ -728,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         atomic_write_json(run_dir / "status.json", _jsonable(status_value))
         _print_status(status_value)
-        return 0 if timeout_with_progress else 1
+        return 0 if requeue_after_timeout else 1
 
 
 if __name__ == "__main__":

@@ -115,6 +115,68 @@ class ResearchWorkerTests(unittest.TestCase):
             self.assertEqual(status["fetch_results"][0]["status"], "timeout")
             self.assertEqual(status["target_dates"], {"etf": "2026-08-26"})
 
+    def test_timeout_without_new_completions_still_requeues_when_work_remains(self) -> None:
+        """预算耗尽且本轮零新完成时，作业仍须回到队列而不是判死。
+
+        契约来自 2026-08-29 全市场作业事故：抓取子进程在限速等待中到达
+        时间预算、只把在途标的标记失败、没有新增完成数，旧逻辑把整个
+        作业置为 failed 并让连续调度器停止推进。
+        """
+        with tempfile.TemporaryDirectory(prefix="research-worker-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "run"
+            state = FetchState(root / "state.sqlite3")
+            job_id = "20260827T000000Z-timeout2"
+            symbols = ["510300", "510500"]
+            state.register_assets("etf", symbols)
+            state.create_job(
+                job_id,
+                kind="research",
+                asset_scope="etf",
+                metadata={
+                    "mode": "daily",
+                    "asset_scope": "etf",
+                    "asset_types": ["etf"],
+                    "symbols": {"etf": symbols},
+                    "target_date": "2026-08-27",
+                },
+            )
+            state.update_job(job_id, total=2, completed=0, pending=2)
+
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(state.path)
+            config["fetch"]["max_data_age_days"] = 0
+
+            def timed_out_without_progress(*args, **kwargs):
+                return {
+                    "asset_type": "etf",
+                    "status": "timeout",
+                    "returncode": None,
+                    "summary": None,
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                    "timeout_seconds": 60,
+                    "time_budget_seconds": 15,
+                }
+
+            with (
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(
+                    worker, "_run_fetch_script", side_effect=timed_out_without_progress
+                ),
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            job = state.get_job(job_id)
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(job["status"], "queued")
+            self.assertEqual(job["completed"], 0)
+            self.assertEqual(job["pending"], 2)
+            self.assertEqual(status["status"], "queued")
+            self.assertIn("回到队列", str(status.get("message", "")))
+
     def test_minimum_coverage_allows_research_with_pending_assets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="research-coverage-", dir=ROOT / "tests") as directory:
             root = pathlib.Path(directory)

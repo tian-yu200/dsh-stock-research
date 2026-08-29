@@ -25,7 +25,7 @@ fetch:
     etf: 50
     otc_fund: 200
   batch_time_budget_seconds: 600
-  shutdown_grace_seconds: 45
+  shutdown_grace_seconds: 120
   max_workers: 3
   requests_per_second: 1.0
   request_timeout_seconds: 20
