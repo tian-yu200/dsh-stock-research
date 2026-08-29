@@ -209,21 +209,34 @@ def merge_otc_frames(
         except pd.errors.EmptyDataError:
             pass
     frames.append(incoming)
-    combined = pd.concat(frames, ignore_index=True)
-    date_column, nav_column = _fund_columns(combined)
-    if date_column is None or nav_column is None:
-        raise FundNavValidationError(
-            source,
-            "fund NAV requires date and unit NAV columns",
-            total_rows=len(combined),
-            samples=[
-                {"columns": [str(column) for column in combined.columns[:10]]}
-            ],
+    # 每帧先各自归一到 date/close 再拼接：已回填 CSV 的列名（date/close）与
+    # akshare 原始列名（净值日期/单位净值）不同，直接 concat 会让交叉列
+    # 互为 NaN，把有效的每日更新误判为数据异常并触发隔离。
+    normalized = []
+    for frame in frames:
+        date_column, nav_column = _fund_columns(frame)
+        if date_column is None or nav_column is None:
+            raise FundNavValidationError(
+                source,
+                "fund NAV requires date and unit NAV columns",
+                total_rows=len(frame),
+                samples=[
+                    {"columns": [str(column) for column in frame.columns[:10]]}
+                ],
+            )
+        normalized.append(
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(
+                        frame[date_column], errors="coerce", format="mixed"
+                    ),
+                    "close": pd.to_numeric(frame[nav_column], errors="coerce"),
+                }
+            )
         )
-    parsed_dates = pd.to_datetime(
-        combined[date_column], errors="coerce", format="mixed"
-    )
-    parsed_navs = pd.to_numeric(combined[nav_column], errors="coerce")
+    combined = pd.concat(normalized, ignore_index=True)
+    parsed_dates = combined["date"]
+    parsed_navs = combined["close"]
     result = pd.DataFrame(
         {
             "date": parsed_dates,
@@ -239,8 +252,8 @@ def merge_otc_frames(
             samples.append(
                 {
                     "row": int(index) if isinstance(index, int) else str(index),
-                    "date": str(combined.at[index, date_column]),
-                    "nav": str(combined.at[index, nav_column]),
+                    "date": str(combined.at[index, "date"]),
+                    "nav": str(combined.at[index, "close"]),
                 }
             )
         raise FundNavValidationError(

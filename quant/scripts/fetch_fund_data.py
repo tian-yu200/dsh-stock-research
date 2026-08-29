@@ -6,11 +6,15 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
+
+import akshare as ak
+import pandas as pd
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -43,6 +47,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 UNIVERSE_PATH = DATA_DIR.parent / "universe.json"
 ETF_POOL = ["510300", "510500", "159915"]
 OTC_POOL = ["110020", "001594"]
+# 池小于该阈值（定向小任务）时直接逐只抓取，不值得花一次全市场快照请求。
+_BULK_MIN_POOL = 50
+# 快照只用来推进已有数据的尾端；距目标日超过该天数的深度过期基金
+# 交给逐只路径补全历史，避免批量追加制造净值序列空洞。
+_BULK_MAX_GAP_DAYS = 10
 
 
 def _manifest_complete(asset_type: str) -> bool:
@@ -118,6 +127,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--backoff-max", type=float, default=120.0, help="失败指数退避最大秒数")
     parser.add_argument("--lease-seconds", type=int, default=1800, help="单标的租约秒数")
     parser.add_argument("--refresh-catalog", action="store_true", help="强制重新发现 ETF/场外基金目录")
+    parser.add_argument(
+        "--bulk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="场外基金池足够大时，先用一次全市场净值快照推进已有基金的尾端",
+    )
     parser.add_argument("--asset-type", choices=["etf", "otc_fund"], default=None, help="只处理一个基金类别")
     parser.add_argument("symbols", nargs="*", help="可选的代码子集；配合 --asset-type 使用")
     parser.add_argument("--job-id", default=None, help="可选的研究任务 ID，用于刷新任务进度")
@@ -149,6 +164,93 @@ def _write_success(kind: str, code: str, frame: Any, path: pathlib.Path) -> dict
     }
     atomic_write_json(metadata, path.with_suffix(".meta.json"))
     return metadata
+
+
+def _bulk_otc_snapshot() -> dict[str, list[tuple[str, float]]] | None:
+    """一次请求取全市场基金最新两个净值日的单位净值；失败返回 None，由逐只路径兜底。"""
+    try:
+        raw = ak.fund_open_fund_daily_em()
+    except Exception as exc:
+        print(f"[批量] 全市场净值快照失败，回退逐只: {type(exc).__name__}: {exc}")
+        return None
+    dated_columns = sorted(
+        (match.group(1), column)
+        for column in raw.columns
+        if (match := re.fullmatch(r"(\d{4}-\d{2}-\d{2})-单位净值", str(column)))
+    )
+    if not dated_columns:
+        print("[批量] 快照缺少带日期的单位净值列，回退逐只")
+        return None
+    codes = raw["基金代码"].astype(str).str.strip()
+    snapshot: dict[str, list[tuple[str, float]]] = {}
+    for date_str, column in dated_columns:
+        values = pd.to_numeric(raw[column], errors="coerce")
+        for code, nav in zip(codes, values):
+            if pd.isna(nav):
+                continue
+            snapshot.setdefault(code, []).append((date_str, float(nav)))
+    return snapshot
+
+
+def _bulk_refresh_otc(
+    *,
+    pool: list[str],
+    state: FetchState,
+    lease_owner: str,
+    deadline: float | None,
+) -> tuple[int, int]:
+    """用一次全市场快照推进已回填基金的净值尾端，返回 (成功数, 处理数)。
+
+    快照每基金最多两个最新净值点，因此只处理已有 CSV 且新点能近似
+    连续接上现有尾端的基金；深度过期基金留给逐只路径补全历史。
+    """
+    snapshot = _bulk_otc_snapshot()
+    if snapshot is None:
+        return 0, 0
+    ok = 0
+    processed = 0
+    max_gap = pd.Timedelta(days=_BULK_MAX_GAP_DAYS)
+    for code in pool:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        points = snapshot.get(str(code))
+        if not points:
+            continue
+        path = _path("otc_fund", str(code))
+        last = cached_end_date(path)
+        if last is None:
+            continue
+        fresh = [(date_str, nav) for date_str, nav in points if date_str > last]
+        if not fresh:
+            continue
+        if pd.Timestamp(fresh[0][0]) - pd.Timestamp(last) > max_gap:
+            continue
+        processed += 1
+        frame = pd.DataFrame(fresh, columns=["净值日期", "单位净值"])
+        frame.attrs.update(
+            {
+                "akshare_interface": "fund_open_fund_daily_em",
+                "akshare_source": "东财(批量)",
+                "adjustment": "unit_nav",
+            }
+        )
+        try:
+            metadata = _write_success("otc_fund", str(code), frame, path)
+        except FundNavValidationError:
+            continue
+        state.mark_success(
+            "otc_fund",
+            str(code),
+            data_end_date=metadata["data_end_date"],
+            source=metadata.get("source"),
+            rows=metadata["rows"],
+            refresh_interval_seconds=5 * 86400,
+            owner=lease_owner,
+        )
+        ok += 1
+        if ok % 2000 == 0:
+            print(f"[批量] 已推进 {ok} 只基金净值")
+    return ok, processed
 
 
 def _fetch_one(
@@ -346,8 +448,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     ok = 0
     fail = 0
+    bulk_ok = 0
+    bulk_processed = 0
     source_by_symbol: dict[str, dict[str, Any]] = {}
     errors: dict[str, str] = {}
+
+    if args.bulk and args.limit is None and len(otc_pool) >= _BULK_MIN_POOL:
+        bulk_ok, bulk_processed = _bulk_refresh_otc(
+            pool=otc_pool,
+            state=state,
+            lease_owner=lease_owner,
+            deadline=deadline,
+        )
+        print(f"[批量] 快照推进完成: 成功 {bulk_ok} / 处理 {bulk_processed}")
 
     while deadline is None or time.monotonic() < deadline:
         did_work = False
@@ -431,6 +544,7 @@ def main(argv: list[str] | None = None) -> int:
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "ok": ok,
         "failed": fail,
+        "bulk_refresh": {"ok": bulk_ok, "processed": bulk_processed},
         "requested": len(etf_pool) + len(otc_pool),
         "processed": ok + fail,
         "pending": progress["pending"],

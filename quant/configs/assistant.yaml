@@ -27,7 +27,8 @@ fetch:
   batch_time_budget_seconds: 600
   shutdown_grace_seconds: 120
   max_workers: 3
-  requests_per_second: 1.0
+  # 东财日频接口在 3 请求/秒下稳定；此前 1 rps 使全市场刷新下限被限速卡在约 60 标的/分钟。
+  requests_per_second: 3.0
   request_timeout_seconds: 20
   heartbeat_interval_seconds: 5
   worker_stalled_seconds: 60

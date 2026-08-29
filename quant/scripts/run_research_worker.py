@@ -587,8 +587,14 @@ def main(argv: list[str] | None = None) -> int:
             _run_rolling_scan(job_id, config, status_value)
             atomic_write_json(run_dir / "status.json", _jsonable(status_value))
             if result["status"] in {"failed", "timeout"}:
-                raise RuntimeError(
-                    f"{asset_type} fetch worker {result['status']}"
+                # 单类抓取失败/超时只记录并继续下一类：个别毒标的耗尽该类
+                # 配额不应让整轮 wave 中途夭折，其余类别的检查点仍然有效，
+                # 未完成部分由下一轮 wave 续抓。
+                status_value["last_error"] = f"{asset_type} fetch worker {result['status']}"
+                print(
+                    f"[wave] {asset_type} fetch worker {result['status']}; "
+                    "continuing with remaining asset types",
+                    flush=True,
                 )
             if time.monotonic() >= deadline:
                 break
@@ -635,11 +641,19 @@ def main(argv: list[str] | None = None) -> int:
         }
         if not fetch_gate_passed:
             state.update_job(job_id, status="queued")
+            fetch_type_interrupted = any(
+                result.get("status") in {"failed", "timeout"}
+                for result in fetch_results
+            )
             status_value.update(
                 {
                     "status": "queued",
                     "phase": "fetch",
-                    "message": "本轮批次完成，等待下一轮继续推进。",
+                    "message": (
+                        "部分类别抓取超时或失败，作业回到队列等待下一轮继续。"
+                        if fetch_type_interrupted
+                        else "本轮批次完成，等待下一轮继续推进。"
+                    ),
                 }
             )
             atomic_write_json(run_dir / "status.json", _jsonable(status_value))
