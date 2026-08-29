@@ -46,11 +46,15 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                     [
                         "run_research",
                         "get_current_snapshot",
+                        "get_rolling_scan",
                         "get_run_status",
                         "list_notifications",
                         "ack_notification",
                     ],
                 )
+
+                rolling = await session.call_tool("get_rolling_scan", {})
+                self.assertFalse(rolling.is_error)
 
                 snapshot = await session.call_tool("get_current_snapshot", {})
                 self.assertFalse(snapshot.is_error)

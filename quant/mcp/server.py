@@ -20,6 +20,7 @@ if str(QUANT_ROOT) not in sys.path:
 from assistant import (  # noqa: E402
     ack_notification,
     get_current_snapshot,
+    get_rolling_scan,
     get_run_status,
     list_notifications,
     run_research,
@@ -71,6 +72,26 @@ TOOLS = [
                     "enum": ["stock", "etf", "otc_fund"],
                 },
                 "symbol": {"type": "string", "pattern": SYMBOL_PATTERN},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    types.Tool(
+        name="get_rolling_scan",
+        description=(
+            "Read the rolling stock pool built incrementally while a full-market "
+            "scan is running. Preliminary and order-biased until the scan "
+            "completes; final recommendations still come from get_current_snapshot."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "asset_type": {
+                    "type": "string",
+                    "enum": ["stock", "etf", "otc_fund"],
+                },
+                "symbol": {"type": "string", "pattern": SYMBOL_PATTERN},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             },
             "additionalProperties": False,
         },
@@ -167,6 +188,16 @@ def validate_tool_arguments(name: str, arguments: dict[str, Any] | None) -> dict
         symbol = arguments.get("symbol")
         if symbol is not None and not _matches(symbol, SYMBOL_PATTERN):
             raise ValueError("invalid symbol")
+    elif name == "get_rolling_scan":
+        asset_type = arguments.get("asset_type")
+        if asset_type is not None and asset_type not in {"stock", "etf", "otc_fund"}:
+            raise ValueError("invalid asset_type")
+        symbol = arguments.get("symbol")
+        if symbol is not None and not _matches(symbol, SYMBOL_PATTERN):
+            raise ValueError("invalid symbol")
+        limit = arguments.get("limit", 30)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
     elif name == "get_run_status":
         if "run_id" in arguments and not _matches(arguments.get("run_id"), RUN_ID_PATTERN):
             raise ValueError("invalid run_id")
@@ -197,6 +228,11 @@ def dispatch_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]
         "get_current_snapshot": lambda: get_current_snapshot(
             asset_type=values.get("asset_type"),
             symbol=values.get("symbol"),
+        ),
+        "get_rolling_scan": lambda: get_rolling_scan(
+            values.get("asset_type"),
+            values.get("symbol"),
+            limit=values.get("limit", 30),
         ),
         "get_run_status": lambda: get_run_status(values.get("run_id")),
         "list_notifications": lambda: list_notifications(

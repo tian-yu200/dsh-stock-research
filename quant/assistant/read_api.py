@@ -212,6 +212,70 @@ def get_run_status(run_id: str | None = None) -> dict[str, Any]:
     return {key: status[key] for key in compact_keys if key in status}
 
 
+def get_rolling_scan(
+    asset_type: str | None = None,
+    symbol: str | None = None,
+    *,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """Read the rolling-scan snapshot (preliminary pool built during a scan)."""
+    snapshot_path = research.ASSISTANT_RESULTS_DIR / "rolling_scan.json"
+    snapshot = read_json(snapshot_path)
+    if snapshot is None:
+        return {
+            "status": "no_rolling_scan",
+            "message": "尚无滚动扫描快照；全市场抓取进行中会按波次自动生成。",
+            "snapshot_path": str(snapshot_path),
+        }
+    normalized_type = str(asset_type).strip().lower() if asset_type else None
+    if normalized_type is not None and normalized_type not in research.ASSET_TYPES:
+        raise ValueError(f"asset_type must be one of: {', '.join(research.ASSET_TYPES)}")
+    normalized_symbol = validate_symbol(symbol) if symbol else None
+    bound = max(1, min(int(limit), 100))
+
+    def select(entries: Any) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        if not isinstance(entries, list):
+            return selected
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if normalized_type and entry.get("asset_type") != normalized_type:
+                continue
+            if normalized_symbol and entry.get("symbol") != normalized_symbol:
+                continue
+            selected.append(entry)
+            if len(selected) >= bound:
+                break
+        return selected
+
+    result: dict[str, Any] = {
+        key: snapshot[key]
+        for key in (
+            "status",
+            "pool_status",
+            "preliminary",
+            "disclaimer",
+            "updated_at",
+            "job_id",
+            "coverage",
+            "scored_total",
+            "eligible_count",
+            "analyzed_this_pass",
+        )
+        if key in snapshot
+    }
+    result.update(
+        {
+            "limit": bound,
+            "pool": select(snapshot.get("pool")),
+            "score_table": select(snapshot.get("score_table")),
+            "recent_events": select(snapshot.get("recent_events")),
+        }
+    )
+    return result
+
+
 def list_notifications(
     unread_only: bool = False,
     *,

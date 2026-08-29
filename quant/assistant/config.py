@@ -74,6 +74,19 @@ DEFAULTS: dict[str, Any] = {
     "runtime": {
         "lock_stale_seconds": 21600,
     },
+    "rolling_scan": {
+        "enabled": True,
+        "state_db": str(DATA_DIR / "rolling_scan.sqlite3"),
+        "snapshot_path": str(ASSISTANT_RESULTS_DIR / "rolling_scan.json"),
+        "pool_asset_types": ["stock"],
+        "pool_size": 30,
+        "min_sample": 200,
+        "min_rows": 120,
+        "min_average_amount_20d": 30000000.0,
+        "stale_after_days": 15,
+        "max_symbols_per_pass": 400,
+        "score_table_limit": 500,
+    },
     "research": {
         "stock_label_horizon": 20,
         "stock_topk": 3,

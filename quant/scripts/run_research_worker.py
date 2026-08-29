@@ -20,6 +20,7 @@ if str(QUANT_ROOT) not in sys.path:
 from assistant.config import load_config
 from assistant.paths import atomic_write_json, run_directory
 from assistant.research import _jsonable
+from assistant.rolling_scan import run_rolling_pass
 from fetch_state import FetchState
 from fetch_targets import asset_target_dates
 
@@ -99,6 +100,23 @@ def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
         compact_fetches.append(compact)
     if compact_fetches:
         result["fetch_results"] = compact_fetches
+    rolling = value.get("rolling_scan")
+    if isinstance(rolling, dict):
+        result["rolling_scan"] = {
+            key: rolling[key]
+            for key in (
+                "status",
+                "pool_status",
+                "analyzed_this_pass",
+                "scored_total",
+                "eligible_count",
+                "pool_size",
+                "events_added",
+                "elapsed_seconds",
+                "error",
+            )
+            if key in rolling
+        }
     return result
 
 
@@ -341,6 +359,24 @@ def _record_progress(
     return completed
 
 
+def _run_rolling_scan(
+    job_id: str,
+    config: dict[str, Any],
+    status_value: dict[str, Any],
+) -> None:
+    """Advance the rolling stock pool by one incremental pass (never fatal)."""
+    settings = config.get("rolling_scan") or {}
+    if not settings.get("enabled", True):
+        return
+    try:
+        status_value["rolling_scan"] = run_rolling_pass(job_id=job_id, config=config)
+    except Exception as exc:
+        status_value["rolling_scan"] = {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _run_fetch_script(
     script: Path,
     *,
@@ -548,6 +584,8 @@ def main(argv: list[str] | None = None) -> int:
             fetch_results.append(result)
             status_value["fetch_results"] = fetch_results
             heartbeat()
+            _run_rolling_scan(job_id, config, status_value)
+            atomic_write_json(run_dir / "status.json", _jsonable(status_value))
             if result["status"] in {"failed", "timeout"}:
                 raise RuntimeError(
                     f"{asset_type} fetch worker {result['status']}"
@@ -575,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
                 "progress": progress,
             }
         )
+        _run_rolling_scan(job_id, config, status_value)
         last_completed = _record_progress(
             status_value,
             progress,

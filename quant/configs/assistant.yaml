@@ -41,6 +41,25 @@ fetch:
 runtime:
   lock_stale_seconds: 21600
 
+# 滚动扫描：全市场抓取进行中按波次增量计算单票技术面得分，维护初选股票池。
+# 单票得分只依赖该票自身数据；横截面排名与最终建议仍由覆盖率达标后的完整研究给出。
+rolling_scan:
+  enabled: true
+  state_db: data/rolling_scan.sqlite3
+  snapshot_path: results/assistant/rolling_scan.json
+  pool_asset_types:
+    - stock
+  pool_size: 30
+  # 已扫描合格样本不足 min_sample 时只累积得分不排名，避免早期名单误导。
+  min_sample: 200
+  min_rows: 120
+  # 20 日日均成交额（元）流动性门槛，过滤无法交易的边缘标的。
+  min_average_amount_20d: 30000000.0
+  # 数据截止日距今超过该天数视为过期，自动出池。
+  stale_after_days: 15
+  max_symbols_per_pass: 400
+  score_table_limit: 500
+
 research:
   stock_label_horizon: 20
   stock_topk: 3
