@@ -17,6 +17,13 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
     rank_ic_ir = metrics.get("rank_ic_ir")
     top_bottom_excess = metrics.get("top_bottom_excess_return")
     max_drawdown = metrics.get("test_max_drawdown")
+    benchmark_drawdown = (metrics.get("benchmark") or {}).get("max_drawdown")
+    # The backtest portfolio is always fully invested, so its drawdown scales with the
+    # market regime; constrain the excess over the benchmark instead of an absolute cap.
+    if _finite(benchmark_drawdown):
+        drawdown_limit = abs(float(benchmark_drawdown)) + float(gate["max_excess_test_drawdown"])
+    else:
+        drawdown_limit = float(gate["max_test_drawdown"])
     return {
         "data_quality_and_model_available": bool(metrics.get("model_available", False)),
         "mean_rank_ic_threshold": _finite(rank_ic)
@@ -25,7 +32,7 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         "top_bottom_excess_return_threshold": _finite(top_bottom_excess)
         and float(top_bottom_excess) >= float(gate["min_top_bottom_excess_return"]),
         "test_max_drawdown_threshold": _finite(max_drawdown)
-        and abs(float(max_drawdown)) <= float(gate["max_test_drawdown"]),
+        and abs(float(max_drawdown)) <= drawdown_limit,
     }
 
 

@@ -113,6 +113,27 @@ class ResearchMetricTests(unittest.TestCase):
         }
         self.assertFalse(all(model_gate_checks(old_contract, DEFAULTS["gate"]).values()))
 
+    def test_model_gate_drawdown_is_benchmark_relative(self) -> None:
+        base = {
+            "model_available": True,
+            "mean_rank_ic": 0.03,
+            "rank_ic_ir": 0.11,
+            "top_bottom_excess_return": 0.001,
+            "test_max_drawdown": -0.31,
+            "benchmark": {"max_drawdown": -0.21},
+        }
+
+        checks = model_gate_checks(base, DEFAULTS["gate"])
+        self.assertTrue(checks["test_max_drawdown_threshold"])
+
+        degraded = dict(base, test_max_drawdown=-0.41, benchmark={"max_drawdown": -0.10})
+        self.assertFalse(model_gate_checks(degraded, DEFAULTS["gate"])["test_max_drawdown_threshold"])
+
+        without_benchmark = {key: value for key, value in base.items() if key != "benchmark"}
+        self.assertFalse(
+            model_gate_checks(without_benchmark, DEFAULTS["gate"])["test_max_drawdown_threshold"]
+        )
+
     def test_otc_fund_analysis_compares_same_category_when_peers_exist(self) -> None:
         dates = pd.bdate_range("2024-01-02", periods=70)
         frame = pd.DataFrame(

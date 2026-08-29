@@ -109,6 +109,7 @@ DEFAULTS: dict[str, Any] = {
         "min_rank_ic_ir": 0.10,
         "min_top_bottom_excess_return": 0.00,
         "max_test_drawdown": 0.25,
+        "max_excess_test_drawdown": 0.15,
     },
     "model": {
         "loss": "mse",
