@@ -111,6 +111,8 @@ class StockWorkerTests(unittest.TestCase):
         self.assertEqual(state.successes, [])
         self.assertEqual(state.failures[0][0], "000016")
         self.assertIn("NoDailyBarsError", state.failures[0][1]["error"])
+        self.assertEqual(state.failures[0][1]["backoff_base_seconds"], 86400)
+        self.assertEqual(state.failures[0][1]["backoff_max_seconds"], 86400)
 
     def test_nonempty_response_keeps_real_end_and_verifies_target(self) -> None:
         with tempfile.TemporaryDirectory(

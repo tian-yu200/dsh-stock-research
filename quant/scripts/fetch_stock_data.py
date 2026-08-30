@@ -189,6 +189,7 @@ def _fetch_one(
     end = target.replace("-", "")
     attempts = max(1, int(retries) + 1)
     last_error: str | None = None
+    confirmed_empty = False
     for attempt in range(1, attempts + 1):
         if deadline is not None and time.monotonic() >= deadline:
             last_error = "worker deadline reached before next request"
@@ -235,6 +236,9 @@ def _fetch_one(
                 }
                 return code, True, metadata, None
             last_error = f"{type(exc).__name__}: {exc}"
+            # 三个独立数据源一致确认无行情：重试不会改变结果，
+            # 用 24 小时退避，避免每轮 wave 都重新确认全部死代码。
+            confirmed_empty = True
             break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -251,12 +255,17 @@ def _fetch_one(
                     delay = min(delay, remaining)
                 if delay:
                     time.sleep(delay)
+    if confirmed_empty:
+        failure_backoff_base = failure_backoff_max = 86400
+    else:
+        failure_backoff_base = max(1, int(backoff_base))
+        failure_backoff_max = max(1, int(backoff_max))
     state.mark_failure(
         "stock",
         code,
         error=last_error or "unknown fetch error",
-        backoff_base_seconds=max(1, int(backoff_base)),
-        backoff_max_seconds=max(1, int(backoff_max)),
+        backoff_base_seconds=failure_backoff_base,
+        backoff_max_seconds=failure_backoff_max,
         owner=lease_owner,
     )
     return code, False, None, last_error
