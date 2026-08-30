@@ -219,7 +219,13 @@ def get_rolling_scan(
     limit: int = 30,
 ) -> dict[str, Any]:
     """Read the rolling-scan snapshot (preliminary pool built during a scan)."""
-    snapshot_path = research.ASSISTANT_RESULTS_DIR / "rolling_scan.json"
+    config = research.load_config()
+    snapshot_path = fixed_path(
+        (config.get("rolling_scan") or {}).get(
+            "snapshot_path",
+            research.ASSISTANT_RESULTS_DIR / "rolling_scan.json",
+        )
+    )
     snapshot = read_json(snapshot_path)
     if snapshot is None:
         return {

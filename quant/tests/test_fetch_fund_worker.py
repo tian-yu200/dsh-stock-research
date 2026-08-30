@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import fetch_fund_data as worker
+from fetch_state import FetchState
 from fetch_utils import FundNavValidationError, merge_otc_frames
 
 
@@ -242,8 +243,9 @@ class _BulkStateSpy:
     def list_assets(self, asset_types, *, statuses=None, limit=200):
         return self.rows
 
-    def mark_success(self, kind: str, symbol: str, **kwargs) -> None:
+    def mark_success(self, kind: str, symbol: str, **kwargs) -> bool:
         self.successes.append((kind, symbol))
+        return True
 
 
 class BulkRefreshTests(unittest.TestCase):
@@ -281,6 +283,56 @@ class BulkRefreshTests(unittest.TestCase):
 
         self.assertEqual((ok, processed), (1, 1))
         self.assertEqual(state.successes, [("otc_fund", "110020")])
+
+    def test_bulk_refresh_updates_state_without_an_unclaimed_owner(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="fund-bulk-state-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            state.register_assets("otc_fund", ["110020"])
+            state.mark_success(
+                "otc_fund",
+                "110020",
+                data_end_date="2026-08-27",
+                source="test",
+                rows=1,
+                refresh_interval_seconds=86400,
+            )
+            path = root / "fund_110020.csv"
+            path.write_text(
+                "date,close\n2026-08-27,1.49\n",
+                encoding="utf-8-sig",
+            )
+            with (
+                patch.object(
+                    worker,
+                    "_bulk_otc_snapshot",
+                    return_value={"110020": [("2026-08-29", 1.51)]},
+                ),
+                patch.object(
+                    worker,
+                    "_path",
+                    return_value=path,
+                ),
+            ):
+                ok, processed = worker._bulk_refresh_otc(
+                    pool=["110020"],
+                    state=state,
+                    lease_owner="not-claimed",
+                    deadline=None,
+                )
+
+            row = state.list_assets(
+                ["otc_fund"],
+                statuses=["success"],
+                limit=10,
+            )[0]
+
+        self.assertEqual((ok, processed), (1, 1))
+        self.assertEqual(row["data_end_date"], "2026-08-29")
+        self.assertEqual(row["status"], "success")
 
     def test_bulk_refresh_skips_funds_without_existing_csv(self) -> None:
         state = _BulkStateSpy()
@@ -323,6 +375,16 @@ class BulkRefreshTests(unittest.TestCase):
 
         self.assertEqual((ok, processed), (1, 1))
         self.assertEqual(state.successes, [("otc_fund", "110020")])
+
+    def test_bulk_snapshot_missing_code_column_falls_back(self) -> None:
+        raw = pd.DataFrame(
+            {
+                "基金简称": ["test"],
+                "2026-08-29-单位净值": [1.5],
+            }
+        )
+        with patch.object(worker.ak, "fund_open_fund_daily_em", return_value=raw):
+            self.assertIsNone(worker._bulk_otc_snapshot())
 
 
 if __name__ == "__main__":

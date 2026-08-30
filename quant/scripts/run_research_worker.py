@@ -621,9 +621,8 @@ def main(argv: list[str] | None = None) -> int:
             _run_rolling_scan(job_id, config, status_value)
             atomic_write_json(run_dir / "status.json", _jsonable(status_value))
             if result["status"] in {"failed", "timeout"}:
-                # 单类抓取失败/超时只记录并继续下一类：个别毒标的耗尽该类
-                # 配额不应让整轮 wave 中途夭折，其余类别的检查点仍然有效，
-                # 未完成部分由下一轮 wave 续抓。
+                # 超时是有检查点的正常波次收尾；真正的 child failed
+                # 仍允许完成其余类别，但本轮绝不进入研究发布阶段。
                 status_value["last_error"] = f"{asset_type} fetch worker {result['status']}"
                 print(
                     f"[wave] {asset_type} fetch worker {result['status']}; "
@@ -662,17 +661,52 @@ def main(argv: list[str] | None = None) -> int:
         minimum_coverage = float(
             config["fetch"].get("min_universe_coverage", 0.95)
         )
+        child_failed = any(
+            result.get("status") == "failed" for result in fetch_results
+        )
         fetch_gate_passed = bool(progress["total"]) and (
+            not child_failed
+            and
             progress["coverage"] >= minimum_coverage
         )
         status_value["fetch_gate"] = {
             "passed": fetch_gate_passed,
+            "child_failed": child_failed,
             "coverage": progress["coverage"],
             "minimum_coverage": minimum_coverage,
             "pending": progress["pending"],
             "failed": progress["failed"],
             "stale": progress["stale"],
         }
+        if child_failed:
+            failed_types = [
+                str(result.get("asset_type") or "unknown")
+                for result in fetch_results
+                if result.get("status") == "failed"
+            ]
+            message = (
+                "抓取子进程失败，禁止进入研究发布阶段："
+                + ", ".join(failed_types)
+            )
+            finished_at = datetime.now(timezone.utc).isoformat()
+            status_value.update(
+                {
+                    "status": "failed",
+                    "phase": "fetch",
+                    "message": message,
+                    "error": message,
+                    "finished_at": finished_at,
+                }
+            )
+            state.update_job(
+                job_id,
+                status="failed",
+                finished_at=finished_at,
+                last_error=message,
+            )
+            atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+            _print_status(status_value)
+            return 1
         if not fetch_gate_passed:
             state.update_job(job_id, status="queued")
             fetch_type_interrupted = any(

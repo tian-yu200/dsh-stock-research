@@ -41,13 +41,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "state_db": "data/rolling_scan.sqlite3",
     "snapshot_path": "results/assistant/rolling_scan.json",
-    "pool_asset_types": ["stock"],
+    "pool_asset_types": ["stock", "etf"],
     "pool_size": 30,
     "min_sample": 200,
     "min_rows": 120,
     "min_average_amount_20d": 30000000.0,
     "stale_after_days": 15,
-    "max_symbols_per_pass": 400,
+    "max_symbols_per_pass": 800,
     "score_table_limit": 500,
 }
 
@@ -376,18 +376,33 @@ def _rank_scores(
     rows: list[dict[str, Any]],
     settings: dict[str, Any],
     today: date,
+) -> dict[str, tuple[list[dict[str, Any]], dict[str, str]]]:
+    """Rank eligible rows within each pool asset type by trend_score.
+
+    Returns ``{asset_type: (ranked_rows, ineligibility_reasons)}`` so every
+    pool type opens its own top-N once it has enough eligible samples.
+    """
+    return {
+        str(asset_type): _rank_one_type(
+            [dict(row) for row in rows if str(row["asset_type"]) == str(asset_type)],
+            settings,
+            today,
+        )
+        for asset_type in settings["pool_asset_types"]
+    }
+
+
+def _rank_one_type(
+    rows: list[dict[str, Any]],
+    settings: dict[str, Any],
+    today: date,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Return eligible rows ranked by trend_score plus ineligibility reasons."""
-    pool_types = set(settings["pool_asset_types"])
     min_rows = int(settings["min_rows"])
     min_amount = float(settings["min_average_amount_20d"])
     stale_after = int(settings["stale_after_days"])
     eligible: list[dict[str, Any]] = []
     ineligible: dict[str, str] = {}
-    for raw in rows:
-        row = dict(raw)
-        if str(row["asset_type"]) not in pool_types:
-            continue
+    for row in rows:
         key = f"{row['asset_type']}:{row['symbol']}"
         reasons: list[str] = []
         if row.get("trend_score") is None:
@@ -450,7 +465,7 @@ def run_rolling_pass(
     config = config or research.load_config()
     settings = _settings(config)
     started = time.monotonic()
-    state_rows, totals = _read_state(Path(config["fetch"]["state_db"]))
+    state_rows, totals = _read_state(fixed_path(config["fetch"]["state_db"]))
     coverage = _coverage(totals)
     store = RollingScanStore(fixed_path(settings["state_db"]))
 
@@ -470,6 +485,15 @@ def run_rolling_pass(
         if scored.get((str(row["asset_type"]), str(row["symbol"])))
         != row.get("data_end_date")
     ]
+    # 池内资产类型优先分析，避免被未入池类型（如场外基金）的大批积压饿死。
+    pool_first = {str(value) for value in settings["pool_asset_types"]}
+    pending.sort(
+        key=lambda row: (
+            0 if str(row["asset_type"]) in pool_first else 1,
+            str(row["asset_type"]),
+            str(row["symbol"]),
+        )
+    )
     pending_total = len(pending)
     cap = pending_total if max_symbols is not None else settings["max_symbols_per_pass"]
     selected = pending[: max(0, int(cap))]
@@ -477,28 +501,49 @@ def run_rolling_pass(
     store.upsert_scores(analyzed)
 
     all_rows = store.all_scores()
-    eligible, ineligible = _rank_scores(all_rows, settings, datetime.now(timezone.utc).date())
+    ranking = _rank_scores(all_rows, settings, datetime.now(timezone.utc).date())
     min_sample = int(settings["min_sample"])
     pool_size = int(settings["pool_size"])
-    pool_status = "active" if len(eligible) >= min_sample else "accumulating"
-    pool_keys = [
-        f"{row['asset_type']}:{row['symbol']}" for row in eligible[:pool_size]
-    ] if pool_status == "active" else []
+    eligible_count = sum(len(ranked) for ranked, _ in ranking.values())
+    eligible_by_type = {
+        str(asset_type): len(ranked)
+        for asset_type, (ranked, _) in ranking.items()
+    }
+    ineligible: dict[str, str] = {}
+    for _, type_ineligible in ranking.values():
+        ineligible.update(type_ineligible)
+    active_types = {
+        str(asset_type)
+        for asset_type, (ranked, _) in ranking.items()
+        if len(ranked) >= min_sample
+    }
+    pool_status = "active" if active_types else "accumulating"
+
+    pool_keys: list[str] = []
+    rank_by_key: dict[str, int] = {}
+    rows_by_key: dict[str, dict[str, Any]] = {}
+    for asset_type, (ranked, _) in ranking.items():
+        if str(asset_type) not in active_types:
+            continue
+        for rank, row in enumerate(ranked, start=1):
+            key = f"{row['asset_type']}:{row['symbol']}"
+            rank_by_key[key] = rank
+            if rank <= pool_size:
+                pool_keys.append(key)
+                rows_by_key[key] = row
 
     events: list[dict[str, Any]] = []
     previous_raw = store.get_meta("pool_state")
     previous = json.loads(previous_raw) if previous_raw else []
     if pool_status == "active":
-        rank_by_key = {
-            f"{row['asset_type']}:{row['symbol']}": rank
-            for rank, row in enumerate(eligible, start=1)
-        }
         new_set = set(pool_keys)
         previous_set = set(previous)
-        for rank, key in enumerate(pool_keys, start=1):
+        for key in pool_keys:
             if key in previous_set:
                 continue
             asset_type, symbol = key.split(":", 1)
+            row = rows_by_key[key]
+            rank = rank_by_key[key]
             events.append(
                 {
                     "created_at": utc_now_iso(),
@@ -507,8 +552,11 @@ def run_rolling_pass(
                     "asset_type": asset_type,
                     "symbol": symbol,
                     "rank": rank,
-                    "score": eligible[rank - 1].get("trend_score"),
-                    "reason": f"trend_score={float(eligible[rank - 1]['trend_score']):.4f}，初选排名第 {rank} 位",
+                    "score": row.get("trend_score"),
+                    "reason": (
+                        f"trend_score={float(row['trend_score']):.4f}，"
+                        f"{asset_type} 初选排名第 {rank} 位"
+                    ),
                 }
             )
         for key in previous:
@@ -550,19 +598,20 @@ def run_rolling_pass(
         "updated_at": utc_now_iso(),
         "coverage": coverage,
         "scored_total": len(all_rows),
-        "eligible_count": len(eligible),
+        "eligible_count": eligible_count,
+        "eligible_by_type": eligible_by_type,
         "analyzed_this_pass": len(analyzed),
         "pending_remaining": pending_total - len(selected),
         "pool": [
-            _pool_item(row, rank)
-            for rank, row in enumerate(eligible[:pool_size], start=1)
-        ]
-        if pool_status == "active"
-        else [],
+            _pool_item(rows_by_key[key], rank_by_key[key]) for key in pool_keys
+        ],
         "recent_events": store.recent_events(_EVENT_HISTORY_LIMIT),
         "score_table": [
             _pool_item(row, rank)
-            for rank, row in enumerate(eligible[: int(settings["score_table_limit"])], start=1)
+            for asset_type, (ranked, _) in ranking.items()
+            for rank, row in enumerate(
+                ranked[: int(settings["score_table_limit"])], start=1
+            )
         ],
         "settings": {
             key: settings[key]
@@ -588,7 +637,8 @@ def run_rolling_pass(
         "analyzed_this_pass": len(analyzed),
         "pending_remaining": pending_total - len(selected),
         "scored_total": len(all_rows),
-        "eligible_count": len(eligible),
+        "eligible_count": eligible_count,
+        "eligible_by_type": eligible_by_type,
         "pool_size": len(pool_keys),
         "events_added": len(events),
         "coverage": coverage,

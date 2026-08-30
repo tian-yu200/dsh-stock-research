@@ -371,6 +371,7 @@ def run(config_path: pathlib.Path) -> None:
         fit_end_time=dataset_config["fit_end_time"],
         label_horizon=horizon,
         segments=dataset_config["segments"],
+        backtest_fields={"$open": "BACKTEST_OPEN", "$close": "BACKTEST_CLOSE"},
     )
     model = train_lgbm(dataset, config["model"], verbose_eval=25)
 
@@ -382,16 +383,14 @@ def run(config_path: pathlib.Path) -> None:
         metrics[segment] = prediction_metrics(prediction, labels)
         prediction.to_csv(result_dir / f"predictions_{segment}.csv", encoding="utf-8-sig")
 
-    fields = ["$open", "$close"]
-    stock_instruments = D.instruments(dataset_config["instruments"])
-    stock_raw = D.features(
-        stock_instruments,
-        fields,
-        start_time=dataset_config["start_time"],
-        end_time=dataset_config["end_time"],
+    stock_raw = dataset.handler.fetch(
+        selector=slice(dataset_config["start_time"], dataset_config["end_time"]),
+        level="datetime",
+        col_set="backtest",
+        data_key="raw",
     )
-    opens = stock_raw["$open"].unstack("instrument").sort_index()
-    closes = stock_raw["$close"].unstack("instrument").sort_index()
+    opens = stock_raw["BACKTEST_OPEN"].unstack("instrument").sort_index()
+    closes = stock_raw["BACKTEST_CLOSE"].unstack("instrument").sort_index()
     test_prediction = predictions["test"]
     group_metrics = forward_group_metrics(test_prediction, closes, horizon)
     test_start = pd.Timestamp(dataset_config["segments"]["test"][0])

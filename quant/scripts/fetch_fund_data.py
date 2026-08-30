@@ -173,6 +173,9 @@ def _bulk_otc_snapshot() -> dict[str, list[tuple[str, float]]] | None:
     except Exception as exc:
         print(f"[批量] 全市场净值快照失败，回退逐只: {type(exc).__name__}: {exc}")
         return None
+    if not isinstance(raw, pd.DataFrame):
+        print("[批量] 快照响应不是表格，回退逐只")
+        return None
     dated_columns = sorted(
         (match.group(1), column)
         for column in raw.columns
@@ -181,7 +184,14 @@ def _bulk_otc_snapshot() -> dict[str, list[tuple[str, float]]] | None:
     if not dated_columns:
         print("[批量] 快照缺少带日期的单位净值列，回退逐只")
         return None
-    codes = raw["基金代码"].astype(str).str.strip()
+    code_column = next(
+        (column for column in raw.columns if str(column).strip() == "基金代码"),
+        None,
+    )
+    if code_column is None:
+        print("[批量] 快照缺少基金代码列，回退逐只")
+        return None
+    codes = raw[code_column].astype(str).str.strip()
     snapshot: dict[str, list[tuple[str, float]]] = {}
     for date_str, column in dated_columns:
         values = pd.to_numeric(raw[column], errors="coerce")
@@ -252,15 +262,19 @@ def _bulk_refresh_otc(
             metadata = _write_success("otc_fund", str(code), frame, path)
         except FundNavValidationError:
             continue
-        state.mark_success(
+        updated = state.mark_success(
             "otc_fund",
             str(code),
             data_end_date=metadata["data_end_date"],
             source=metadata.get("source"),
             rows=metadata["rows"],
             refresh_interval_seconds=5 * 86400,
-            owner=lease_owner,
+            # 批量路径尚未 claim_due，不能冒用本 worker 的 lease。
+            owner=None,
         )
+        if not updated:
+            print(f"[批量] 状态库未更新，跳过成功计数: otc_fund:{code}")
+            continue
         ok += 1
         if ok % 2000 == 0:
             print(f"[批量] 已推进 {ok} 只基金净值")

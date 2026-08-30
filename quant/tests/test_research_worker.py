@@ -177,6 +177,72 @@ class ResearchWorkerTests(unittest.TestCase):
             self.assertEqual(status["status"], "queued")
             self.assertIn("回到队列", str(status.get("message", "")))
 
+    def test_failed_fetch_child_blocks_research_even_when_coverage_passes(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="research-worker-failed-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "run"
+            state = FetchState(root / "state.sqlite3")
+            job_id = "20260827T000000Z-failed01"
+            symbols = [f"{index:06d}" for index in range(21)]
+            state.register_assets("stock", symbols)
+            for symbol in symbols[:-1]:
+                state.mark_success(
+                    "stock",
+                    symbol,
+                    data_end_date="2026-08-27",
+                    source="test",
+                    rows=1,
+                    refresh_interval_seconds=86400,
+                )
+            state.create_job(
+                job_id,
+                kind="research",
+                asset_scope="stock",
+                metadata={
+                    "mode": "daily",
+                    "asset_scope": "stock",
+                    "asset_types": ["stock"],
+                    "symbols": {"stock": symbols},
+                    "full_universe": False,
+                    "target_date": "2026-08-27",
+                },
+            )
+
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(state.path)
+            config["fetch"]["max_data_age_days"] = 5
+            failed_fetch = {
+                "asset_type": "stock",
+                "status": "failed",
+                "returncode": 1,
+                "summary": None,
+                "stdout_tail": "",
+                "stderr_tail": "child crashed",
+                "timeout_seconds": 60,
+                "time_budget_seconds": 15,
+            }
+            with (
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(worker, "_run_fetch_script", return_value=failed_fetch),
+                patch.object(worker, "_run_rolling_scan"),
+                patch.object(worker, "_run_research_process") as research,
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            job = state.get_job(job_id)
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(status["status"], "failed")
+        self.assertFalse(status["fetch_gate"]["passed"])
+        self.assertTrue(status["fetch_gate"]["child_failed"])
+        research.assert_not_called()
+
     def test_minimum_coverage_allows_research_with_pending_assets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="research-coverage-", dir=ROOT / "tests") as directory:
             root = pathlib.Path(directory)

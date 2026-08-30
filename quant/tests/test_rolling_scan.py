@@ -47,6 +47,21 @@ def _write_csv(stocks_dir: pathlib.Path, symbol: str, drift: float) -> None:
     frame.to_csv(stocks_dir / f"{symbol}.csv", index=False)
 
 
+def _write_etf_csv(funds_dir: pathlib.Path, symbol: str, drift: float) -> None:
+    funds_dir.mkdir(parents=True, exist_ok=True)
+    dates = pd.bdate_range(end=END_DATE, periods=260)
+    closes = [10.0 * (1.0 + drift) ** index for index in range(260)]
+    frame = pd.DataFrame(
+        {
+            "date": dates.strftime("%Y-%m-%d"),
+            "close": closes,
+            "volume": 1_000_000.0,
+            "amount": 50_000_000.0,
+        }
+    )
+    frame.to_csv(funds_dir / f"etf_{symbol}.csv", index=False)
+
+
 def _make_state(root: pathlib.Path, symbols: list[str]) -> FetchState:
     state = FetchState(root / "fetch_state.sqlite3")
     state.register_assets("stock", symbols)
@@ -253,25 +268,132 @@ class RollingScanTests(unittest.TestCase):
             config = _config(root)
             with patch.object(research, "DATA_DIR", root), patch.object(
                 research, "UNIVERSE_PATH", root / "universe.json"
-            ):
+            ), patch.object(research, "load_config", return_value=config):
                 rolling_scan.run_rolling_pass("job-1", config=config)
 
             with patch.object(research, "ASSISTANT_RESULTS_DIR", root):
-                result = read_api.get_rolling_scan(symbol="600001")
+                with patch.object(research, "load_config", return_value=config):
+                    result = read_api.get_rolling_scan(symbol="600001")
                 self.assertEqual(result["status"], "ok")
                 self.assertEqual(result["pool"][0]["symbol"], "600001")
                 self.assertEqual(result["score_table"][0]["symbol"], "600001")
 
-                everything = read_api.get_rolling_scan(limit=100)
+                with patch.object(research, "load_config", return_value=config):
+                    everything = read_api.get_rolling_scan(limit=100)
                 self.assertEqual(len(everything["score_table"]), 6)
 
-                missing = read_api.get_rolling_scan(symbol="600006")
+                with patch.object(research, "load_config", return_value=config):
+                    missing = read_api.get_rolling_scan(symbol="600006")
                 self.assertEqual(missing["pool"], [])
                 self.assertEqual(missing["score_table"], [])
 
+            empty_config = copy.deepcopy(config)
+            empty_config["rolling_scan"]["snapshot_path"] = str(
+                root / "empty" / "rolling_scan.json"
+            )
             with patch.object(research, "ASSISTANT_RESULTS_DIR", root / "empty"):
-                empty = read_api.get_rolling_scan()
+                with patch.object(research, "load_config", return_value=empty_config):
+                    empty = read_api.get_rolling_scan()
             self.assertEqual(empty["status"], "no_rolling_scan")
+
+    def test_read_api_uses_custom_snapshot_path(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="rolling-custom-path-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            for symbol, drift in SYMBOL_DRIFTS.items():
+                _write_csv(root / "stocks", symbol, drift)
+            _make_state(root, list(SYMBOL_DRIFTS))
+            custom_path = root / "custom" / "snapshot.json"
+            config = _config(root, snapshot_path=str(custom_path))
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                rolling_scan.run_rolling_pass("job-1", config=config)
+
+            with patch.object(research, "load_config", return_value=config):
+                result = read_api.get_rolling_scan()
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["pool"][0]["symbol"], "600000")
+            self.assertTrue(custom_path.exists())
+
+    def test_rolling_scan_rejects_external_fetch_state_path(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="rolling-external-state-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            config = _config(root)
+            external_state = ROOT.parent / "outside-rolling-state.sqlite3"
+            config["fetch"]["state_db"] = str(external_state)
+            with self.assertRaises(ValueError):
+                rolling_scan.run_rolling_pass("job-1", config=config)
+            self.assertFalse(external_state.exists())
+
+    def test_per_type_pools_and_pool_type_priority(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rolling-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            for symbol, drift in SYMBOL_DRIFTS.items():
+                _write_csv(root / "stocks", symbol, drift)
+            _write_etf_csv(root / "funds", "510300", 0.012)
+            _write_etf_csv(root / "funds", "510500", 0.006)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.register_assets("stock", list(SYMBOL_DRIFTS))
+            for symbol in SYMBOL_DRIFTS:
+                state.mark_success(
+                    "stock", symbol,
+                    data_end_date=END_DATE, source="test", rows=260,
+                    refresh_interval_seconds=86400,
+                )
+            state.register_assets("etf", ["510300", "510500"])
+            state.register_assets("otc_fund", ["000001"])
+            for asset_type, symbols in (
+                ("etf", ["510300", "510500"]),
+                ("otc_fund", ["000001"]),
+            ):
+                for symbol in symbols:
+                    state.mark_success(
+                        asset_type, symbol,
+                        data_end_date=END_DATE, source="test", rows=260,
+                        refresh_interval_seconds=86400,
+                    )
+
+            # 优先级：单波名额先给池内类型，场外基金排队在后。
+            config = _config(root, max_symbols_per_pass=4)
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                summary = rolling_scan.run_rolling_pass("job-1", config=config)
+            self.assertEqual(summary["analyzed_this_pass"], 4)
+            store = rolling_scan.RollingScanStore(root / "rolling_scan.sqlite3")
+            scored_types = {row["asset_type"] for row in store.all_scores()}
+            self.assertEqual(scored_types, {"stock", "etf"})
+
+            # 每类各自开池：股票和 ETF 各出 top-2，互不挤占。
+            config = _config(root, max_symbols_per_pass=100, min_sample=2)
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                summary = rolling_scan.run_rolling_pass("job-1", config=config)
+            self.assertEqual(summary["pool_status"], "active")
+            self.assertEqual(summary["eligible_by_type"], {"stock": 6, "etf": 2})
+            snapshot = json.loads((root / "rolling_scan.json").read_text(encoding="utf-8"))
+            pool = snapshot["pool"]
+            self.assertEqual(
+                [(item["asset_type"], item["symbol"]) for item in pool],
+                [
+                    ("stock", "600000"),
+                    ("stock", "600001"),
+                    ("etf", "510300"),
+                    ("etf", "510500"),
+                ],
+            )
+            self.assertEqual(len(snapshot["score_table"]), 8)
+            enters = [
+                event for event in snapshot["recent_events"] if event["event"] == "enter"
+            ]
+            self.assertEqual(len(enters), 4)
 
     def test_worker_hook_isolates_failures_and_respects_enabled_flag(self) -> None:
         config = _config(pathlib.Path(ROOT / "tests"))

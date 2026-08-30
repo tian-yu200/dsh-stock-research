@@ -343,12 +343,12 @@ class FetchState:
         refresh_interval_seconds: int,
         verified_through: str | None = None,
         owner: str | None = None,
-    ) -> None:
+    ) -> bool:
         now = utc_now()
         next_retry = now + timedelta(seconds=max(0, refresh_interval_seconds))
         verified_date = verified_through or data_end_date
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE assets
                 SET data_end_date = ?,
@@ -377,6 +377,7 @@ class FetchState:
                     owner,
                 ),
             )
+        return cursor.rowcount > 0
 
     def mark_failure(
         self,
@@ -670,6 +671,55 @@ class FetchState:
                 [*updates.values(), job_id],
             )
         return self.get_job(job_id)
+
+    def update_job_if(
+        self,
+        job_id: str,
+        *,
+        expected_status: str | None = None,
+        expected_started_at: str | None = None,
+        **values: Any,
+    ) -> bool:
+        """Update a job only while its observed worker generation is unchanged."""
+        allowed = {
+            "status",
+            "started_at",
+            "finished_at",
+            "total",
+            "completed",
+            "pending",
+            "failed",
+            "stale",
+            "coverage",
+            "last_error",
+            "metadata_json",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if "metadata" in values:
+            updates["metadata_json"] = json.dumps(
+                values["metadata"],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        if not updates:
+            return False
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        conditions = ["job_id = ?"]
+        parameters: list[Any] = [*updates.values(), job_id]
+        if expected_status is not None:
+            conditions.append("status = ?")
+            parameters.append(expected_status)
+        if expected_started_at is not None:
+            conditions.append("started_at = ?")
+            parameters.append(expected_started_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = connection.execute(
+                f"UPDATE jobs SET {assignments} WHERE {' AND '.join(conditions)}",
+                parameters,
+            )
+            connection.commit()
+        return result.rowcount == 1
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:

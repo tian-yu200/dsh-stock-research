@@ -148,7 +148,22 @@ class ResearchMetricTests(unittest.TestCase):
             "asset_count": 6,
             "stale_assets": ["000001", "000002"],
         }
-        self.assertFalse(research._freshness_passed(directed, config))
+        self.assertFalse(
+            research._freshness_passed(directed, config, full_universe=False)
+        )
+
+        one_stale_directed = {
+            "stale": True,
+            "asset_count": 20,
+            "stale_assets": ["000001"],
+        }
+        self.assertFalse(
+            research._freshness_passed(
+                one_stale_directed,
+                config,
+                full_universe=False,
+            )
+        )
 
         fresh = {"stale": False, "asset_count": 5551, "stale_assets": []}
         self.assertTrue(research._freshness_passed(fresh, config))

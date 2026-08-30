@@ -53,15 +53,16 @@ rolling_scan:
   snapshot_path: results/assistant/rolling_scan.json
   pool_asset_types:
     - stock
+    - etf
   pool_size: 30
-  # 已扫描合格样本不足 min_sample 时只累积得分不排名，避免早期名单误导。
+  # 每类资产各自开池：该类合格样本达到 min_sample 才输出该类的 top-N 名单。
   min_sample: 200
   min_rows: 120
   # 20 日日均成交额（元）流动性门槛，过滤无法交易的边缘标的。
   min_average_amount_20d: 30000000.0
   # 数据截止日距今超过该天数视为过期，自动出池。
   stale_after_days: 15
-  max_symbols_per_pass: 400
+  max_symbols_per_pass: 800
   score_table_limit: 500
 
 research:

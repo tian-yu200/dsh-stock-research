@@ -153,6 +153,89 @@ def init_qlib(provider_uri: str | Path, *, kernels: int = 1) -> Path:
     return provider
 
 
+class _SingleQueryQlibDataLoader:
+    """Load Alpha158 fields and auxiliary backtest fields in one provider query.
+
+    Qlib's stock loader normally calls ``D.features`` once per field group.
+    Keeping the auxiliary close in a separate group preserves the model's
+    feature/label contract while this loader shares the underlying query.
+    """
+
+    def __init__(
+        self,
+        field_groups: Mapping[str, tuple[list[str], list[str]]],
+        *,
+        filter_pipe: Any = None,
+        freq: str = "day",
+        inst_processors: Any = None,
+        data_api: Any = None,
+    ) -> None:
+        self.fields = {
+            group: (list(exprs), list(names))
+            for group, (exprs, names) in field_groups.items()
+        }
+        for group, (exprs, names) in self.fields.items():
+            if len(exprs) != len(names):
+                raise ValueError(f"field/name count mismatch for Qlib group {group!r}")
+        self.filter_pipe = filter_pipe
+        self.freq = freq
+        self.inst_processors = [] if inst_processors is None else inst_processors
+        self._data_api = data_api
+
+    def _api(self) -> Any:
+        if self._data_api is not None:
+            return self._data_api
+        from qlib.data import D
+
+        return D
+
+    def load(
+        self,
+        instruments: Any = None,
+        start_time: str | pd.Timestamp | None = None,
+        end_time: str | pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        data_api = self._api()
+        query_instruments = instruments
+        if isinstance(query_instruments, str):
+            query_instruments = data_api.instruments(
+                query_instruments,
+                filter_pipe=self.filter_pipe,
+            )
+
+        fields: list[str] = []
+        for exprs, _ in self.fields.values():
+            for expression in exprs:
+                if expression not in fields:
+                    fields.append(expression)
+
+        raw = data_api.features(
+            query_instruments,
+            fields,
+            start_time,
+            end_time,
+            freq=self.freq,
+            inst_processors=self.inst_processors,
+        )
+        if len(raw.columns) != len(fields):
+            raise ValueError(
+                "Qlib returned an unexpected field count: "
+                f"expected {len(fields)}, got {len(raw.columns)}"
+            )
+
+        # D.features returns (instrument, datetime), matching QlibDataLoader's
+        # per-group normalization before it concatenates the groups.
+        raw = raw.copy()
+        raw.columns = fields
+        raw = raw.swaplevel().sort_index()
+        groups = {}
+        for group, (exprs, names) in self.fields.items():
+            selected = raw.loc[:, exprs].copy()
+            selected.columns = names
+            groups[group] = selected
+        return pd.concat(groups, axis=1)
+
+
 def build_dataset(
     *,
     instruments: Any,
@@ -162,11 +245,14 @@ def build_dataset(
     fit_end_time: str,
     label_horizon: int,
     segments: Mapping[str, Any],
+    backtest_fields: Mapping[str, str] | None = None,
 ) -> Any:
     """Alpha158 handler + DatasetH：两条训练路径共享的同一数据集构建。"""
     from qlib.contrib.data.handler import Alpha158
     from qlib.data.dataset import DatasetH
 
+    # Build the normal handler without loading first so the feature, label,
+    # and backtest groups can share one Qlib provider query.
     handler = Alpha158(
         instruments=instruments,
         start_time=start_time,
@@ -182,7 +268,28 @@ def build_dataset(
             {"class": "DropnaLabel"},
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
         ],
+        init_data=False,
     )
+    field_groups = dict(handler.data_loader.fields)
+    selected_backtest_fields = (
+        {"$close": "BACKTEST_CLOSE"}
+        if backtest_fields is None
+        else dict(backtest_fields)
+    )
+    field_groups["backtest"] = (
+        list(selected_backtest_fields),
+        list(selected_backtest_fields.values()),
+    )
+    original_inst_processors = getattr(handler.data_loader, "inst_processors", None)
+    if isinstance(original_inst_processors, dict):
+        original_inst_processors = []
+    handler.data_loader = _SingleQueryQlibDataLoader(
+        field_groups,
+        filter_pipe=getattr(handler.data_loader, "filter_pipe", None),
+        freq=getattr(handler.data_loader, "freq", "day"),
+        inst_processors=original_inst_processors,
+    )
+    handler.setup_data()
     return DatasetH(handler=handler, segments=segments)
 
 
@@ -281,13 +388,13 @@ def _run_qlib_stock_model(config: Mapping[str, Any]) -> dict[str, Any]:
         test_prediction = predictions["test"]
         if test_prediction.empty:
             raise ValueError("Qlib test prediction is empty")
-        raw = D.features(
-            D.instruments("stocks"),
-            ["$close"],
-            start_time=segments["test"][0],
-            end_time=segments["test"][1],
+        raw = dataset.handler.fetch(
+            selector=slice(segments["test"][0], segments["test"][1]),
+            level="datetime",
+            col_set="backtest",
+            data_key="raw",
         )
-        closes = raw["$close"].unstack("instrument").sort_index()
+        closes = raw["BACKTEST_CLOSE"].unstack("instrument").sort_index()
         future = closes.shift(-1) / closes - 1.0
         strategy_returns: dict[pd.Timestamp, float] = {}
         benchmark_returns: dict[pd.Timestamp, float] = {}
