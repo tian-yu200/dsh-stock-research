@@ -134,6 +134,28 @@ class ResearchMetricTests(unittest.TestCase):
             model_gate_checks(without_benchmark, DEFAULTS["gate"])["test_max_drawdown_threshold"]
         )
 
+    def test_freshness_gate_uses_stale_ratio_tolerance(self) -> None:
+        config = {"fetch": {"min_universe_coverage": 0.93}}
+        full_universe = {
+            "stale": True,
+            "asset_count": 5551,
+            "stale_assets": ["000001", "000002"],
+        }
+        self.assertTrue(research._freshness_passed(full_universe, config))
+
+        directed = {
+            "stale": True,
+            "asset_count": 6,
+            "stale_assets": ["000001", "000002"],
+        }
+        self.assertFalse(research._freshness_passed(directed, config))
+
+        fresh = {"stale": False, "asset_count": 5551, "stale_assets": []}
+        self.assertTrue(research._freshness_passed(fresh, config))
+
+        empty = {"stale": True, "asset_count": 0, "stale_assets": ["000001"]}
+        self.assertFalse(research._freshness_passed(empty, config))
+
     def test_otc_fund_analysis_compares_same_category_when_peers_exist(self) -> None:
         dates = pd.bdate_range("2024-01-02", periods=70)
         frame = pd.DataFrame(

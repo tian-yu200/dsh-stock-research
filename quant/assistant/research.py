@@ -221,6 +221,20 @@ def _asset_scope(value: str) -> tuple[str, ...]:
     return ASSET_SCOPE_MAP[scope]
 
 
+def _freshness_passed(quality: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
+    """全市场规模下 QDII/清盘标的的净值天然滞后，"任何一只过期即否决"
+    会让发布被 0.04% 的滞后长期阻塞；改用与抓取覆盖门槛一致的过期比例容忍，
+    定向小任务的少量过期仍会被拦下。"""
+    if not quality.get("stale"):
+        return True
+    asset_count = int(quality.get("asset_count") or 0)
+    stale_count = len(quality.get("stale_assets") or [])
+    if asset_count <= 0:
+        return False
+    tolerance = 1.0 - float(config.get("fetch", {}).get("min_universe_coverage", 0.95))
+    return (stale_count / asset_count) <= tolerance
+
+
 def run_research(
     mode: str = "daily",
     asset_scope: str = "all",
@@ -471,7 +485,7 @@ def run_research(
             stock_metrics["model_available"] = bool(stock_model.get("model_available"))
             checks = model_gate_checks(stock_metrics, config["gate"])
             checks["data_quality_passed"] = bool(stock_quality["passed"])
-            checks["freshness_passed"] = not bool(stock_quality["stale"])
+            checks["freshness_passed"] = _freshness_passed(stock_quality, config)
             checks["refresh_passed"] = all(
                 result.get("status") == "success"
                 for result in refresh.get("results", [])
@@ -543,7 +557,7 @@ def run_research(
             asset_quality = _aggregate_quality(asset_facts, config)
             checks = {
                 "data_quality_passed": bool(asset_quality["passed"]),
-                "freshness_passed": not bool(asset_quality["stale"]),
+                "freshness_passed": _freshness_passed(asset_quality, config),
                 "refresh_passed": all(
                     result.get("status") == "success"
                     for result in refresh.get("results", [])
