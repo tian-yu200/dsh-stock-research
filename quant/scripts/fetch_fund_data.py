@@ -207,18 +207,32 @@ def _bulk_refresh_otc(
     snapshot = _bulk_otc_snapshot()
     if snapshot is None:
         return 0, 0
+    # 新鲜度以状态库为准、一次查询拿全池；逐个读 2 万个 CSV 每轮要花
+    # 10-20 分钟纯磁盘扫描，会把基金段的抓取配额吃掉一大半。
+    end_dates: dict[str, str] = {}
+    try:
+        for row in state.list_assets(("otc_fund",), limit=len(pool) + 10000):
+            symbol = str(row.get("symbol") or "")
+            end = row.get("data_end_date")
+            if symbol and end:
+                end_dates[symbol] = str(end)
+    except Exception as exc:
+        print(f"[批量] 状态库读取失败，回退逐文件检查: {type(exc).__name__}: {exc}")
     ok = 0
     processed = 0
     max_gap = pd.Timedelta(days=_BULK_MAX_GAP_DAYS)
     for code in pool:
         if deadline is not None and time.monotonic() >= deadline:
             break
-        points = snapshot.get(str(code))
+        code = str(code)
+        points = snapshot.get(code)
         if not points:
             continue
-        path = _path("otc_fund", str(code))
-        last = cached_end_date(path)
+        path = _path("otc_fund", code)
+        last = end_dates.get(code)
         if last is None:
+            last = cached_end_date(path)
+        if last is None or not path.exists():
             continue
         fresh = [(date_str, nav) for date_str, nav in points if date_str > last]
         if not fresh:

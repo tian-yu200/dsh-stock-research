@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,14 @@ def _captured_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value or ""
+
+
+def _read_tail(handle: Any, limit: int = 512 * 1024) -> bytes:
+    """Read the last `limit` bytes of a seekable temp file without loading it all."""
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    handle.seek(max(0, size - limit))
+    return handle.read()
 
 
 def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
@@ -182,43 +191,46 @@ def _run_bounded_command(
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         popen_options["start_new_session"] = True
-    process = subprocess.Popen(
-        command,
-        cwd=str(QUANT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-        creationflags=creation_flags,
-        env=env,
-        **popen_options,
-    )
-    started = time.monotonic()
-    heartbeat_interval = max(
-        1.0,
-        float(config["fetch"].get("heartbeat_interval_seconds", 5)),
-    )
-    timed_out = False
-    stdout = ""
-    stderr = ""
-    while True:
-        remaining = timeout_seconds - (time.monotonic() - started)
-        if remaining <= 0:
-            timed_out = True
-            break
-        try:
-            stdout, stderr = process.communicate(
-                timeout=min(heartbeat_interval, remaining)
-            )
-            break
-        except subprocess.TimeoutExpired:
-            if heartbeat is not None:
-                heartbeat()
-    if timed_out:
-        _terminate_process_tree(
-            process,
-            float(config["fetch"].get("shutdown_grace_seconds", 45)),
+    # 输出重定向到临时文件而非 PIPE：全市场规模的子进程输出（逐标的日志、
+    # tqdm 进度条）远超 64KB 管道缓冲，而带超时的 communicate 重试在
+    # Windows 上无法可靠排空管道，父子进程互相等待形成死锁。
+    # 临时文件随 with 块退出自动删除，读取末尾片段即可覆盖调用方的用途。
+    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+        process = subprocess.Popen(
+            command,
+            cwd=str(QUANT_ROOT),
+            stdout=out_file,
+            stderr=err_file,
+            text=False,
+            creationflags=creation_flags,
+            env=env,
+            **popen_options,
         )
-        stdout, stderr = process.communicate()
+        started = time.monotonic()
+        heartbeat_interval = max(
+            1.0,
+            float(config["fetch"].get("heartbeat_interval_seconds", 5)),
+        )
+        timed_out = False
+        while True:
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                process.wait(timeout=min(heartbeat_interval, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if heartbeat is not None:
+                    heartbeat()
+        if timed_out:
+            _terminate_process_tree(
+                process,
+                float(config["fetch"].get("shutdown_grace_seconds", 45)),
+            )
+            process.wait()
+        stdout = _read_tail(out_file)
+        stderr = _read_tail(err_file)
     return {
         "timed_out": timed_out,
         "returncode": None if timed_out else process.returncode,
@@ -422,7 +434,29 @@ def _run_fetch_script(
     }
 
 
+def _hold_awake() -> None:
+    """本进程存活期间向系统声明"勿待机"。
+
+    Modern Standby（S0）机器在屏幕关闭后会进入待机冻结后台进程；
+    Windows 只认线程级电源请求，不认电源计划里的"从不睡眠"。
+    请求随线程退出自动失效，无需清理。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        es_continuous = 0x80000000
+        es_system_required = 0x00000040
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ctypes.c_uint(es_continuous | es_system_required)
+        )
+    except Exception:
+        return
+
+
 def main(argv: list[str] | None = None) -> int:
+    _hold_awake()
     args = _parser().parse_args(argv)
     config = load_config()
     state = FetchState(Path(config["fetch"]["state_db"]))

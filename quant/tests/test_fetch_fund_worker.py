@@ -235,8 +235,12 @@ class FundNavValidationTests(unittest.TestCase):
 
 
 class _BulkStateSpy:
-    def __init__(self) -> None:
+    def __init__(self, rows=None) -> None:
+        self.rows = list(rows or [])
         self.successes: list[tuple[str, str]] = []
+
+    def list_assets(self, asset_types, *, statuses=None, limit=200):
+        return self.rows
 
     def mark_success(self, kind: str, symbol: str, **kwargs) -> None:
         self.successes.append((kind, symbol))
@@ -244,7 +248,12 @@ class _BulkStateSpy:
 
 class BulkRefreshTests(unittest.TestCase):
     def test_bulk_refresh_extends_existing_series_and_skips_others(self) -> None:
-        state = _BulkStateSpy()
+        state = _BulkStateSpy(
+            rows=[
+                {"symbol": "110020", "data_end_date": "2026-08-27"},
+                {"symbol": "001594", "data_end_date": "2026-08-10"},
+            ]
+        )
         snapshot = {
             "110020": [("2026-08-28", 1.5), ("2026-08-29", 1.51)],
             "001594": [("2026-08-29", 2.0)],
@@ -255,12 +264,8 @@ class BulkRefreshTests(unittest.TestCase):
             fresh_path.write_text("date,close\n2026-08-27,1.49\n", encoding="utf-8-sig")
             stale_path.write_text("date,close\n2026-08-10,1.99\n", encoding="utf-8-sig")
 
-            def cached_end_date(path):
-                return "2026-08-27" if path == fresh_path else "2026-08-10"
-
             with (
                 patch.object(worker, "_bulk_otc_snapshot", return_value=snapshot),
-                patch.object(worker, "cached_end_date", side_effect=cached_end_date),
                 patch.object(worker, "_path", side_effect=lambda kind, code: pathlib.Path(directory) / f"fund_{code}.csv"),
             ):
                 ok, processed = worker._bulk_refresh_otc(
@@ -272,6 +277,7 @@ class BulkRefreshTests(unittest.TestCase):
 
             merged = pd.read_csv(fresh_path)
             self.assertEqual(merged["date"].astype(str).tolist(), ["2026-08-27", "2026-08-28", "2026-08-29"])
+            self.assertEqual(stale_path.read_text(encoding="utf-8-sig").strip().splitlines()[-1], "2026-08-10,1.99")
 
         self.assertEqual((ok, processed), (1, 1))
         self.assertEqual(state.successes, [("otc_fund", "110020")])
@@ -293,6 +299,30 @@ class BulkRefreshTests(unittest.TestCase):
 
         self.assertEqual((ok, processed), (0, 0))
         self.assertEqual(state.successes, [])
+
+    def test_bulk_refresh_falls_back_to_csv_when_state_unavailable(self) -> None:
+        class _BrokenListState(_BulkStateSpy):
+            def list_assets(self, asset_types, *, statuses=None, limit=200):
+                raise RuntimeError("state db unavailable")
+
+        state = _BrokenListState()
+        with tempfile.TemporaryDirectory(prefix="fund-bulk-fb-", dir=ROOT / "tests") as directory:
+            fresh_path = pathlib.Path(directory) / "fund_110020.csv"
+            fresh_path.write_text("date,close\n2026-08-27,1.49\n", encoding="utf-8-sig")
+            with (
+                patch.object(worker, "_bulk_otc_snapshot", return_value={"110020": [("2026-08-29", 1.51)]}),
+                patch.object(worker, "cached_end_date", return_value="2026-08-27"),
+                patch.object(worker, "_path", side_effect=lambda kind, code: pathlib.Path(directory) / f"fund_{code}.csv"),
+            ):
+                ok, processed = worker._bulk_refresh_otc(
+                    pool=["110020"],
+                    state=state,
+                    lease_owner="test",
+                    deadline=None,
+                )
+
+        self.assertEqual((ok, processed), (1, 1))
+        self.assertEqual(state.successes, [("otc_fund", "110020")])
 
 
 if __name__ == "__main__":

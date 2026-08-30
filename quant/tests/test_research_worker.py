@@ -365,9 +365,9 @@ class ResearchWorkerTests(unittest.TestCase):
         config["fetch"]["heartbeat_interval_seconds"] = 1
         config["fetch"]["shutdown_grace_seconds"] = 1
         process = Mock(pid=12345, returncode=None)
-        process.communicate.side_effect = [
+        process.wait.side_effect = [
             subprocess.TimeoutExpired(["test"], 1),
-            ("", ""),
+            0,
         ]
         heartbeat = Mock()
 

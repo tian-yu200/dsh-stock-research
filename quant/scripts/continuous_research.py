@@ -51,9 +51,10 @@ WORKER_LOG_DIR = CONTINUOUS_DIR / "workers"
 
 # 每个 wave 的抓取预算。外部触发间隔约 10 分钟；预算必须接近触发间隔，
 # 否则大部分时间空转等待下一次触发（240s 预算 + 10min 间隔时吞吐仅约 2 标的/分钟）。
-# 壁钟超时必须大于预算 + 研究阶段的耗时，否则 worker 会在抓取中途被杀。
+# 壁钟上限必须覆盖 抓取预算 + qlib 重建 + 研究运行：抓取门槛首次通过的
+# 那一轮 wave 会在同一进程内连续跑完三个阶段，预算 3300s + 研究约 30min。
 WORKER_TIME_BUDGET_SECONDS = 3300
-WORKER_WALL_TIMEOUT_SECONDS = 4200
+WORKER_WALL_TIMEOUT_SECONDS = 8400
 STALE_AFTER_SECONDS = 21600
 LONG_STALE_EXTRA_DAYS = 20
 LONG_STALE_RETRY_INTERVAL_SECONDS = 6 * 60 * 60

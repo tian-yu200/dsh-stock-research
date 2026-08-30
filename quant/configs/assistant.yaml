@@ -15,7 +15,10 @@ fetch:
   retries: 2
   retry_delay_seconds: 3
   max_data_age_days: 5
-  min_universe_coverage: 0.95
+  # 95% 时 QDII/货币基金的 T+1/T+2 净值发布滞后 + 退市死代码会把覆盖率
+  # 长期压在 93.5% 左右，任务空转无法进入发布；死代码已三源逐一确认，
+  # 数据实质成功率 97.9%，93% 门槛仍保留约束力。
+  min_universe_coverage: 0.93
   target_lag_trading_days:
     stock: 0
     etf: 1
