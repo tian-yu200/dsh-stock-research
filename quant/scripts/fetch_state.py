@@ -77,6 +77,8 @@ class FetchState:
                     status TEXT NOT NULL DEFAULT 'pending',
                     source TEXT,
                     last_error TEXT,
+                    failure_class TEXT,
+                    failure_details_json TEXT,
                     rows INTEGER,
                     lease_owner TEXT,
                     lease_until TEXT,
@@ -106,6 +108,14 @@ class FetchState:
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(assets)").fetchall()
+            }
+            if "failure_class" not in columns:
+                connection.execute("ALTER TABLE assets ADD COLUMN failure_class TEXT")
+            if "failure_details_json" not in columns:
+                connection.execute("ALTER TABLE assets ADD COLUMN failure_details_json TEXT")
 
     @staticmethod
     def _symbols(values: Iterable[str]) -> list[str]:
@@ -357,6 +367,8 @@ class FetchState:
                     status = 'success',
                     source = ?,
                     last_error = NULL,
+                    failure_class = NULL,
+                    failure_details_json = NULL,
                     rows = ?,
                     lease_owner = NULL,
                     lease_until = NULL,
@@ -387,6 +399,8 @@ class FetchState:
         error: str,
         backoff_base_seconds: int,
         backoff_max_seconds: int,
+        failure_class: str | None = None,
+        field_anomalies: Mapping[str, Any] | None = None,
         owner: str | None = None,
     ) -> None:
         now = utc_now()
@@ -411,6 +425,8 @@ class FetchState:
                 SET next_retry_at = ?,
                     status = 'failed',
                     last_error = ?,
+                    failure_class = ?,
+                    failure_details_json = ?,
                     lease_owner = NULL,
                     lease_until = NULL,
                     updated_at = ?
@@ -420,6 +436,8 @@ class FetchState:
                 (
                     iso_now(now + timedelta(seconds=delay)),
                     str(error)[:2000],
+                    failure_class,
+                    json.dumps(field_anomalies, ensure_ascii=False, sort_keys=True) if field_anomalies else None,
                     iso_now(now),
                     asset_type,
                     symbol,
@@ -434,6 +452,8 @@ class FetchState:
         symbol: str,
         *,
         error: str,
+        failure_class: str | None = None,
+        field_anomalies: Mapping[str, Any] | None = None,
         owner: str | None = None,
     ) -> None:
         """Remove a deterministic bad response from automatic retries."""
@@ -444,6 +464,8 @@ class FetchState:
                 SET next_retry_at = NULL,
                     status = 'quarantined',
                     last_error = ?,
+                    failure_class = ?,
+                    failure_details_json = ?,
                     lease_owner = NULL,
                     lease_until = NULL,
                     updated_at = ?
@@ -452,6 +474,8 @@ class FetchState:
                 """,
                 (
                     str(error)[:2000],
+                    failure_class,
+                    json.dumps(field_anomalies, ensure_ascii=False, sort_keys=True) if field_anomalies else None,
                     iso_now(),
                     asset_type,
                     symbol,
@@ -460,6 +484,42 @@ class FetchState:
                 ),
             )
 
+    def requeue_quarantined(
+        self,
+        asset_type: str,
+        *,
+        symbols: Iterable[str] | None = None,
+        failure_class: str = "schema_conflict",
+    ) -> int:
+        """Return only matching quarantined assets to the durable queue."""
+        selected = self._symbols(symbols or [])
+        clauses = [
+            "asset_type = ?",
+            "status = 'quarantined'",
+            "failure_class = ?",
+        ]
+        parameters: list[Any] = [asset_type, failure_class]
+        if selected:
+            placeholders = ",".join("?" for _ in selected)
+            clauses.append(f"symbol IN ({placeholders})")
+            parameters.extend(selected)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE assets
+                SET status = 'pending',
+                    next_retry_at = NULL,
+                    last_error = NULL,
+                    failure_class = NULL,
+                    failure_details_json = NULL,
+                    lease_owner = NULL,
+                    lease_until = NULL,
+                    updated_at = ?
+                WHERE {' AND '.join(clauses)}
+                """,
+                [iso_now(), *parameters],
+            )
+        return max(0, int(cursor.rowcount))
     def progress(
         self,
         asset_types: Iterable[str],

@@ -24,12 +24,16 @@ class _FetchStateSpy:
     def __init__(self) -> None:
         self.successes: list[tuple[str, dict]] = []
         self.failures: list[tuple[str, dict]] = []
+        self.quarantines: list[tuple[str, dict]] = []
 
     def mark_success(self, kind: str, symbol: str, **kwargs) -> None:
         self.successes.append((symbol, kwargs))
 
     def mark_failure(self, kind: str, symbol: str, **kwargs) -> None:
         self.failures.append((symbol, kwargs))
+
+    def mark_quarantined(self, kind: str, symbol: str, **kwargs) -> None:
+        self.quarantines.append((symbol, kwargs))
 
 
 def _bars(date: str) -> pd.DataFrame:
@@ -55,6 +59,7 @@ class StockWorkerTests(unittest.TestCase):
         *,
         response,
         target: str = "2026-08-27",
+        patch_fetch: bool = True,
     ):
         fetch_patch = patch.object(
             worker,
@@ -62,7 +67,20 @@ class StockWorkerTests(unittest.TestCase):
             side_effect=response if isinstance(response, BaseException) else None,
             return_value=None if isinstance(response, BaseException) else response,
         )
-        with patch.object(worker, "_data_path", return_value=path), fetch_patch:
+        with patch.object(worker, "_data_path", return_value=path):
+            if patch_fetch:
+                with fetch_patch:
+                    return worker._fetch_one(
+                        {"symbol": "000016", "data_end_date": None},
+                        state=state,
+                        limiter=_FakeLimiter(),
+                        target=target,
+                        retries=3,
+                        backoff_base=0,
+                        backoff_max=0,
+                        lease_owner="test-owner",
+                        deadline=None,
+                    )
             return worker._fetch_one(
                 {"symbol": "000016", "data_end_date": None},
                 state=state,
@@ -129,6 +147,34 @@ class StockWorkerTests(unittest.TestCase):
         self.assertEqual(result[0:2], ("000016", True))
         self.assertEqual(state.successes[0][1]["data_end_date"], "2026-08-26")
         self.assertEqual(state.successes[0][1]["verified_through"], "2026-08-27")
+
+    def test_schema_error_is_quarantined_without_network_retries(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="stock-worker-", dir=ROOT / "tests"
+        ) as directory:
+            path = pathlib.Path(directory) / "000016.csv"
+            state = _FetchStateSpy()
+            from market_data import DailyBarSchemaError
+
+            error = DailyBarSchemaError(
+                "conflicting duplicate values for volume",
+                failure_class="schema_conflict",
+                field_anomalies={"volume": {"conflicting_rows": 1}},
+            )
+            with patch.object(worker, "fetch_a_stock_daily", side_effect=error) as fetch:
+                result = self._fetch(path, state, response=error, patch_fetch=False)
+
+        self.assertEqual(result[0:2], ("000016", False))
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(state.failures, [])
+        self.assertEqual(len(state.quarantines), 1)
+        self.assertEqual(
+            state.quarantines[0][1]["failure_class"], "schema_conflict"
+        )
+        self.assertEqual(
+            state.quarantines[0][1]["field_anomalies"],
+            {"volume": {"conflicting_rows": 1}},
+        )
 
 
 if __name__ == "__main__":

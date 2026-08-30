@@ -20,6 +20,7 @@ from typing import Any
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from data_source import NoDailyBarsError, fetch_a_stock_daily
+from market_data import DailyBarSchemaError
 from fetch_state import DEFAULT_DB_PATH, FetchState
 from fetch_utils import (
     RateLimiter,
@@ -144,6 +145,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--backoff-max", type=float, default=120.0, help="失败指数退避最大秒数")
     parser.add_argument("--lease-seconds", type=int, default=1800, help="单标的租约秒数")
     parser.add_argument("--job-id", default=None, help="可选的研究任务 ID，用于刷新任务进度")
+    parser.add_argument(
+        "--requeue-failure-class",
+        default=None,
+        help="显式重放指定失败分类的隔离股票，例如 schema_conflict；默认不重放",
+    )
     return parser
 
 
@@ -164,6 +170,8 @@ def _write_success(code: str, frame: Any, path: pathlib.Path) -> dict[str, Any]:
         "data_end_date": merged["date"].max().date().isoformat(),
         "rows": int(len(merged)),
     }
+    if frame.attrs.get("field_anomalies"):
+        metadata["field_anomalies"] = frame.attrs["field_anomalies"]
     atomic_write_json(metadata, path.with_suffix(".meta.json"))
     return metadata
 
@@ -179,7 +187,7 @@ def _fetch_one(
     backoff_max: float,
     lease_owner: str,
     deadline: float | None,
-) -> tuple[str, bool, dict[str, Any] | None, str | None]:
+) -> tuple[str, bool, dict[str, Any] | None, str | None, dict[str, Any] | None]:
     code = str(item["symbol"])
     path = _data_path(code)
     start = next_start_date(
@@ -190,14 +198,17 @@ def _fetch_one(
     attempts = max(1, int(retries) + 1)
     last_error: str | None = None
     confirmed_empty = False
+    failure_info: dict[str, Any] | None = None
     for attempt in range(1, attempts + 1):
         if deadline is not None and time.monotonic() >= deadline:
             last_error = "worker deadline reached before next request"
+            failure_info = {"failure_class": "worker_deadline"}
             break
         try:
             limiter.wait()
             if deadline is not None and time.monotonic() >= deadline:
                 last_error = "worker deadline reached while waiting for rate limit"
+                failure_info = {"failure_class": "worker_deadline"}
                 break
             frame = fetch_a_stock_daily(code, start=start, end=end)
             metadata = _write_success(code, frame, path)
@@ -211,7 +222,22 @@ def _fetch_one(
                 verified_through=target,
                 owner=lease_owner,
             )
-            return code, True, metadata, None
+            return code, True, metadata, None, None
+        except DailyBarSchemaError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            failure_info = {
+                "failure_class": exc.failure_class,
+                "field_anomalies": exc.field_anomalies,
+            }
+            state.mark_quarantined(
+                "stock",
+                code,
+                error=last_error,
+                failure_class=exc.failure_class,
+                field_anomalies=exc.field_anomalies,
+                owner=lease_owner,
+            )
+            return code, False, None, last_error, failure_info
         except NoDailyBarsError as exc:
             cached_end = cached_end_date(path)
             if cached_end:
@@ -234,14 +260,16 @@ def _fetch_one(
                     "verified_through": target,
                     "empty_sources": list(exc.sources),
                 }
-                return code, True, metadata, None
+                return code, True, metadata, None, None
             last_error = f"{type(exc).__name__}: {exc}"
+            failure_info = {"failure_class": "empty_window"}
             # 三个独立数据源一致确认无行情：重试不会改变结果，
             # 用 24 小时退避，避免每轮 wave 都重新确认全部死代码。
             confirmed_empty = True
             break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            failure_info = {"failure_class": "upstream_error"}
             if attempt < attempts:
                 delay = min(
                     backoff_max,
@@ -251,6 +279,7 @@ def _fetch_one(
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         last_error = "worker deadline reached before retry"
+                        failure_info = {"failure_class": "worker_deadline"}
                         break
                     delay = min(delay, remaining)
                 if delay:
@@ -266,9 +295,11 @@ def _fetch_one(
         error=last_error or "unknown fetch error",
         backoff_base_seconds=failure_backoff_base,
         backoff_max_seconds=failure_backoff_max,
+        failure_class=(failure_info or {}).get("failure_class"),
+        field_anomalies=(failure_info or {}).get("field_anomalies"),
         owner=lease_owner,
     )
-    return code, False, None, last_error
+    return code, False, None, last_error, failure_info
 
 
 def _refresh_manifest(
@@ -337,6 +368,16 @@ def main(argv: list[str] | None = None) -> int:
     state.reclaim_orphaned_leases()
     data_end_dates = {code: cached_end_date(_data_path(code)) for code in codes}
     state.register_assets("stock", codes, data_end_dates=data_end_dates)
+    requeued = 0
+    if args.requeue_failure_class:
+        requeued = state.requeue_quarantined(
+            "stock",
+            symbols=codes,
+            failure_class=str(args.requeue_failure_class),
+        )
+        print(
+            f"[重放] 已将 {requeued} 个 {args.requeue_failure_class} 隔离标的放回队列"
+        )
     lease_owner = (
         f"stock-worker-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
         f"-{os.getpid()}"
@@ -353,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
     fail = 0
     source_by_symbol: dict[str, dict[str, Any]] = {}
     errors: dict[str, str] = {}
+    error_classes: dict[str, int] = {}
+    field_anomalies: list[dict[str, Any]] = []
     claimed_limit = min(batch_size, workers * 2)
 
     while deadline is None or time.monotonic() < deadline:
@@ -366,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not due:
             break
-        handled: set[Future[tuple[str, bool, dict[str, Any] | None, str | None]]] = set()
+        handled: set[Future[tuple[str, bool, dict[str, Any] | None, str | None, dict[str, Any] | None]]] = set()
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(
@@ -397,14 +440,24 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 for future in done:
                     handled.add(future)
-                    code, succeeded, metadata, error = future.result()
+                    code, succeeded, metadata, error, failure_info = future.result()
                     if succeeded and metadata:
                         ok += 1
                         source_by_symbol[code] = metadata
+                        anomalies = metadata.get("field_anomalies")
+                        if anomalies:
+                            field_anomalies.append({"symbol": code, "fields": anomalies})
                         print(f"[完成] {code} -> {_data_path(code)}")
                     else:
                         fail += 1
                         errors[code] = error or "unknown error"
+                        if failure_info:
+                            failure_class = failure_info.get("failure_class")
+                            if failure_class:
+                                error_classes[failure_class] = error_classes.get(failure_class, 0) + 1
+                            anomalies = failure_info.get("field_anomalies")
+                            if anomalies:
+                                field_anomalies.append({"symbol": code, "fields": anomalies})
                         print(f"[失败] {code}: {errors[code]}")
             cancelled_symbols = [
                 str(futures[future])
@@ -419,14 +472,24 @@ def main(argv: list[str] | None = None) -> int:
         for future, symbol in futures.items():
             if future in handled or future.cancelled():
                 continue
-            code, succeeded, metadata, error = future.result()
+            code, succeeded, metadata, error, failure_info = future.result()
             if succeeded and metadata:
                 ok += 1
                 source_by_symbol[code] = metadata
+                anomalies = metadata.get("field_anomalies")
+                if anomalies:
+                    field_anomalies.append({"symbol": code, "fields": anomalies})
                 print(f"[完成] {code} -> {_data_path(code)}")
             else:
                 fail += 1
                 errors[code] = error or "unknown error"
+                if failure_info:
+                    failure_class = failure_info.get("failure_class")
+                    if failure_class:
+                        error_classes[failure_class] = error_classes.get(failure_class, 0) + 1
+                    anomalies = failure_info.get("field_anomalies")
+                    if anomalies:
+                        field_anomalies.append({"symbol": code, "fields": anomalies})
                 print(f"[失败] {code}: {errors[code]}")
         if deadline is not None and time.monotonic() >= deadline:
             break
@@ -476,7 +539,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "source_by_symbol": source_by_symbol,
         "errors": errors,
-        "field_anomalies": [],
+        "error_classes": error_classes,
+        "field_anomalies": field_anomalies,
+        "requeued": requeued,
         "state_db": str(pathlib.Path(args.state_db).resolve()),
         "limited": limited,
         "partial_failure": bool(fail or progress["pending"] or limited),

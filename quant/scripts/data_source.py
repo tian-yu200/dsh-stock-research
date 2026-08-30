@@ -11,7 +11,7 @@ os.environ.setdefault("NO_PROXY", "*")  # 绕过系统代理直连国内数据�
 import akshare as ak
 import pandas as pd
 
-from market_data import EmptyDailyBarResponse, normalize_daily_bars
+from market_data import DailyBarSchemaError, EmptyDailyBarResponse, normalize_daily_bars
 
 class NoDailyBarsError(RuntimeError):
     """Independent sources agreed that the requested window has no bars."""
@@ -64,6 +64,7 @@ def fetch_a_stock_daily(symbol: str, start="20200101", end="20991231") -> pd.Dat
     """Try independent sources and classify a confirmed no-bar window."""
     last_err = None
     empty_sources: list[str] = []
+    schema_errors: list[DailyBarSchemaError] = []
     for name, fn in _SOURCES:
         try:
             df = fn(symbol, start, end)
@@ -84,11 +85,17 @@ def fetch_a_stock_daily(symbol: str, start="20200101", end="20991231") -> pd.Dat
         except EmptyDailyBarResponse:
             empty_sources.append(name)
             print(f"  [{symbol}] {name}源返回空行情")
+        except DailyBarSchemaError as exc:
+            schema_errors.append(exc)
+            last_err = exc
+            print(f"  [{symbol}] {name}源结构异常: {exc.failure_class}")
         except Exception as e:
             last_err = e
             print(f"  [{symbol}] {name}源失败: {type(e).__name__}")
     if len(empty_sources) >= 2:
         raise NoDailyBarsError(symbol, empty_sources) from last_err
+    if schema_errors:
+        raise schema_errors[-1] from last_err
     raise RuntimeError(f"{symbol} 所有数据源均失败: {last_err}")
 
 

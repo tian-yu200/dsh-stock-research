@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import pathlib
+import sqlite3
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -294,7 +295,102 @@ class FetchStateTests(unittest.TestCase):
             self.assertEqual(progress["failed"], 1)
             self.assertEqual(progress["pending"], 1)
 
+    def test_quarantine_details_are_persisted_and_matching_rows_can_be_requeued(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="fetch-quarantine-details-", dir=ROOT / "tests"
+        ) as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("stock", ["000001", "000002"])
+            state.claim_due(
+                "stock",
+                symbols=["000001", "000002"],
+                limit=2,
+                target_date="2026-08-26",
+                owner="worker-a",
+            )
+            anomalies = {"volume": {"conflicting_rows": 2}}
+            state.mark_quarantined(
+                "stock",
+                "000001",
+                error="schema conflict",
+                failure_class="schema_conflict",
+                field_anomalies=anomalies,
+                owner="worker-a",
+            )
+            with state._connect() as connection:
+                row = connection.execute(
+                    "SELECT status, failure_class, failure_details_json FROM assets "
+                    "WHERE asset_type = ? AND symbol = ?",
+                    ("stock", "000001"),
+                ).fetchone()
+            self.assertEqual(row["status"], "quarantined")
+            self.assertEqual(row["failure_class"], "schema_conflict")
+            self.assertEqual(json.loads(row["failure_details_json"]), anomalies)
+            self.assertEqual(
+                state.requeue_quarantined(
+                    "stock", symbols=["000001"], failure_class="schema_conflict"
+                ),
+                1,
+            )
+            claimed = state.claim_due(
+                "stock",
+                symbols=["000001"],
+                target_date="2026-08-26",
+                owner="worker-b",
+            )
+            self.assertEqual([item["symbol"] for item in claimed], ["000001"])
+            with state._connect() as connection:
+                row = connection.execute(
+                    "SELECT failure_class, failure_details_json FROM assets "
+                    "WHERE asset_type = ? AND symbol = ?",
+                    ("stock", "000001"),
+                ).fetchone()
+            self.assertIsNone(row["failure_class"])
+            self.assertIsNone(row["failure_details_json"])
 
+    def test_old_assets_table_is_migrated_without_rebuilding_it(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="fetch-migrate-", dir=ROOT / "tests"
+        ) as directory:
+            database = pathlib.Path(directory) / "state.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """
+                CREATE TABLE assets (
+                    asset_type TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    data_end_date TEXT,
+                    last_success_date TEXT,
+                    last_attempt_at TEXT,
+                    next_retry_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    source TEXT,
+                    last_error TEXT,
+                    rows INTEGER,
+                    lease_owner TEXT,
+                    lease_until TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (asset_type, symbol)
+                )
+                """,
+            )
+            connection.execute(
+                "INSERT INTO assets (asset_type, symbol, updated_at) VALUES (?, ?, ?)",
+                ("stock", "000001", "2026-08-26T00:00:00+00:00"),
+            )
+            connection.commit()
+            connection.close()
+            FetchState(database)
+            connection = sqlite3.connect(database)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(assets)")}
+            preserved = connection.execute(
+                "SELECT symbol, status FROM assets WHERE asset_type = ?", ("stock",)
+            ).fetchone()
+            connection.close()
+        self.assertEqual(preserved, ("000001", "pending"))
+        self.assertIn("failure_class", columns)
+        self.assertIn("failure_details_json", columns)
 class FetchUtilityTests(unittest.TestCase):
     def test_cached_end_date_and_incremental_merge(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fetch-utils-", dir=ROOT / "tests") as directory:
