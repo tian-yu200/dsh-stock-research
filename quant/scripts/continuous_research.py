@@ -22,6 +22,8 @@ from typing import Any, Callable, Iterator
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+import psutil
+
 
 QUANT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = QUANT_ROOT.parent
@@ -64,6 +66,8 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 ALERT_MAX_BYTES = 2 * 1024 * 1024
 ALERT_BACKUP_COUNT = 3
+
+WORKER_SCRIPT_NAMES = ("run_research_worker.py", "run_assistant_research.py")
 
 
 class ClosingRotatingFileHandler(RotatingFileHandler):
@@ -162,6 +166,78 @@ def _process_exists(pid: int | None) -> bool:
     except (OSError, ProcessLookupError, PermissionError):
         return False
     return True
+
+def _worker_status(job_id: str) -> dict[str, Any]:
+    try:
+        directory = run_directory(job_id)
+    except (FileNotFoundError, ValueError):
+        return {}
+    status = _read_json(directory / "status.json", {})
+    return status if isinstance(status, dict) else {}
+
+
+def _process_identity(
+    pid: int | None,
+    job_id: str,
+    *,
+    expected_started_at: str | None = None,
+ ) -> str:
+    """Classify a PID without trusting PID reuse or unrelated processes."""
+    if not pid or pid <= 0 or not _process_exists(pid):
+        return "dead"
+    try:
+        process = psutil.Process(int(pid))
+        command_line = " ".join(process.cmdline()).lower()
+        if job_id.lower() not in command_line:
+            return "mismatch"
+        if not any(name.lower() in command_line for name in WORKER_SCRIPT_NAMES):
+            return "mismatch"
+        expected = parse_iso(expected_started_at) if expected_started_at else None
+        if expected is not None:
+            actual = datetime.fromtimestamp(
+                process.create_time(),
+                tz=ZoneInfo("UTC"),
+            )
+            if abs((actual - expected).total_seconds()) > 180:
+                return "mismatch"
+    except (psutil.Error, OSError, ValueError, OverflowError):
+        return "unknown"
+    return "match"
+
+
+def _find_live_worker_for_job(job_id: str) -> int | None:
+    """Find a matching worker when the status file contains a stale PID."""
+    try:
+        for process in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                pid = int(process.info.get("pid") or 0)
+                command_line = " ".join(process.info.get("cmdline") or []).lower()
+                if (
+                    pid > 0
+                    and job_id.lower() in command_line
+                    and any(
+                        name.lower() in command_line
+                        for name in WORKER_SCRIPT_NAMES
+                    )
+                ):
+                    return pid
+            except (psutil.Error, OSError, TypeError, ValueError):
+                continue
+    except psutil.Error:
+        return None
+    return None
+
+
+def _worker_generation(job_id: str, pid: int | None) -> str | None:
+    status = _worker_status(job_id)
+    try:
+        recorded_pid = int(status.get("worker_pid", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not pid or recorded_pid != int(pid):
+        return None
+    value = status.get("started_at")
+    return str(value) if value and parse_iso(str(value)) is not None else None
 
 
 class SchedulerLock:
@@ -429,13 +505,7 @@ def _find_resumable_job(
 
 
 def _latest_worker_pid(job_id: str) -> int | None:
-    try:
-        directory = run_directory(job_id)
-    except (FileNotFoundError, ValueError):
-        return None
-    status = _read_json(directory / "status.json", {})
-    if not isinstance(status, dict):
-        return None
+    status = _worker_status(job_id)
     for key in ("worker_pid", "pid"):
         try:
             value = int(status.get(key, 0) or 0)
@@ -445,6 +515,50 @@ def _latest_worker_pid(job_id: str) -> int | None:
             return value
     return None
 
+
+def _requeue_dead_worker(
+    state: FetchState,
+    job: dict[str, Any],
+    *,
+    reason: str,
+    logger: logging.Logger,
+    ) -> bool:
+    """Release a running job after its recorded worker is confirmed dead."""
+    job_id = str(job["job_id"])
+    pid = _latest_worker_pid(job_id)
+    if pid is None:
+        return False
+    generation = _worker_generation(job_id, pid)
+    identity = _process_identity(
+        pid,
+        job_id,
+        expected_started_at=generation,
+    )
+    if identity in {"match", "unknown"}:
+        return False
+    if _find_live_worker_for_job(job_id) is not None:
+        return False
+    expected_started_at = job.get("started_at")
+    if not expected_started_at:
+        return False
+    recovered = state.update_job_if(
+        job_id,
+        expected_status="running",
+        expected_started_at=expected_started_at,
+        status="queued",
+        finished_at=None,
+        last_error=reason,
+    )
+    if recovered:
+        logger.warning(
+            "requeued dead or mismatched worker job_id=%s worker_pid=%s "
+            "identity=%s reason=%s",
+            job_id,
+            pid,
+            identity,
+            reason,
+        )
+    return recovered
 
 def _ensure_job(
     state: FetchState,
@@ -461,9 +575,31 @@ def _ensure_job(
         progress = _job_progress(state, job, config)
         current_status = str(job.get("status", ""))
         if current_status == "running":
-            pid = _latest_worker_pid(str(job["job_id"]))
-            if pid and _process_exists(pid):
+            job_id = str(job["job_id"])
+            pid = _latest_worker_pid(job_id)
+            generation = _worker_generation(job_id, pid)
+            identity = _process_identity(
+                pid,
+                job_id,
+                expected_started_at=generation,
+            )
+            if identity == "match" or _find_live_worker_for_job(job_id) is not None:
                 return job, progress, "worker_already_running"
+            if identity == "unknown":
+                _high_alert(
+                    logger,
+                    f"无法确认 job {job_id} 的 worker PID 身份；暂不重复启动。",
+                )
+                return job, progress, "job_lock_suspect"
+            if pid and _requeue_dead_worker(
+                state,
+                job,
+                reason="worker process exited before scheduler recovery",
+                logger=logger,
+            ):
+                job = state.get_job(str(job["job_id"])) or job
+                progress = _job_progress(state, job, config)
+                return job, progress, None
             started_at = parse_iso(job.get("started_at"))
             age = (
                 (_utc_now() - started_at).total_seconds()
@@ -542,6 +678,7 @@ class WorkerOutcome:
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    started_at: str | None = None
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -618,6 +755,7 @@ def _run_worker(job_id: str, logger: logging.Logger) -> WorkerOutcome:
                     process.pid,
                     WORKER_WALL_TIMEOUT_SECONDS,
                 )
+                worker_generation = _worker_generation(job_id, process.pid)
                 _kill_process_tree(process.pid)
                 process.wait(timeout=30)
                 return WorkerOutcome(
@@ -625,6 +763,7 @@ def _run_worker(job_id: str, logger: logging.Logger) -> WorkerOutcome:
                     returncode=None,
                     timed_out=True,
                     duration_seconds=time.monotonic() - started,
+                    started_at=worker_generation,
                     error=(
                         f"worker wall timeout after {WORKER_WALL_TIMEOUT_SECONDS} seconds"
                     ),
@@ -636,8 +775,10 @@ def _run_worker(job_id: str, logger: logging.Logger) -> WorkerOutcome:
             returncode=None,
             timed_out=False,
             duration_seconds=time.monotonic() - started,
+            started_at=_worker_generation(job_id, process.pid if process is not None else None),
             error=f"{type(exc).__name__}: {exc}",
         )
+    worker_generation = _worker_generation(job_id, process.pid if process is not None else None)
     stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
     return WorkerOutcome(
@@ -645,6 +786,7 @@ def _run_worker(job_id: str, logger: logging.Logger) -> WorkerOutcome:
         returncode=returncode,
         timed_out=False,
         duration_seconds=time.monotonic() - started,
+        started_at=worker_generation,
         stdout=stdout,
         stderr=stderr,
         error=None if returncode == 0 else f"worker exited with code {returncode}",
@@ -1045,6 +1187,30 @@ def run_once(
         _write_json(LATEST_STATUS_PATH, status)
         _log_progress(logger, status)
         outcome = (worker_runner or _run_worker)(job_id, logger)
+        requeued_after_timeout = False
+        if outcome.timed_out:
+            if outcome.started_at:
+                requeued_after_timeout = state.update_job_if(
+                    job_id,
+                    expected_status="running",
+                    expected_started_at=outcome.started_at,
+                    status="queued",
+                    finished_at=None,
+                    last_error=outcome.error or "worker wall timeout; queued for resume",
+                )
+            else:
+                logger.error(
+                    "worker timeout generation unavailable; preserving current job state "
+                    "job_id=%s worker_pid=%s",
+                    job_id,
+                    outcome.pid,
+                )
+            if requeued_after_timeout:
+                logger.warning(
+                    "worker timeout requeued job_id=%s worker_pid=%s",
+                    job_id,
+                    outcome.pid,
+                )
         worker_json = _latest_json(outcome.stdout)
         state.reclaim_orphaned_leases()
         job = state.get_job(job_id) or job
@@ -1095,7 +1261,9 @@ def run_once(
                 job_id,
                 progress.get("failed"),
             )
-        if progress["completed"] == progress["total"] and progress["total"] > 0:
+        if requeued_after_timeout:
+            final_status = "queued"
+        elif progress["completed"] == progress["total"] and progress["total"] > 0:
             final_status = (
                 "completed"
                 if str(job.get("status")) in {"complete", "completed", "success"}
@@ -1107,7 +1275,11 @@ def run_once(
         finished = _now()
         status = _public_status(
             status=final_status,
-            phase="research" if progress["pending"] == 0 else "fetch",
+            phase=(
+                "fetch"
+                if requeued_after_timeout
+                else "research" if progress["pending"] == 0 else "fetch"
+            ),
             job=job,
             progress=progress,
             target_date=target_date,
@@ -1124,6 +1296,8 @@ def run_once(
                 "worker_result": worker_json,
                 "calendar": calendar,
                 "checkpoint_retained": True,
+                "job_requeued": requeued_after_timeout,
+                "worker_generation": outcome.started_at,
             },
         )
         _save_control(control)

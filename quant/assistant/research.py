@@ -31,6 +31,7 @@ from .paths import (
     atomic_write_json,
     ensure_directories,
     read_json,
+    validate_run_id,
     validate_symbol,
 )
 from .portfolio import allocation_budget, build_target_weights
@@ -252,6 +253,8 @@ def run_research(
     _target_date: str | None = None,
     _start_background_worker: bool | None = None,
     _symbols_by_type: Mapping[str, Iterable[str]] | None = None,
+    _run_id_override: str | None = None,
+    _run_dir_override: Path | None = None,
 ) -> dict[str, Any]:
     mode = str(mode or "daily").strip().lower()
     if mode not in MODE_NAMES:
@@ -269,6 +272,12 @@ def run_research(
             else {}
         )
     )
+    if _symbols_by_type is not None:
+        requested_symbols = sorted({
+            symbol
+            for routed_symbols in explicit_routes.values()
+            for symbol in routed_symbols
+        })
     directed_research = bool(requested_symbols) or _symbols_by_type is not None
     config = load_config()
     if (
@@ -287,9 +296,30 @@ def run_research(
                 True if _start_background_worker is None else _start_background_worker
             ),
         )
-    run_id = _run_id()
     started = _now()
-    run_dir = RUNS_DIR / started.strftime("%Y") / started.strftime("%m") / started.strftime("%d") / run_id
+    if _run_id_override is None:
+        if _run_dir_override is not None:
+            raise ValueError("_run_dir_override requires _run_id_override")
+        run_id = _run_id()
+        run_dir = (
+            RUNS_DIR
+            / started.strftime("%Y")
+            / started.strftime("%m")
+            / started.strftime("%d")
+            / run_id
+        )
+        reuse_run_dir = False
+    else:
+        run_id = validate_run_id(_run_id_override)
+        expected_run_dir = (
+            RUNS_DIR / run_id[:4] / run_id[4:6] / run_id[6:8] / run_id
+        ).resolve()
+        run_dir = Path(_run_dir_override or expected_run_dir).resolve()
+        if run_dir != expected_run_dir or run_dir.name != run_id:
+            raise ValueError("queued run directory does not match run_id")
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"queued run directory does not exist: {run_id}")
+        reuse_run_dir = True
     lock_descriptor: int | None = None
     log_lines = [f"started {started.isoformat()}", f"mode={mode}", f"asset_types={asset_types}"]
     status_path = run_dir / "status.json"
@@ -315,21 +345,47 @@ def run_research(
     )
     decision_support["asset_paths"] = {}
     result_paths: dict[str, str] = {}
+    research_progress_path = run_dir / "research-progress.json"
+    research_phase_seq = 0
+
+    def report_research_phase(phase: str, **details: Any) -> None:
+        nonlocal research_phase_seq
+        research_phase_seq += 1
+        record = {
+            "run_id": run_id,
+            "status": "running",
+            "phase": str(phase),
+            "phase_seq": research_phase_seq,
+            "updated_at": _now().isoformat(),
+        }
+        for key in ("cache_hit", "cache_miss_reason", "provider_end", "message"):
+            if key in details and details[key] is not None:
+                record[key] = details[key]
+        atomic_write_json(research_progress_path, record)
+    def touch_phase(phase: str) -> None:
+        if reuse_run_dir:
+            report_research_phase(phase)
+        else:
+            _touch_status(status_path, phase)
+
     try:
         lock_descriptor = _acquire_lock(
             run_id,
             int(config["runtime"]["lock_stale_seconds"]),
         )
-        run_dir.mkdir(parents=True, exist_ok=False)
-        atomic_write_json(
-            status_path,
-            {
-                "run_id": run_id,
-                "status": "running",
-                "started_at": started.isoformat(),
-                "updated_at": started.isoformat(),
-            },
-        )
+        run_dir.mkdir(parents=True, exist_ok=reuse_run_dir)
+        if reuse_run_dir:
+            report_research_phase("research_start")
+        else:
+            atomic_write_json(
+                status_path,
+                {
+                    "run_id": run_id,
+                    "status": "running",
+                    "started_at": started.isoformat(),
+                    "updated_at": started.isoformat(),
+                },
+            )
         symbol_routes = explicit_routes or {asset_type: [] for asset_type in asset_types}
         analyzed_types = tuple(
             asset_type
@@ -349,7 +405,7 @@ def run_research(
                 log_lines,
                 symbols_by_type=symbol_routes if explicit_routes else None,
             )
-        _touch_status(status_path, "refreshed")
+        touch_phase("refreshed")
         all_frames: dict[str, dict[str, pd.DataFrame]] = {}
         for asset_type in analyzed_types:
             scope_symbols = symbol_routes[asset_type] if explicit_routes else None
@@ -413,7 +469,7 @@ def run_research(
         if not all_facts:
             raise ValueError("no asset data found in fixed data directories")
 
-        _touch_status(status_path, "scanned")
+        touch_phase("scanned")
         benchmark_series = None
         if analyzed_types:
             try:
@@ -433,7 +489,7 @@ def run_research(
                 benchmark_series,
             )
 
-        _touch_status(status_path, "signals")
+        touch_phase("signals")
         stock_model = {
             "model_available": False,
             "model_name": "Qlib Alpha158 + LightGBM",
@@ -451,12 +507,17 @@ def run_research(
             stock_facts = [item for item in all_facts if item["asset_type"] == "stock"]
             stock_quality = _aggregate_quality(stock_facts, config)
             stock_refresh_ok = all(
-                result.get("status") == "success"
+                result.get("status") in {"success", "reused"}
                 for result in refresh.get("results", [])
                 if result.get("label") in {"stock", "qlib_provider"}
             )
             if stock_quality["passed"] and stock_refresh_ok:
-                stock_model = _run_qlib_stock_model(config)
+                model_options: dict[str, Any] = {}
+                if explicit_routes:
+                    model_options["requested_symbols"] = symbol_routes.get("stock", [])
+                if reuse_run_dir:
+                    model_options["progress_callback"] = report_research_phase
+                stock_model = _run_qlib_stock_model(config, **model_options)
             else:
                 stock_model["error"] = "stock model skipped because stock data quality or refresh failed"
                 stock_model["leakage_check"] = {
@@ -474,7 +535,7 @@ def run_research(
                     key=lambda item: item.get("qlib_score", -math.inf), reverse=True
                 )
 
-        _touch_status(status_path, "gates")
+        touch_phase("gates")
         decision_support = {
             "allocation_basis": "基于假设资金/配置的目标权重",
             "hypothetical_capital": float(config["research"]["hypothetical_capital"]),
@@ -500,7 +561,7 @@ def run_research(
                 full_universe=not directed_research,
             )
             checks["refresh_passed"] = all(
-                result.get("status") == "success"
+                result.get("status") in {"success", "reused"}
                 for result in refresh.get("results", [])
                 if result.get("label") in {"stock", "qlib_provider"}
             )
@@ -684,6 +745,8 @@ def run_research(
         )
         manifest["paths"] = result_paths
         atomic_write_json(run_dir / "manifest.json", _jsonable(manifest))
+        if reuse_run_dir:
+            report_research_phase("publish", message=run_status)
         status = {
             "run_id": run_id,
             "status": run_status,
@@ -692,7 +755,8 @@ def run_research(
             "result_path": str(run_dir),
             "failure_reasons": failure_reasons,
         }
-        atomic_write_json(status_path, status)
+        if not reuse_run_dir:
+            atomic_write_json(status_path, status)
         if run_status == "success":
             current = {
                 "run_id": run_id,
@@ -767,7 +831,8 @@ def run_research(
             )
             manifest["paths"] = result_paths
             atomic_write_json(run_dir / "manifest.json", manifest)
-            atomic_write_json(status_path, manifest)
+            if not reuse_run_dir:
+                atomic_write_json(status_path, manifest)
         notification = add_notification(
             "research_failure",
             "股票/基金研究失败",

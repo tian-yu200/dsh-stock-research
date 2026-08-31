@@ -8,15 +8,105 @@ run_under50_research.py 共享的训练层；Qlib 的导入仍延迟到各函数
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 import pandas as pd
 
 from . import research
-from .paths import validate_symbol
+from .paths import atomic_write_json, read_json, validate_symbol
+from .provider_lock import ProviderLock
+
+
+MODEL_CACHE_SCHEMA = 1
+
+
+def _report_progress(
+    callback: Callable[..., None] | None,
+    phase: str,
+    **details: Any,
+ ) -> None:
+    if callback is not None:
+        callback(phase, **details)
+
+
+def _provider_source_fingerprint(provider: Path) -> dict[str, Any] | None:
+    manifest = read_json(provider / "manifest.json", {})
+    if not isinstance(manifest, dict):
+        return None
+    fingerprint = manifest.get("source_fingerprint")
+    return dict(fingerprint) if isinstance(fingerprint, dict) else None
+
+
+def _model_cache_identity(
+    config: Mapping[str, Any],
+    *,
+    provider_fingerprint: Mapping[str, Any],
+    provider_end: str,
+ ) -> tuple[str, dict[str, Any]]:
+    identity = {
+        "schema": MODEL_CACHE_SCHEMA,
+        "provider_source_fingerprint": dict(provider_fingerprint),
+        "provider_end": str(provider_end),
+        "dataset": dict(config["dataset"]),
+        "model": dict(config["model"]),
+        "research": {
+            key: config["research"][key]
+            for key in (
+                "stock_label_horizon",
+                "stock_topk",
+                "transaction_cost_bps",
+            )
+        },
+    }
+    canonical = json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), identity
+
+
+def _model_cache_path(config: Mapping[str, Any], cache_key: str) -> Path:
+    return (
+        Path(config["paths"]["results_dir"])
+        / "model-cache"
+        / "qlib-alpha158-lightgbm"
+        / f"{cache_key}.json"
+    )
+
+
+def _cached_model_result(path: Path, cache_key: str) -> dict[str, Any] | None:
+    cached = read_json(path, {})
+    if (
+        not isinstance(cached, dict)
+        or cached.get("schema") != MODEL_CACHE_SCHEMA
+        or cached.get("cache_key") != cache_key
+        or not isinstance(cached.get("result"), dict)
+        or not cached["result"].get("model_available")
+    ):
+        return None
+    return dict(cached["result"])
+
+
+def _filter_scores(
+    result: Mapping[str, Any],
+    requested_symbols: list[str] | None,
+ ) -> dict[str, Any]:
+    filtered = dict(result)
+    scores = result.get("scores", {})
+    if not isinstance(scores, Mapping):
+        scores = {}
+    normalized_scores = {validate_symbol(str(symbol)): float(score) for symbol, score in scores.items()}
+    if requested_symbols is not None:
+        requested = {validate_symbol(symbol) for symbol in requested_symbols}
+        normalized_scores = {
+            symbol: score
+            for symbol, score in normalized_scores.items()
+            if symbol in requested
+        }
+    filtered["scores"] = normalized_scores
+    return filtered
 
 def _prediction_metrics(prediction: pd.Series, labels: pd.Series) -> dict[str, float | int]:
     frame = pd.concat({"score": prediction, "label": labels}, axis=1).dropna()
@@ -328,7 +418,12 @@ def segment_prediction(dataset: Any, model: Any, segment: str) -> tuple[pd.Serie
     return prediction, labels
 
 
-def _run_qlib_stock_model(config: Mapping[str, Any]) -> dict[str, Any]:
+def _run_qlib_stock_model(
+    config: Mapping[str, Any],
+    *,
+    requested_symbols: list[str] | None = None,
+    progress_callback: Callable[..., None] | None = None,
+ ) -> dict[str, Any]:
     """Run the isolated Alpha158/LightGBM path.
 
     Importing Qlib is deliberately deferred so ETF/fund snapshot calls remain
@@ -357,115 +452,225 @@ def _run_qlib_stock_model(config: Mapping[str, Any]) -> dict[str, Any]:
         import qlib
         from qlib.data import D
 
-        provider = init_qlib(config["paths"]["qlib_provider"], kernels=1)
-        dataset_config = config["dataset"]
-        calendar = D.calendar(freq="day")
-        provider_end = pd.Timestamp(calendar[-1]).date().isoformat()
-        end_time = min(str(dataset_config["segments"]["test"][1]), provider_end)
-        segments = {
-            name: [values[0], min(values[1], end_time)]
-            for name, values in dataset_config["segments"].items()
-        }
-        label_horizon = int(config["research"]["stock_label_horizon"])
-        dataset = build_dataset(
-            instruments="stocks",
-            start_time=dataset_config["start_time"],
-            end_time=end_time,
-            fit_start_time=dataset_config["fit_start_time"],
-            fit_end_time=dataset_config["fit_end_time"],
-            label_horizon=label_horizon,
-            segments=segments,
+        provider = Path(config["paths"]["qlib_provider"]).resolve()
+        _report_progress(progress_callback, "provider_cache_check")
+        provider_lock = ProviderLock(
+            provider,
+            purpose="Alpha158 training, metrics, and backtest",
+        ).acquire(
+            timeout_seconds=float(config.get("runtime", {}).get("provider_lock_timeout_seconds", 30.0))
         )
-        model = train_lgbm(dataset, config["model"])
-        predictions: dict[str, pd.Series] = {}
-        labels_by_segment: dict[str, pd.Series] = {}
-        metrics: dict[str, Any] = {}
-        for segment in ("valid", "test"):
-            prediction, labels = segment_prediction(dataset, model, segment)
-            predictions[segment] = prediction
-            labels_by_segment[segment] = labels
-            metrics[segment] = _prediction_metrics(prediction, labels)
-        test_prediction = predictions["test"]
-        if test_prediction.empty:
-            raise ValueError("Qlib test prediction is empty")
-        raw = dataset.handler.fetch(
-            selector=slice(segments["test"][0], segments["test"][1]),
-            level="datetime",
-            col_set="backtest",
-            data_key="raw",
-        )
-        closes = raw["BACKTEST_CLOSE"].unstack("instrument").sort_index()
-        future = closes.shift(-1) / closes - 1.0
-        strategy_returns: dict[pd.Timestamp, float] = {}
-        benchmark_returns: dict[pd.Timestamp, float] = {}
-        turnover_by_date: dict[pd.Timestamp, float] = {}
-        previous_weights: dict[str, float] = {}
-        transaction_cost_rate = float(config["research"]["transaction_cost_bps"]) / 10000.0
-        for date, scores in test_prediction.groupby(level="datetime"):
-            if date not in future.index:
-                continue
-            top = scores.droplevel("datetime").sort_values(ascending=False).head(int(config["research"]["stock_topk"]))
-            values = future.loc[date].reindex(top.index).dropna()
-            if not values.empty:
-                weights = {str(symbol): 1.0 / len(values) for symbol in values.index}
-                symbols = set(previous_weights) | set(weights)
-                turnover = sum(
-                    abs(weights.get(symbol, 0.0) - previous_weights.get(symbol, 0.0))
-                    for symbol in symbols
-                ) / 2.0
-                gross_return = float(values.mean())
-                strategy_returns[pd.Timestamp(date)] = gross_return - turnover * transaction_cost_rate
-                turnover_by_date[pd.Timestamp(date)] = turnover
-                universe_values = future.loc[date].dropna()
-                benchmark_returns[pd.Timestamp(date)] = (
-                    float(universe_values.mean()) if not universe_values.empty else float("nan")
+        try:
+            init_qlib(provider, kernels=1)
+            dataset_config = config["dataset"]
+            calendar = D.calendar(freq="day")
+            if not len(calendar):
+                raise ValueError("Qlib provider calendar is empty")
+            provider_end = pd.Timestamp(calendar[-1]).date().isoformat()
+            fingerprint = _provider_source_fingerprint(provider)
+            cache_key = None
+            cache_identity = None
+            cache_path = None
+            cache_miss_reason = "provider_source_fingerprint_missing"
+            if fingerprint is not None and fingerprint.get("digest"):
+                cache_key, cache_identity = _model_cache_identity(
+                    config,
+                    provider_fingerprint=fingerprint,
+                    provider_end=provider_end,
                 )
-                previous_weights = weights
-        net_returns = pd.Series(strategy_returns, dtype=float).sort_index()
-        equity = net_returns.add(1.0).cumprod()
-        benchmark_equity = pd.Series(benchmark_returns, dtype=float).sort_index().dropna().add(1.0).cumprod()
-        performance = _performance(equity)
-        benchmark_performance = _performance(benchmark_equity)
-        group_metrics = _forward_group_metrics(
-            test_prediction,
-            labels_by_segment["test"],
-        )
-        latest_date = test_prediction.index.get_level_values("datetime").max()
-        latest = test_prediction.xs(latest_date, level="datetime").sort_values(ascending=False)
-        best_iteration = getattr(getattr(model, "model", None), "best_iteration", None)
-        return {
-            "model_available": True,
-            "model_name": "Qlib Alpha158 + LightGBM",
-            "qlib_version": getattr(qlib, "__version__", "unknown"),
-            "provider": str(provider),
-            "data_end_date": provider_end,
-            "latest_signal_date": research._iso_date(latest_date),
-            "valid": metrics["valid"],
-            "test": metrics["test"],
-            "mean_rank_ic": metrics["test"]["mean_rank_ic"],
-            "test_rank_ic": metrics["test"]["mean_rank_ic"],
-            "rank_ic_ir": metrics["test"]["rank_ic_ir"],
-            "top_bottom_excess_return": group_metrics["top_bottom_excess_return"],
-            "forward_group_metrics": group_metrics,
-            "net_annualized_return": performance["net_annualized_return"],
-            "test_max_drawdown": performance["max_drawdown"],
-            "max_drawdown": performance["max_drawdown"],
-            "transaction_cost_bps": float(config["research"]["transaction_cost_bps"]),
-            "mean_daily_turnover": float(pd.Series(turnover_by_date, dtype=float).mean()),
-            "benchmark": {
-                "name": "equal_weight_stock_universe",
-                "annualized_return": benchmark_performance["net_annualized_return"],
-                "max_drawdown": benchmark_performance["max_drawdown"],
-                "excess_annualized_return": performance["net_annualized_return"]
-                - benchmark_performance["net_annualized_return"],
-            },
-            "training_best_iteration": best_iteration,
-            "scores": {
-                validate_symbol(str(symbol)): float(score)
-                for symbol, score in latest.items()
-            },
-            "leakage_check": {"passed": True, "label_horizon_days": label_horizon},
-        }
+                cache_path = _model_cache_path(config, cache_key)
+                cached = _cached_model_result(cache_path, cache_key)
+                if cached is not None:
+                    _report_progress(
+                        progress_callback,
+                        "model_cache_check",
+                        cache_hit=True,
+                        provider_end=provider_end,
+                    )
+                    result = _filter_scores(cached, requested_symbols)
+                    result.pop("cache_miss_reason", None)
+                    result.update(
+                        {
+                            "cache_hit": True,
+                            "model_cache_key": cache_key,
+                        }
+                    )
+                    _report_progress(progress_callback, "publish", cache_hit=True)
+                    return result
+                cache_miss_reason = "cache_file_missing_or_invalid"
+            _report_progress(
+                progress_callback,
+                "model_cache_check",
+                cache_hit=False,
+                cache_miss_reason=cache_miss_reason,
+                provider_end=provider_end,
+            )
+            end_time = min(str(dataset_config["segments"]["test"][1]), provider_end)
+            segments = {
+                name: [values[0], min(values[1], end_time)]
+                for name, values in dataset_config["segments"].items()
+            }
+            label_horizon = int(config["research"]["stock_label_horizon"])
+            _report_progress(progress_callback, "alpha158_prepare", provider_end=provider_end)
+            dataset = build_dataset(
+                instruments="stocks",
+                start_time=dataset_config["start_time"],
+                end_time=end_time,
+                fit_start_time=dataset_config["fit_start_time"],
+                fit_end_time=dataset_config["fit_end_time"],
+                label_horizon=label_horizon,
+                segments=segments,
+            )
+            _report_progress(progress_callback, "lightgbm_train")
+            model = train_lgbm(dataset, config["model"])
+            predictions: dict[str, pd.Series] = {}
+            labels_by_segment: dict[str, pd.Series] = {}
+            metrics: dict[str, Any] = {}
+            for segment in ("valid", "test"):
+                _report_progress(progress_callback, f"{segment}_metrics")
+                prediction, labels = segment_prediction(dataset, model, segment)
+                predictions[segment] = prediction
+                labels_by_segment[segment] = labels
+                metrics[segment] = _prediction_metrics(prediction, labels)
+            test_prediction = predictions["test"]
+            if test_prediction.empty:
+                raise ValueError("Qlib test prediction is empty")
+            _report_progress(progress_callback, "backtest")
+            raw = dataset.handler.fetch(
+                selector=slice(segments["test"][0], segments["test"][1]),
+                level="datetime",
+                col_set="backtest",
+                data_key="raw",
+            )
+            closes = raw["BACKTEST_CLOSE"].unstack("instrument").sort_index()
+            future = closes.shift(-1) / closes - 1.0
+            strategy_returns: dict[pd.Timestamp, float] = {}
+            benchmark_returns: dict[pd.Timestamp, float] = {}
+            turnover_by_date: dict[pd.Timestamp, float] = {}
+            previous_weights: dict[str, float] = {}
+            transaction_cost_rate = (
+                float(config["research"]["transaction_cost_bps"]) / 10000.0
+            )
+            for date, scores in test_prediction.groupby(level="datetime"):
+                if date not in future.index:
+                    continue
+                top = (
+                    scores.droplevel("datetime")
+                    .sort_values(ascending=False)
+                    .head(int(config["research"]["stock_topk"]))
+                )
+                values = future.loc[date].reindex(top.index).dropna()
+                if not values.empty:
+                    weights = {
+                        str(symbol): 1.0 / len(values) for symbol in values.index
+                    }
+                    symbols = set(previous_weights) | set(weights)
+                    turnover = sum(
+                        abs(
+                            weights.get(symbol, 0.0)
+                            - previous_weights.get(symbol, 0.0)
+                        )
+                        for symbol in symbols
+                    ) / 2.0
+                    gross_return = float(values.mean())
+                    strategy_returns[pd.Timestamp(date)] = (
+                        gross_return - turnover * transaction_cost_rate
+                    )
+                    turnover_by_date[pd.Timestamp(date)] = turnover
+                    universe_values = future.loc[date].dropna()
+                    benchmark_returns[pd.Timestamp(date)] = (
+                        float(universe_values.mean())
+                        if not universe_values.empty
+                        else float("nan")
+                    )
+                    previous_weights = weights
+            net_returns = pd.Series(strategy_returns, dtype=float).sort_index()
+            equity = net_returns.add(1.0).cumprod()
+            benchmark_equity = (
+                pd.Series(benchmark_returns, dtype=float)
+                .sort_index()
+                .dropna()
+                .add(1.0)
+                .cumprod()
+            )
+            performance = _performance(equity)
+            benchmark_performance = _performance(benchmark_equity)
+            group_metrics = _forward_group_metrics(
+                test_prediction,
+                labels_by_segment["test"],
+            )
+            latest_date = test_prediction.index.get_level_values("datetime").max()
+            latest = test_prediction.xs(
+                latest_date, level="datetime"
+            ).sort_values(ascending=False)
+            best_iteration = getattr(
+                getattr(model, "model", None), "best_iteration", None
+            )
+            full_result = {
+                "model_available": True,
+                "model_name": "Qlib Alpha158 + LightGBM",
+                "qlib_version": getattr(qlib, "__version__", "unknown"),
+                "provider": str(provider),
+                "data_end_date": provider_end,
+                "latest_signal_date": research._iso_date(latest_date),
+                "valid": metrics["valid"],
+                "test": metrics["test"],
+                "mean_rank_ic": metrics["test"]["mean_rank_ic"],
+                "test_rank_ic": metrics["test"]["mean_rank_ic"],
+                "rank_ic_ir": metrics["test"]["rank_ic_ir"],
+                "top_bottom_excess_return": group_metrics[
+                    "top_bottom_excess_return"
+                ],
+                "forward_group_metrics": group_metrics,
+                "net_annualized_return": performance["net_annualized_return"],
+                "test_max_drawdown": performance["max_drawdown"],
+                "max_drawdown": performance["max_drawdown"],
+                "transaction_cost_bps": float(
+                    config["research"]["transaction_cost_bps"]
+                ),
+                "mean_daily_turnover": float(
+                    pd.Series(turnover_by_date, dtype=float).mean()
+                ),
+                "benchmark": {
+                    "name": "equal_weight_stock_universe",
+                    "annualized_return": benchmark_performance[
+                        "net_annualized_return"
+                    ],
+                    "max_drawdown": benchmark_performance["max_drawdown"],
+                    "excess_annualized_return": performance[
+                        "net_annualized_return"
+                    ]
+                    - benchmark_performance["net_annualized_return"],
+                },
+                "training_best_iteration": best_iteration,
+                "scores": {
+                    validate_symbol(str(symbol)): float(score)
+                    for symbol, score in latest.items()
+                },
+                "leakage_check": {
+                    "passed": True,
+                    "label_horizon_days": label_horizon,
+                },
+                "cache_hit": False,
+                "cache_miss_reason": cache_miss_reason,
+                "model_cache_key": cache_key,
+            }
+            _report_progress(progress_callback, "publish", cache_hit=False)
+            if cache_path is not None and cache_key is not None:
+                atomic_write_json(
+                    cache_path,
+                    research._jsonable(
+                        {
+                            "schema": MODEL_CACHE_SCHEMA,
+                            "cache_key": cache_key,
+                            "identity": cache_identity,
+                            "result": full_result,
+                        }
+                    ),
+                )
+            return _filter_scores(full_result, requested_symbols)
+        finally:
+            provider_lock.release()
     except Exception as exc:
         return {
             "model_available": False,

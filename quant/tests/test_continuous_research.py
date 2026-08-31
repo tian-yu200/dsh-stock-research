@@ -181,16 +181,18 @@ class ContinuousResearchTests(unittest.TestCase):
                 )
                 before = _digest(current_path)
 
-                timed_out = continuous.WorkerOutcome(
-                    pid=321,
-                    returncode=None,
-                    timed_out=True,
-                    duration_seconds=1.0,
-                    error="worker wall timeout",
-                )
-                first = continuous.run_once(
-                    worker_runner=lambda _job_id, _logger: timed_out
-                )
+                def timeout_and_claim(job_id: str, _logger: object):
+                    self.assertTrue(state.claim_job(job_id))
+                    started_at = str(state.get_job(job_id)["started_at"])
+                    return continuous.WorkerOutcome(
+                        pid=321,
+                        returncode=None,
+                        timed_out=True,
+                        duration_seconds=1.0,
+                        error="worker wall timeout",
+                        started_at=started_at,
+                    )
+                first = continuous.run_once(worker_runner=timeout_and_claim)
 
                 def advance_same_job(job_id: str, _logger: object):
                     self.assertEqual(job_id, JOB_ID)
@@ -212,9 +214,11 @@ class ContinuousResearchTests(unittest.TestCase):
 
                 second = continuous.run_once(worker_runner=advance_same_job)
 
-            self.assertEqual(first["status"], "failed")
+            self.assertEqual(first["status"], "queued")
             self.assertTrue(first["worker_timeout"])
             self.assertTrue(first["checkpoint_retained"])
+            self.assertTrue(first["job_requeued"])
+            self.assertEqual(state.get_job(JOB_ID)["status"], "queued")
             self.assertEqual(second["run_id"], JOB_ID)
             self.assertEqual(second["status"], "partial")
             self.assertEqual(second["completed"], 1)
@@ -225,6 +229,83 @@ class ContinuousResearchTests(unittest.TestCase):
             self.assertTrue(
                 (environment["continuous_dir"] / "continuous_research.log").is_file()
             )
+
+    def test_timeout_cannot_requeue_a_new_worker_generation(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-timeout-generation-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                self._environment(stack, root, state)
+                self._create_job(state, root / "runs", status="queued")
+                old_generation = "2026-08-26T10:00:00+00:00"
+                new_generation = "2026-08-26T10:01:00+00:00"
+
+                def timed_out_old_worker(job_id: str, _logger: object):
+                    state.update_job(
+                        job_id,
+                        status="running",
+                        started_at=old_generation,
+                    )
+                    state.update_job(
+                        job_id,
+                        status="running",
+                        started_at=new_generation,
+                    )
+                    return continuous.WorkerOutcome(
+                        pid=322,
+                        returncode=None,
+                        timed_out=True,
+                        duration_seconds=1.0,
+                        error="old worker wall timeout",
+                        started_at=old_generation,
+                    )
+
+                result = continuous.run_once(
+                    worker_runner=timed_out_old_worker
+                )
+
+            current = state.get_job(JOB_ID)
+            self.assertIsNotNone(current)
+            self.assertEqual(current["status"], "running")
+            self.assertEqual(current["started_at"], new_generation)
+            self.assertFalse(result["job_requeued"])
+            self.assertEqual(result["status"], "failed")
+
+    def test_update_job_if_requires_matching_generation(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-update-job-if-",
+            dir=ROOT / "tests",
+        ) as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            run_root = pathlib.Path(directory) / "runs"
+            self._create_job(state, run_root, status="queued")
+            self.assertTrue(state.claim_job(JOB_ID))
+            current = state.get_job(JOB_ID)
+            self.assertIsNotNone(current)
+            started_at = str(current["started_at"])
+
+            self.assertFalse(
+                state.update_job_if(
+                    JOB_ID,
+                    expected_status="running",
+                    expected_started_at="wrong-generation",
+                    status="queued",
+                )
+            )
+            self.assertEqual(state.get_job(JOB_ID)["status"], "running")
+            self.assertTrue(
+                state.update_job_if(
+                    JOB_ID,
+                    expected_status="running",
+                    expected_started_at=started_at,
+                    status="queued",
+                )
+            )
+            self.assertEqual(state.get_job(JOB_ID)["status"], "queued")
+
 
     def test_old_stock_job_resumes_without_today_calendar_gate(self) -> None:
         old_target = "2026-08-25"

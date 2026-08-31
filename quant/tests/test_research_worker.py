@@ -16,9 +16,173 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from assistant.config import DEFAULTS
 from fetch_state import FetchState
 import run_research_worker as worker
+import run_assistant_research as queued_cli
 
 
 class ResearchWorkerTests(unittest.TestCase):
+    def test_parses_bounded_qlib_build_summary(self) -> None:
+        summary = worker._qlib_build_summary(
+            "noise\n"
+            'QLIB_BUILD_SUMMARY={"cache_hit":true,'
+            '"source_fingerprint_digest":"provider-v1"}\n'
+        )
+        self.assertEqual(
+            summary,
+            {
+                "cache_hit": True,
+                "source_fingerprint_digest": "provider-v1",
+            },
+        )
+
+    def test_merges_qlib_build_progress_only_when_phase_sequence_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            run_dir = pathlib.Path(temporary_dir)
+            progress_path = run_dir / "qlib-build-progress.json"
+            status = {"phase_seq": 3, "qlib_build_phase_seq": 0}
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "phase": "loading_sources",
+                        "phase_seq": 2,
+                        "completed": 4,
+                        "total": 10,
+                        "updated_at": "2026-08-31T00:00:00+00:00",
+                        "cache_hit": False,
+                        "source_fingerprint_digest": "digest",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(worker._merge_qlib_build_progress(run_dir, status))
+            self.assertEqual(status["qlib_build_phase"], "loading_sources")
+            self.assertEqual(status["qlib_build_phase_seq"], 2)
+            self.assertEqual(status["qlib_build_completed"], 4)
+            self.assertEqual(status["qlib_build_total"], 10)
+            self.assertEqual(status["qlib_build_updated_at"], "2026-08-31T00:00:00+00:00")
+            self.assertFalse(worker._merge_qlib_build_progress(run_dir, status))
+
+            progress_path.write_text(
+                json.dumps({"phase": "complete", "phase_seq": 1}),
+                encoding="utf-8",
+            )
+            self.assertFalse(worker._merge_qlib_build_progress(run_dir, status))
+
+    def test_reset_qlib_build_progress_discards_previous_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            run_dir = pathlib.Path(temporary_dir)
+            progress_path = run_dir / "qlib-build-progress.json"
+            progress_path.write_text("{}", encoding="utf-8")
+            status = {
+                "phase": "qlib_build",
+                "qlib_build_phase": "complete",
+                "qlib_build_phase_seq": 8,
+                "qlib_build_completed": 1,
+                "qlib_build_total": 1,
+                "qlib_build_updated_at": "now",
+                "qlib_build": {"cache_hit": True},
+                "cache_hit": True,
+                "source_fingerprint_digest": "old",
+            }
+
+            worker._reset_qlib_build_progress(run_dir, status)
+            self.assertFalse(progress_path.exists())
+            self.assertEqual(status, {"phase": "qlib_build"})
+
+    def test_reset_research_progress_discards_an_earlier_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            run_dir = pathlib.Path(temporary_dir)
+            progress_path = run_dir / "research-progress.json"
+            progress_path.write_text(
+                json.dumps({"phase": "backtest", "phase_seq": 12}),
+                encoding="utf-8",
+            )
+            status = {
+                "phase": "research",
+                "research_phase": "backtest",
+                "research_phase_seq": 12,
+                "cache_hit": False,
+                "cache_miss_reason": "cache_file_missing_or_invalid",
+                "provider_end": "2026-08-28",
+            }
+
+            worker._reset_research_progress(run_dir, status)
+
+            self.assertFalse(progress_path.exists())
+            self.assertEqual(status, {"phase": "research"})
+            progress_path.write_text(
+                json.dumps({"phase": "provider_cache_check", "phase_seq": 1}),
+                encoding="utf-8",
+            )
+            self.assertTrue(worker._merge_research_progress(run_dir, status))
+            self.assertEqual(status["research_phase_seq"], 1)
+            self.assertEqual(status["research_phase"], "provider_cache_check")
+
+    def test_queued_cli_reuses_original_run_id_and_directory(self) -> None:
+        run_id = "20260827T000000Z-acde0001"
+        run_dir = ROOT / "tests" / "queued-run-placeholder"
+        with patch.object(
+            queued_cli,
+            "_queued_request",
+            return_value=("on_demand", "stock", {"stock": ["002942"]}),
+        ), patch.object(
+            queued_cli, "run_directory", return_value=run_dir
+        ), patch.object(
+            queued_cli,
+            "_run_fixed_research",
+            return_value={"run_id": run_id, "status": "success"},
+        ) as run_fixed:
+            exit_code = queued_cli.main(["--queued-run-id", run_id])
+
+        self.assertEqual(exit_code, 0)
+        run_fixed.assert_called_once_with(
+            mode="on_demand",
+            asset_scope="stock",
+            symbols_by_type={"stock": ["002942"]},
+            force_sync=True,
+            run_id_override=run_id,
+            run_dir_override=run_dir,
+        )
+
+    def test_compact_status_keeps_bounded_provider_build_summary(self) -> None:
+        compact = worker._compact_status(
+            {
+                "job_id": "job",
+                "status": "running",
+                "worker_pid": 1234,
+                "qlib_build_phase": "writing_features",
+                "qlib_build_phase_seq": 5,
+                "qlib_build_completed": 12,
+                "qlib_build_total": 20,
+                "qlib_build_updated_at": "now",
+                "qlib_build": {
+                    "returncode": 0,
+                    "timeout_seconds": 900,
+                    "child_pid": 1234,
+                    "cache_hit": True,
+                    "stdout_tail": "x" * 100000,
+                    "stderr_tail": "y" * 100000,
+                },
+            }
+        )
+
+        self.assertEqual(
+            compact["qlib_build"],
+            {
+                "returncode": 0,
+                "timeout_seconds": 900,
+                "child_pid": 1234,
+                "cache_hit": True,
+            },
+        )
+        self.assertEqual(compact["worker_pid"], 1234)
+        self.assertEqual(compact["qlib_build_phase"], "writing_features")
+        self.assertEqual(compact["qlib_build_phase_seq"], 5)
+        self.assertEqual(compact["qlib_build_completed"], 12)
+        self.assertEqual(compact["qlib_build_total"], 20)
+        self.assertEqual(compact["qlib_build_updated_at"], "now")
+        self.assertLess(len(json.dumps(compact)), 1000)
+
     def test_compact_status_omits_large_nested_payloads(self) -> None:
         compact = worker._compact_status(
             {
@@ -30,6 +194,7 @@ class ResearchWorkerTests(unittest.TestCase):
                     {
                         "asset_type": "otc_fund",
                         "status": "partial",
+                        "requested": 3,
                         "summary": {
                             "processed": 3,
                             "ok": 3,
@@ -43,6 +208,7 @@ class ResearchWorkerTests(unittest.TestCase):
 
         self.assertNotIn("research_result", compact)
         self.assertNotIn("stdout_tail", compact["fetch_results"][0])
+        self.assertEqual(compact["fetch_results"][0]["requested"], 3)
         self.assertNotIn(
             "source_by_symbol",
             compact["fetch_results"][0]["summary"],
@@ -289,7 +455,7 @@ class ResearchWorkerTests(unittest.TestCase):
                 "time_budget_seconds": 10,
             }
             research_result = {
-                "run_id": "result-run",
+                "run_id": job_id,
                 "status": "success",
                 "result_path": str(root / "result"),
             }
@@ -314,7 +480,10 @@ class ResearchWorkerTests(unittest.TestCase):
             self.assertEqual(status["progress"]["pending"], 1)
             research.assert_called_once()
             self.assertEqual(research.call_args.args, (job_id,))
-            self.assertIn("timeout_seconds", research.call_args.kwargs)
+            self.assertLessEqual(
+                research.call_args.kwargs["timeout_seconds"],
+                15.0,
+            )
             self.assertIn("heartbeat", research.call_args.kwargs)
 
     def test_fresh_targeted_cache_skips_fetch_and_preserves_routes(self) -> None:
@@ -353,7 +522,7 @@ class ResearchWorkerTests(unittest.TestCase):
             config["fetch"]["state_db"] = str(state.path)
             config["fetch"]["max_data_age_days"] = 5
             research_result = {
-                "run_id": "result-run",
+                "run_id": job_id,
                 "status": "success",
                 "result_path": str(root / "result"),
             }
@@ -379,6 +548,227 @@ class ResearchWorkerTests(unittest.TestCase):
             self.assertIn("timeout_seconds", research.call_args.kwargs)
             self.assertIn("heartbeat", research.call_args.kwargs)
 
+    def test_targeted_stock_refresh_reuses_provider_without_build(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="research-targeted-refresh-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "run"
+            state = FetchState(root / "state.sqlite3")
+            job_id = "20260827T000000Z-acde0002"
+            symbol = "002942"
+            state.register_assets("stock", [symbol])
+            state.create_job(
+                job_id,
+                kind="research",
+                asset_scope="stock",
+                metadata={
+                    "mode": "on_demand",
+                    "asset_scope": "stock",
+                    "asset_types": ["stock"],
+                    "symbols": {"stock": [symbol]},
+                    "full_universe": False,
+                    "target_date": "2026-08-27",
+                    "target_dates": {"stock": "2026-08-27"},
+                },
+            )
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(state.path)
+            config["fetch"]["max_data_age_days"] = 5
+            research_result = {
+                "run_id": job_id,
+                "status": "success",
+                "result_path": str(run_dir),
+            }
+
+            def refresh_target(*args, **kwargs):
+                self.assertEqual(kwargs["asset_type"], "stock")
+                self.assertEqual(kwargs["symbols"], [symbol])
+                state.mark_success(
+                    "stock",
+                    symbol,
+                    data_end_date="2026-08-27",
+                    source="test",
+                    rows=300,
+                    refresh_interval_seconds=86400,
+                )
+                return {
+                    "asset_type": "stock",
+                    "status": "success",
+                    "returncode": 0,
+                    "summary": {
+                        "status": "success",
+                        "requested": 1,
+                        "processed": 1,
+                        "ok": 1,
+                        "failed": 0,
+                        "pending": 0,
+                    },
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                    "timeout_seconds": 60,
+                    "time_budget_seconds": 15,
+                }
+
+            with (
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(
+                    worker,
+                    "_run_fetch_script",
+                    side_effect=refresh_target,
+                ) as fetch,
+                patch.object(worker, "_run_rolling_scan"),
+                patch.object(worker, "_run_bounded_command") as build,
+                patch.object(
+                    worker,
+                    "_run_research_process",
+                    return_value=research_result,
+                ) as research,
+            ):
+                exit_code = worker.main(
+                    ["--job-id", job_id, "--time-budget", "60"]
+                )
+
+            status_bytes = (run_dir / "status.json").read_bytes()
+            status = json.loads(status_bytes.decode("utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        fetch.assert_called_once()
+        build.assert_not_called()
+        research.assert_called_once()
+        self.assertEqual(
+            status["provider_strategy"],
+            "reuse_existing_provider_for_targeted_run",
+        )
+        self.assertNotIn("qlib_build", status)
+        self.assertNotIn("research_result", status)
+        self.assertLess(len(status_bytes), 16 * 1024)
+
+    def test_full_universe_stock_refresh_builds_provider_with_run_progress_file(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="research-full-universe-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "run"
+            state = FetchState(root / "state.sqlite3")
+            job_id = "20260827T000000Z-acde0003"
+            symbol = "002942"
+            state.register_assets("stock", [symbol])
+            state.create_job(
+                job_id,
+                kind="research",
+                asset_scope="stock",
+                metadata={
+                    "mode": "daily",
+                    "asset_scope": "stock",
+                    "asset_types": ["stock"],
+                    "symbols": {"stock": []},
+                    "full_universe": True,
+                    "target_date": "2026-08-27",
+                    "target_dates": {"stock": "2026-08-27"},
+                },
+            )
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(state.path)
+            config["fetch"]["max_data_age_days"] = 0
+            research_result = {
+                "run_id": job_id,
+                "status": "success",
+                "result_path": str(run_dir),
+            }
+
+            def refresh_universe(*args, **kwargs):
+                self.assertIsNone(kwargs["symbols"])
+                state.mark_success(
+                    "stock",
+                    symbol,
+                    data_end_date="2026-08-27",
+                    source="test",
+                    rows=300,
+                    refresh_interval_seconds=86400,
+                )
+                return {
+                    "asset_type": "stock",
+                    "status": "success",
+                    "returncode": 0,
+                    "summary": {
+                        "status": "success",
+                        "requested": 1,
+                        "processed": 1,
+                        "ok": 1,
+                        "failed": 0,
+                        "pending": 0,
+                    },
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                    "timeout_seconds": 60,
+                    "time_budget_seconds": 15,
+                }
+
+            def build_provider(command, **kwargs):
+                self.assertIn("--progress-file", command)
+                progress_path = pathlib.Path(
+                    command[command.index("--progress-file") + 1]
+                )
+                self.assertEqual(progress_path, run_dir / "qlib-build-progress.json")
+                progress_path.parent.mkdir(parents=True, exist_ok=True)
+                progress_path.write_text(
+                    json.dumps(
+                        {
+                            "phase": "complete",
+                            "phase_seq": 3,
+                            "completed": 1,
+                            "total": 1,
+                            "updated_at": "now",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return {
+                    "returncode": 0,
+                    "stdout": "QLIB_BUILD_SUMMARY={\"cache_hit\":false}\n",
+                    "stderr": "",
+                    "timeout_seconds": 60,
+                    "child_pid": 123,
+                    "timed_out": False,
+                }
+
+            with (
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(
+                    worker,
+                    "_run_fetch_script",
+                    side_effect=refresh_universe,
+                ) as fetch,
+                patch.object(worker, "_run_rolling_scan"),
+                patch.object(
+                    worker,
+                    "_run_bounded_command",
+                    side_effect=build_provider,
+                ) as build,
+                patch.object(
+                    worker,
+                    "_run_research_process",
+                    return_value=research_result,
+                ) as research,
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        fetch.assert_called_once()
+        build.assert_called_once()
+        research.assert_called_once()
+        self.assertEqual(status["provider_strategy"], "rebuild_if_source_changed")
+        self.assertEqual(status["qlib_build_phase"], "complete")
+        self.assertEqual(status["qlib_build_completed"], 1)
+        self.assertEqual(status["qlib_build_total"], 1)
+
     def test_fetch_command_reserves_shutdown_grace_and_forwards_symbols(self) -> None:
         config = copy.deepcopy(DEFAULTS)
         config["fetch"]["request_timeout_seconds"] = 30
@@ -401,6 +791,34 @@ class ResearchWorkerTests(unittest.TestCase):
         self.assertGreaterEqual(timeout_seconds - child_budget, 45)
         self.assertEqual(command[-len(symbols):], symbols)
         self.assertNotIn("--asset-type", command)
+
+    def test_stage_timeout_is_capped_by_global_deadline(self) -> None:
+        with patch.object(worker.time, "monotonic", return_value=400.0):
+            timeout_seconds = worker._remaining_stage_timeout(
+                deadline=460.0,
+                configured_timeout=900.0,
+                shutdown_grace=45.0,
+                stage="research",
+            )
+
+        self.assertEqual(timeout_seconds, 15.0)
+
+    def test_stage_timeout_rejects_launch_when_only_shutdown_grace_remains(
+        self,
+    ) -> None:
+        with (
+            patch.object(worker.time, "monotonic", return_value=415.0),
+            self.assertRaisesRegex(
+                TimeoutError,
+                "worker time budget exhausted before research",
+            ),
+        ):
+            worker._remaining_stage_timeout(
+                deadline=460.0,
+                configured_timeout=900.0,
+                shutdown_grace=45.0,
+                stage="research",
+            )
 
     def test_fetch_command_caps_request_timeout_for_short_budget(self) -> None:
         config = copy.deepcopy(DEFAULTS)

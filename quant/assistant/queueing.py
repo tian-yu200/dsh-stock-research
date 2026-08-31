@@ -515,7 +515,8 @@ def _refresh_data(
         result.get("label") == "stock" and result.get("status") == "success"
         for result in results
     )
-    if "stock" in selected and stock_fetch_ok:
+    targeted_stock_refresh = symbols_by_type is not None and bool(routes.get("stock"))
+    if "stock" in selected and stock_fetch_ok and not targeted_stock_refresh:
         provider_result = _run_refresh_command(
             [sys.executable, str(scripts / "build_qlib_data.py"), "--replace"],
             cwd=Path(__file__).resolve().parents[1],
@@ -524,8 +525,17 @@ def _refresh_data(
             log=log,
         )
         results.append({"label": "qlib_provider", **provider_result})
+    elif "stock" in selected and stock_fetch_ok and targeted_stock_refresh:
+        log.append("qlib provider rebuild skipped for targeted stock refresh; existing provider reused")
+        results.append(
+            {
+                "label": "qlib_provider",
+                "status": "reused",
+                "reason": "targeted_stock_refresh",
+            }
+        )
     passed = bool(results) and all(
-        result.get("status") == "success" for result in results
+        result.get("status") in {"success", "reused"} for result in results
     )
     return {
         "attempted": True,

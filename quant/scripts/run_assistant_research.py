@@ -94,6 +94,8 @@ def _run_fixed_research(
     symbols: list[str] | None = None,
     symbols_by_type: dict[str, list[str]] | None = None,
     force_sync: bool = False,
+    run_id_override: str | None = None,
+    run_dir_override: Path | None = None,
  ) -> dict[str, Any]:
     captured = io.StringIO()
     previous_skip = os.environ.get("DSH_STOCK_SKIP_FETCH")
@@ -107,6 +109,8 @@ def _run_fixed_research(
                 symbols=symbols,
                 _force_sync=force_sync,
                 _symbols_by_type=symbols_by_type,
+                _run_id_override=run_id_override,
+                _run_dir_override=run_dir_override,
             )
     finally:
         noisy_output = captured.getvalue()
@@ -137,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                 asset_scope=asset_scope,
                 symbols_by_type=symbols_by_type,
                 force_sync=True,
+                run_id_override=args.queued_run_id,
+                run_dir_override=run_directory(args.queued_run_id),
             )
         else:
             if args.mode is None or args.asset_scope is None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -92,8 +93,23 @@ class SingleQueryQlibDataLoaderTests(unittest.TestCase):
 
 class QlibBacktestReuseTests(unittest.TestCase):
     def test_model_reuses_handler_close_without_second_features_query(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="qlib-model-", dir=ROOT / "tests")
+        self.addCleanup(temporary.cleanup)
+        temp_root = pathlib.Path(temporary.name)
+        provider_dir = temp_root / "provider"
+        results_dir = temp_root / "results"
+        logs_dir = temp_root / "logs"
+        for directory in (provider_dir, results_dir, logs_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
         config = copy.deepcopy(DEFAULTS)
-        config["paths"]["logs_dir"] = str(ROOT / "logs")
+        config["paths"].update(
+            {
+                "qlib_provider": str(provider_dir),
+                "results_dir": str(results_dir),
+                "logs_dir": str(logs_dir),
+            }
+        )
         config["dataset"]["segments"]["test"] = ["2024-01-02", "2024-01-04"]
 
         dates = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
@@ -137,6 +153,110 @@ class QlibBacktestReuseTests(unittest.TestCase):
             data_key="raw",
         )
         self.assertTrue(result["model_available"])
+        self.assertFalse(result["cache_hit"])
+        self.assertEqual(
+            result["cache_miss_reason"],
+            "provider_source_fingerprint_missing",
+        )
+
+
+class QlibModelCacheTests(unittest.TestCase):
+    def test_cache_hit_filters_scores_and_holds_provider_lock_through_publish(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qlib-cache-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            provider_dir = root / "provider"
+            results_dir = root / "results"
+            logs_dir = root / "logs"
+            for path in (provider_dir, results_dir, logs_dir):
+                path.mkdir(parents=True, exist_ok=True)
+
+            config = copy.deepcopy(DEFAULTS)
+            config["paths"].update(
+                {
+                    "qlib_provider": str(provider_dir),
+                    "results_dir": str(results_dir),
+                    "logs_dir": str(logs_dir),
+                }
+            )
+            fingerprint = {"digest": "provider-v1", "files": 2}
+            qlib_model.atomic_write_json(
+                provider_dir / "manifest.json",
+                {"source_fingerprint": fingerprint},
+            )
+            provider_end = "2024-01-04"
+            cache_key, identity = qlib_model._model_cache_identity(
+                config,
+                provider_fingerprint=fingerprint,
+                provider_end=provider_end,
+            )
+            qlib_model.atomic_write_json(
+                qlib_model._model_cache_path(config, cache_key),
+                {
+                    "schema": qlib_model.MODEL_CACHE_SCHEMA,
+                    "cache_key": cache_key,
+                    "identity": identity,
+                    "result": {
+                        "model_available": True,
+                        "model_name": "Qlib Alpha158 + LightGBM",
+                        "scores": {"002942": 0.8, "600519": 0.5},
+                    },
+                },
+            )
+
+            lock_state = {"active": False}
+            events: list[str] = []
+            lock = Mock()
+
+            def acquire(*, timeout_seconds: float) -> Mock:
+                self.assertGreaterEqual(timeout_seconds, 0.0)
+                lock_state["active"] = True
+                events.append("lock_acquired")
+                return lock
+
+            def release() -> None:
+                self.assertTrue(lock_state["active"])
+                events.append("lock_released")
+                lock_state["active"] = False
+
+            def initialize(provider: pathlib.Path, *, kernels: int) -> None:
+                self.assertTrue(lock_state["active"])
+                self.assertEqual(provider, provider_dir.resolve())
+                self.assertEqual(kernels, 1)
+                events.append("initialized")
+
+            def progress(phase: str, **details: object) -> None:
+                if phase != "provider_cache_check":
+                    self.assertTrue(lock_state["active"])
+                events.append(phase)
+
+            lock.acquire.side_effect = acquire
+            lock.release.side_effect = release
+            data_provider = Mock()
+            data_provider.calendar.return_value = list(
+                pd.to_datetime(["2024-01-02", provider_end])
+            )
+
+            with patch.object(qlib_model, "ProviderLock", return_value=lock), patch.object(
+                qlib_model, "init_qlib", side_effect=initialize
+            ), patch.object(
+                qlib_model, "build_dataset"
+            ) as build_dataset, patch.object(qlib.data.D, "_provider", data_provider):
+                result = qlib_model._run_qlib_stock_model(
+                    config,
+                    requested_symbols=["002942"],
+                    progress_callback=progress,
+                )
+
+        self.assertEqual(result["scores"], {"002942": 0.8})
+        self.assertTrue(result["cache_hit"])
+        self.assertNotIn("cache_miss_reason", result)
+        self.assertEqual(result["model_cache_key"], cache_key)
+        build_dataset.assert_not_called()
+        lock.acquire.assert_called_once()
+        lock.release.assert_called_once_with()
+        self.assertFalse(lock_state["active"])
+        self.assertLess(events.index("lock_acquired"), events.index("initialized"))
+        self.assertLess(events.index("publish"), events.index("lock_released"))
 
 
 if __name__ == "__main__":

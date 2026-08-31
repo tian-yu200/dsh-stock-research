@@ -369,6 +369,71 @@ class AssistantStateMachineTests(unittest.TestCase):
         status = research.get_run_status(result["run_id"])
         self.assertEqual(status["status"], "failed")
 
+    def test_queued_targeted_research_reuses_run_and_reports_model_phases(self) -> None:
+        symbol = "002942"
+        self._write_market_data("stock", symbol)
+        run_id = "20260825T100000Z-acde0001"
+        run_dir = self.runs_dir / "2026" / "08" / "25" / run_id
+        run_dir.mkdir(parents=True)
+        parent_status = {
+            "run_id": run_id,
+            "job_id": run_id,
+            "status": "running",
+            "phase": "research",
+            "phase_seq": 4,
+        }
+        paths.atomic_write_json(run_dir / "status.json", parent_status)
+        unavailable = {
+            "model_available": False,
+            "model_name": "Qlib Alpha158 + LightGBM",
+            "error": "test model unavailable",
+            "test_rank_ic": float("nan"),
+            "rank_ic_ir": float("nan"),
+            "net_annualized_return": float("nan"),
+            "max_drawdown": float("nan"),
+            "leakage_check": {"passed": False, "reason": "test"},
+        }
+
+        def run_model(config: dict[str, object], **options: object) -> dict[str, object]:
+            callback = options["progress_callback"]
+            callback("provider_cache_check")  # type: ignore[operator]
+            callback(  # type: ignore[operator]
+                "model_cache_check",
+                cache_hit=False,
+                cache_miss_reason="cache_file_missing_or_invalid",
+                provider_end="2026-08-25",
+            )
+            callback("publish", cache_hit=False)  # type: ignore[operator]
+            return unavailable
+
+        with patch.object(
+            research, "_run_qlib_stock_model", side_effect=run_model
+        ) as model:
+            result = research.run_research(
+                "on_demand",
+                "stock",
+                _force_sync=True,
+                _symbols_by_type={"stock": [symbol]},
+                _run_id_override=run_id,
+                _run_dir_override=run_dir,
+            )
+
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        progress = json.loads(
+            (run_dir / "research-progress.json").read_text(encoding="utf-8")
+        )
+        preserved_status = json.loads(
+            (run_dir / "status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(result["run_id"], run_id)
+        self.assertEqual(manifest["run_id"], run_id)
+        self.assertEqual(manifest["requested_symbols"], [symbol])
+        self.assertEqual(model.call_args.kwargs["requested_symbols"], [symbol])
+        self.assertEqual(progress["run_id"], run_id)
+        self.assertEqual(progress["phase"], "publish")
+        self.assertGreaterEqual(progress["phase_seq"], 3)
+        self.assertEqual(preserved_status, parent_status)
+
     def test_etf_path_can_publish_without_stock_model(self) -> None:
         self._write_market_data("etf", "510300")
 

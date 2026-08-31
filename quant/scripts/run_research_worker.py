@@ -19,7 +19,7 @@ if str(QUANT_ROOT) not in sys.path:
     sys.path.insert(0, str(QUANT_ROOT))
 
 from assistant.config import load_config
-from assistant.paths import atomic_write_json, run_directory
+from assistant.paths import atomic_write_json, read_json, run_directory
 from assistant.research import _jsonable
 from assistant.rolling_scan import run_rolling_pass
 from fetch_state import FetchState
@@ -35,6 +35,18 @@ def _parser() -> argparse.ArgumentParser:
 
 def _summary(stdout: str) -> dict[str, Any] | None:
     marker = "ASSISTANT_FETCH_SUMMARY="
+    for line in reversed((stdout or "").splitlines()):
+        if line.startswith(marker):
+            try:
+                value = json.loads(line[len(marker):])
+            except json.JSONDecodeError:
+                return None
+            return value if isinstance(value, dict) else None
+    return None
+
+
+def _qlib_build_summary(stdout: str) -> dict[str, Any] | None:
+    marker = "QLIB_BUILD_SUMMARY="
     for line in reversed((stdout or "").splitlines()):
         if line.startswith(marker):
             try:
@@ -64,20 +76,63 @@ def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
         "run_id",
         "job_id",
         "status",
+        "worker_pid",
         "phase",
+        "phase_seq",
+        "research_phase",
+        "research_phase_seq",
+        "qlib_build_phase",
+        "qlib_build_phase_seq",
+        "qlib_build_completed",
+        "qlib_build_total",
+        "qlib_build_updated_at",
         "target_date",
         "target_dates",
+        "asset_scope",
+        "asset_types",
+        "full_universe",
         "completed",
         "pending",
         "failed",
         "stale",
         "coverage",
+        "progress_seq",
+        "last_progress_at",
+        "last_heartbeat_at",
+        "started_at",
         "result_run_id",
+        "result_path",
         "finished_at",
         "message",
         "error",
+        "cache_hit",
+        "cache_miss_reason",
+        "provider_end",
+        "provider_strategy",
     )
     result = {key: value[key] for key in keys if key in value}
+    progress = value.get("progress")
+    if isinstance(progress, dict):
+        result["progress"] = {
+            key: progress[key]
+            for key in ("total", "completed", "pending", "failed", "stale", "coverage")
+            if key in progress
+        }
+    fetch_gate = value.get("fetch_gate")
+    if isinstance(fetch_gate, dict):
+        result["fetch_gate"] = {
+            key: fetch_gate[key]
+            for key in (
+                "passed",
+                "child_failed",
+                "coverage",
+                "minimum_coverage",
+                "pending",
+                "failed",
+                "stale",
+            )
+            if key in fetch_gate
+        }
     compact_fetches = []
     for fetch in value.get("fetch_results", []):
         compact = {
@@ -85,6 +140,7 @@ def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
             for key in (
                 "asset_type",
                 "status",
+                "requested",
                 "returncode",
                 "time_budget_seconds",
                 "timeout_seconds",
@@ -109,6 +165,20 @@ def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
         compact_fetches.append(compact)
     if compact_fetches:
         result["fetch_results"] = compact_fetches
+    qlib_build = value.get("qlib_build")
+    if isinstance(qlib_build, dict):
+        result["qlib_build"] = {
+            key: qlib_build[key]
+            for key in (
+                "returncode",
+                "timeout_seconds",
+                "child_pid",
+                "cache_hit",
+                "skipped",
+                "source_fingerprint_digest",
+            )
+            if key in qlib_build
+        }
     rolling = value.get("rolling_scan")
     if isinstance(rolling, dict):
         result["rolling_scan"] = {
@@ -134,7 +204,97 @@ def _print_status(value: dict[str, Any]) -> None:
 
 
 def _write_status(job_id: str, value: dict[str, Any]) -> None:
-    atomic_write_json(run_directory(job_id) / "status.json", _jsonable(value))
+    atomic_write_json(
+        run_directory(job_id) / "status.json",
+        _jsonable(_compact_status(value)),
+    )
+
+
+def _set_phase(status_value: dict[str, Any], phase: str) -> None:
+    phase = str(phase)
+    if status_value.get("phase") != phase:
+        status_value["phase"] = phase
+        status_value["phase_seq"] = int(status_value.get("phase_seq", 0)) + 1
+
+
+def _merge_research_progress(
+    run_dir: Path,
+    status_value: dict[str, Any],
+) -> bool:
+    progress = read_json(run_dir / "research-progress.json", {})
+    if not isinstance(progress, dict):
+        return False
+    child_seq = int(progress.get("phase_seq", 0) or 0)
+    if child_seq <= int(status_value.get("research_phase_seq", 0) or 0):
+        return False
+    status_value["research_phase_seq"] = child_seq
+    status_value["research_phase"] = str(progress.get("phase") or "unknown")
+    status_value["phase_seq"] = int(status_value.get("phase_seq", 0)) + 1
+    for key in ("cache_hit", "cache_miss_reason", "provider_end"):
+        if key in progress:
+            status_value[key] = progress[key]
+    return True
+
+
+def _merge_qlib_build_progress(
+    run_dir: Path,
+    status_value: dict[str, Any],
+) -> bool:
+    progress = read_json(run_dir / "qlib-build-progress.json", {})
+    if not isinstance(progress, dict):
+        return False
+    child_seq = int(progress.get("phase_seq", 0) or 0)
+    if child_seq <= int(status_value.get("qlib_build_phase_seq", 0) or 0):
+        return False
+    status_value["qlib_build_phase_seq"] = child_seq
+    status_value["qlib_build_phase"] = str(progress.get("phase") or "unknown")
+    for source_key, status_key in (
+        ("completed", "qlib_build_completed"),
+        ("total", "qlib_build_total"),
+        ("updated_at", "qlib_build_updated_at"),
+    ):
+        if source_key in progress:
+            status_value[status_key] = progress[source_key]
+    for key in ("cache_hit", "source_fingerprint_digest"):
+        if key in progress:
+            status_value[key] = progress[key]
+    status_value["phase_seq"] = int(status_value.get("phase_seq", 0)) + 1
+    return True
+
+
+def _reset_qlib_build_progress(
+    run_dir: Path,
+    status_value: dict[str, Any],
+) -> None:
+    """Discard progress and summary from an earlier provider-build attempt."""
+    (run_dir / "qlib-build-progress.json").unlink(missing_ok=True)
+    for key in (
+        "qlib_build_phase",
+        "qlib_build_phase_seq",
+        "qlib_build_completed",
+        "qlib_build_total",
+        "qlib_build_updated_at",
+    ):
+        status_value.pop(key, None)
+    status_value.pop("qlib_build", None)
+    for key in ("cache_hit", "source_fingerprint_digest"):
+        status_value.pop(key, None)
+
+
+def _reset_research_progress(
+    run_dir: Path,
+    status_value: dict[str, Any],
+) -> None:
+    """Discard progress from an earlier attempt before starting a new child."""
+    (run_dir / "research-progress.json").unlink(missing_ok=True)
+    for key in (
+        "research_phase",
+        "research_phase_seq",
+        "cache_hit",
+        "cache_miss_reason",
+        "provider_end",
+    ):
+        status_value.pop(key, None)
 
 
 def _latest_queued(state: FetchState) -> dict[str, Any] | None:
@@ -277,6 +437,20 @@ def _run_research_process(
         detail = completed["stderr"][-1000:] or completed["stdout"][-1000:]
         raise RuntimeError(f"research process failed: {detail}")
     return result
+
+
+def _remaining_stage_timeout(
+    *,
+    deadline: float,
+    configured_timeout: float,
+    shutdown_grace: float,
+    stage: str,
+ ) -> float:
+    remaining = deadline - time.monotonic()
+    available = remaining - max(0.0, shutdown_grace)
+    if available <= 0:
+        raise TimeoutError(f"worker time budget exhausted before {stage}")
+    return max(0.1, min(float(configured_timeout), available))
 
 
 def _build_fetch_command(
@@ -519,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
         "target_dates": target_dates,
         "result_path": str(run_dir),
         "phase": "cache_check",
+        "phase_seq": 1,
         "fetch_results": [],
         "progress_seq": 0,
         "last_progress_at": started.isoformat(),
@@ -543,7 +718,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_progress,
         previous_completed=int(initial_progress.get("completed", 0)),
     )
-    atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+    _write_status(job_id, status_value)
 
     def heartbeat() -> None:
         nonlocal last_completed
@@ -567,7 +742,9 @@ def main(argv: list[str] | None = None) -> int:
             stale=progress["stale"],
             coverage=progress["coverage"],
         )
-        atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+        _merge_research_progress(run_dir, status_value)
+        _merge_qlib_build_progress(run_dir, status_value)
+        _write_status(job_id, status_value)
 
     try:
         scripts = QUANT_ROOT / "scripts"
@@ -590,7 +767,7 @@ def main(argv: list[str] | None = None) -> int:
                 status_value["fetch_results"] = fetch_results
                 heartbeat()
                 continue
-            status_value["phase"] = "fetch"
+            _set_phase(status_value, "fetch")
             remaining = deadline - time.monotonic()
             if remaining <= shutdown_grace:
                 break
@@ -619,7 +796,7 @@ def main(argv: list[str] | None = None) -> int:
             status_value["fetch_results"] = fetch_results
             heartbeat()
             _run_rolling_scan(job_id, config, status_value)
-            atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+            _write_status(job_id, status_value)
             if result["status"] in {"failed", "timeout"}:
                 # 超时是有检查点的正常波次收尾；真正的 child failed
                 # 仍允许完成其余类别，但本轮绝不进入研究发布阶段。
@@ -704,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
                 finished_at=finished_at,
                 last_error=message,
             )
-            atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+            _write_status(job_id, status_value)
             _print_status(status_value)
             return 1
         if not fetch_gate_passed:
@@ -724,7 +901,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 }
             )
-            atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+            _write_status(job_id, status_value)
             _print_status(status_value)
             return 0
 
@@ -733,47 +910,80 @@ def main(argv: list[str] | None = None) -> int:
             and result.get("status") != "cache_hit"
             for result in fetch_results
         )
-        if stock_refresh_performed:
-            status_value["phase"] = "qlib_build"
+        if stock_refresh_performed and full_universe:
+            status_value["provider_strategy"] = "rebuild_if_source_changed"
+            _reset_qlib_build_progress(run_dir, status_value)
+            _set_phase(status_value, "qlib_build")
             heartbeat()
+            build_timeout = _remaining_stage_timeout(
+                deadline=deadline,
+                configured_timeout=max(
+                    60.0,
+                    float(config["fetch"].get("timeout_seconds", 900)),
+                ),
+                shutdown_grace=shutdown_grace,
+                stage="Qlib provider build",
+            )
             build = _run_bounded_command(
                 [
                     sys.executable,
                     str(scripts / "build_qlib_data.py"),
                     "--replace",
+                    "--progress-file",
+                    str(run_dir / "qlib-build-progress.json"),
                 ],
-                timeout_seconds=max(
-                    60.0,
-                    float(config["fetch"].get("timeout_seconds", 900)),
-                ),
+                timeout_seconds=build_timeout,
                 config=config,
                 heartbeat=heartbeat,
             )
+            _merge_qlib_build_progress(run_dir, status_value)
+            build_summary = _qlib_build_summary(build["stdout"]) or {}
             status_value["qlib_build"] = {
                 "returncode": build["returncode"],
                 "stdout_tail": build["stdout"][-3000:],
                 "stderr_tail": build["stderr"][-3000:],
                 "timeout_seconds": build["timeout_seconds"],
                 "child_pid": build["child_pid"],
+                "cache_hit": bool(build_summary.get("cache_hit", False)),
+                "source_fingerprint_digest": build_summary.get(
+                    "source_fingerprint_digest"
+                ),
             }
             if build["timed_out"]:
                 raise TimeoutError("Qlib provider build exceeded its deadline")
             if build["returncode"] != 0:
                 raise RuntimeError("Qlib provider build failed")
+        elif "stock" in asset_types and not full_universe:
+            status_value["provider_strategy"] = (
+                "reuse_existing_provider_for_targeted_run"
+            )
 
-        status_value["phase"] = "research"
+        _reset_research_progress(run_dir, status_value)
+        _set_phase(status_value, "research")
         heartbeat()
-        research_result = _run_research_process(
-            job_id,
-            config=config,
-            timeout_seconds=max(
+        research_timeout = _remaining_stage_timeout(
+            deadline=deadline,
+            configured_timeout=max(
                 60.0,
                 float(config["fetch"].get("timeout_seconds", 900)),
             ),
+            shutdown_grace=shutdown_grace,
+            stage="research",
+        )
+        research_result = _run_research_process(
+            job_id,
+            config=config,
+            timeout_seconds=research_timeout,
             heartbeat=heartbeat,
         )
-        status_value["research_result"] = research_result
-        status_value["result_run_id"] = research_result.get("run_id")
+        _merge_research_progress(run_dir, status_value)
+        result_run_id = research_result.get("run_id")
+        if result_run_id != job_id:
+            raise ValueError(
+                "research result run_id does not match queued job_id: "
+                f"expected {job_id}, got {result_run_id!r}"
+            )
+        status_value["result_run_id"] = result_run_id
         status_value["result_path"] = research_result.get("result_path", str(run_dir))
         research_succeeded = research_result.get("status") == "success"
         has_incomplete_data = any(
@@ -797,7 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
                 else str(research_result.get("error") or research_result.get("failure_reasons"))
             ),
         )
-        atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+        _write_status(job_id, status_value)
         _print_status(status_value)
         return 0 if status_value["status"] in {"complete", "partial"} else 1
     except Exception as exc:
@@ -855,7 +1065,7 @@ def main(argv: list[str] | None = None) -> int:
             last_error=error,
             **progress_fields,
         )
-        atomic_write_json(run_dir / "status.json", _jsonable(status_value))
+        _write_status(job_id, status_value)
         _print_status(status_value)
         return 0 if requeue_after_timeout else 1
 
