@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from typing import Any
 from unittest.mock import Mock, patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -124,7 +129,7 @@ class ResearchWorkerTests(unittest.TestCase):
         with patch.object(
             queued_cli,
             "_queued_request",
-            return_value=("on_demand", "stock", {"stock": ["002942"]}),
+            return_value=("on_demand", "stock", {"stock": ["002942"]}, "quick"),
         ), patch.object(
             queued_cli, "run_directory", return_value=run_dir
         ), patch.object(
@@ -139,10 +144,30 @@ class ResearchWorkerTests(unittest.TestCase):
             mode="on_demand",
             asset_scope="stock",
             symbols_by_type={"stock": ["002942"]},
+            depth="quick",
             force_sync=True,
             run_id_override=run_id,
             run_dir_override=run_dir,
         )
+
+    def test_queued_cli_defaults_depth_for_legacy_manifests(self) -> None:
+        run_id = "20260827T000000Z-acde0002"
+        run_dir = ROOT / "tests" / "queued-run-placeholder"
+        with patch.object(
+            queued_cli,
+            "_queued_request",
+            return_value=("daily", "stock", None, "standard"),
+        ), patch.object(
+            queued_cli, "run_directory", return_value=run_dir
+        ), patch.object(
+            queued_cli,
+            "_run_fixed_research",
+            return_value={"run_id": run_id, "status": "success"},
+        ) as run_fixed:
+            exit_code = queued_cli.main(["--queued-run-id", run_id])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_fixed.call_args.kwargs["depth"], "standard")
 
     def test_compact_status_keeps_bounded_provider_build_summary(self) -> None:
         compact = worker._compact_status(
@@ -480,9 +505,12 @@ class ResearchWorkerTests(unittest.TestCase):
             self.assertEqual(status["progress"]["pending"], 1)
             research.assert_called_once()
             self.assertEqual(research.call_args.args, (job_id,))
+            # 研究阶段不再被波次预算截断（模型缓存冷启动需要更长预算），
+            # 但仍受 fetch.timeout_seconds 上限约束。
+            self.assertGreater(research.call_args.kwargs["timeout_seconds"], 15.0)
             self.assertLessEqual(
                 research.call_args.kwargs["timeout_seconds"],
-                15.0,
+                float(config["fetch"]["timeout_seconds"]),
             )
             self.assertIn("heartbeat", research.call_args.kwargs)
 
@@ -547,6 +575,256 @@ class ResearchWorkerTests(unittest.TestCase):
             self.assertEqual(research.call_args.args, (job_id,))
             self.assertIn("timeout_seconds", research.call_args.kwargs)
             self.assertIn("heartbeat", research.call_args.kwargs)
+
+    def test_quick_depth_skips_fetch_scan_and_gate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="research-quick-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "run"
+            state = FetchState(root / "state.sqlite3")
+            job_id = "20260827T000000Z-quick001"
+            symbols = ["600999", "601696", "600030"]
+            state.register_assets("stock", symbols)
+            # 全部标的都落后于 target_date：standard 会触发抓取，quick 必须跳过。
+            for symbol in symbols:
+                state.mark_success(
+                    "stock",
+                    symbol,
+                    data_end_date="2026-08-20",
+                    source="test",
+                    rows=1,
+                    refresh_interval_seconds=86400,
+                )
+            state.create_job(
+                job_id,
+                kind="research",
+                asset_scope="stock",
+                metadata={
+                    "mode": "on_demand",
+                    "depth": "quick",
+                    "asset_scope": "stock",
+                    "asset_types": ["stock"],
+                    "symbols": {"stock": symbols},
+                    "full_universe": False,
+                    "target_date": "2026-08-27",
+                    "target_dates": {"stock": "2026-08-27"},
+                },
+            )
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(state.path)
+            config["fetch"]["max_data_age_days"] = 5
+            research_result = {
+                "run_id": job_id,
+                "status": "success",
+                "result_path": str(run_dir),
+            }
+            with (
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(worker, "_run_fetch_script") as fetch,
+                patch.object(worker, "_run_rolling_scan") as scan,
+                patch.object(
+                    worker,
+                    "_run_research_process",
+                    return_value=research_result,
+                ) as research,
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 0)
+            fetch.assert_not_called()
+            scan.assert_not_called()
+            self.assertEqual(status["depth"], "quick")
+            self.assertEqual(
+                status["fetch_results"],
+                [
+                    {
+                        "asset_type": "stock",
+                        "status": "skipped_by_depth",
+                        "requested": 3,
+                    }
+                ],
+            )
+            self.assertTrue(status["fetch_gate"]["passed"])
+            self.assertEqual(status["fetch_gate"]["bypassed_by_depth"], "quick")
+            self.assertTrue(status["stage_timings"])
+            self.assertIn("research", status["stage_timings"])
+            research.assert_called_once()
+
+    def test_set_phase_accumulates_stage_timings(self) -> None:
+        status: dict[str, Any] = {}
+        worker._set_phase(status, "fetch")
+        worker._set_phase(status, "qlib_build")
+        worker._set_phase(status, "qlib_build")
+        worker._set_phase(status, "research")
+
+        self.assertEqual(status["phase"], "research")
+        self.assertEqual(status["phase_seq"], 3)
+        self.assertEqual(
+            sorted(status["stage_timings"]),
+            ["fetch", "qlib_build"],
+        )
+        for entry in status["stage_timings"].values():
+            self.assertIn("started_at", entry)
+            self.assertIn("finished_at", entry)
+            self.assertGreaterEqual(entry["elapsed_seconds"], 0.0)
+
+    def test_close_stage_entry_never_double_counts(self) -> None:
+        # 终态收口后异常分支可能再次收口同一阶段；elapsed 不允许翻倍。
+        status: dict[str, Any] = {}
+        worker._set_phase(status, "research")
+        worker._close_current_stage(status)
+        elapsed_once = status["stage_timings"]["research"]["elapsed_seconds"]
+        worker._close_current_stage(status)
+        self.assertEqual(
+            status["stage_timings"]["research"]["elapsed_seconds"],
+            elapsed_once,
+        )
+        # 新阶段照常开始计时（entry 在其收口时才落盘）。
+        worker._set_phase(status, "publish")
+        self.assertEqual(status["phase"], "publish")
+        self.assertIsNotNone(status["phase_started_at"])
+        worker._close_current_stage(status)
+        self.assertIn("started_at", status["stage_timings"]["publish"])
+
+    def test_print_status_is_ascii_safe(self) -> None:
+        # worker 的 stdout 可能是 GBK 管道；状态里带着抓取子进程输出
+        # 残留的 U+FFFD 时打印绝不能像旧版那样抛 UnicodeEncodeError。
+        status = {
+            "run_id": "20260902T164252Z-e7a3bfbc",
+            "message": "定向请求已入队；后台只会检查和刷新指定代码。",
+            "error": "bad\ufffdchar",
+        }
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            worker._print_status(status)
+        payload = captured.getvalue()
+        payload.encode("ascii")  # 不可编码字符必须已被转义
+        self.assertEqual(json.loads(payload)["error"], "bad\ufffdchar")
+
+    def _make_two_type_job(
+        self,
+        root: pathlib.Path,
+        job_id: str,
+        *,
+        parallel: bool,
+    ) -> tuple[pathlib.Path, FetchState, dict[str, Any]]:
+        run_dir = root / "run"
+        state = FetchState(root / "state.sqlite3")
+        state.register_assets("stock", ["600999"])
+        state.register_assets("etf", ["510300"])
+        state.create_job(
+            job_id,
+            kind="research",
+            asset_scope="all",
+            metadata={
+                "mode": "daily",
+                "asset_scope": "all",
+                "asset_types": ["stock", "etf"],
+                "symbols": {"stock": [], "etf": []},
+                "full_universe": True,
+                "target_date": "2026-08-27",
+                "target_dates": {"stock": "2026-08-27", "etf": "2026-08-26"},
+            },
+        )
+        config = copy.deepcopy(DEFAULTS)
+        config["fetch"]["state_db"] = str(state.path)
+        config["fetch"]["max_data_age_days"] = 5
+        config["fetch"]["parallel_asset_fetch"] = parallel
+        return run_dir, state, config
+
+    def test_parallel_fetch_lanes_run_stock_and_fund_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="research-parallel-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            job_id = "20260827T000000Z-paral001"
+            run_dir, state, config = self._make_two_type_job(
+                root, job_id, parallel=True
+            )
+            # 两个通道必须同时在 _run_fetch_script 内会合，否则 Barrier 超时。
+            barrier = threading.Barrier(2, timeout=10)
+
+            def fetch(script: object, **kwargs: Any) -> dict[str, Any]:
+                barrier.wait()
+                return {
+                    "asset_type": str(kwargs["asset_type"]),
+                    "status": "success",
+                    "time_budget_seconds": 60,
+                }
+
+            with (
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(worker, "_run_fetch_script", side_effect=fetch) as fetch_mock,
+                patch.object(worker, "_run_rolling_scan"),
+                patch.object(
+                    worker,
+                    "_run_research_process",
+                    return_value={"run_id": job_id, "status": "success"},
+                ),
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            [call.kwargs["asset_type"] for call in fetch_mock.call_args_list],
+            ["stock", "etf"],
+        )
+        self.assertEqual(
+            [item["asset_type"] for item in status["fetch_results"]],
+            ["stock", "etf"],
+        )
+        self.assertFalse(status["fetch_gate"]["child_failed"])
+
+    def test_parallel_fetch_disabled_keeps_lanes_serial(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="research-serial-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            job_id = "20260827T000000Z-serial01"
+            run_dir, state, config = self._make_two_type_job(
+                root, job_id, parallel=False
+            )
+            in_flight = {"value": False}
+
+            def fetch(script: object, **kwargs: Any) -> dict[str, Any]:
+                self.assertFalse(
+                    in_flight["value"],
+                    "关闭并行后不允许出现并发抓取",
+                )
+                in_flight["value"] = True
+                time.sleep(0.05)
+                in_flight["value"] = False
+                return {
+                    "asset_type": str(kwargs["asset_type"]),
+                    "status": "success",
+                }
+
+            with (
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(worker, "_run_fetch_script", side_effect=fetch),
+                patch.object(worker, "_run_rolling_scan"),
+                patch.object(
+                    worker,
+                    "_run_research_process",
+                    return_value={"run_id": job_id, "status": "success"},
+                ),
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            [item["asset_type"] for item in status["fetch_results"]],
+            ["stock", "etf"],
+        )
 
     def test_targeted_stock_refresh_reuses_provider_without_build(self) -> None:
         with tempfile.TemporaryDirectory(

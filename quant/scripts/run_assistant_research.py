@@ -28,6 +28,7 @@ from assistant.research import run_research  # noqa: E402
 CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 MODES = ("daily", "monthly", "on_demand")
 ASSET_SCOPES = ("all", "stock", "etf", "otc_fund")
+DEPTHS = ("quick", "standard", "full")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -36,6 +37,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mode", choices=MODES)
     parser.add_argument("--asset-scope", choices=ASSET_SCOPES)
+    parser.add_argument(
+        "--depth",
+        choices=DEPTHS,
+        default=None,
+        help=(
+            "Research depth: quick reads cached data only; standard refreshes "
+            "targeted symbols; full refreshes the whole selected universe. "
+            "Defaults to standard for daily/monthly and the configured "
+            "default_depth for on_demand."
+        ),
+    )
     parser.add_argument(
         "--queued-run-id",
         default=None,
@@ -64,7 +76,9 @@ def _validate_symbols(values: list[str] | None) -> list[str] | None:
     return values
 
 
-def _queued_request(run_id: str) -> tuple[str, str, dict[str, list[str]] | None]:
+def _queued_request(
+    run_id: str,
+) -> tuple[str, str, dict[str, list[str]] | None, str]:
     manifest = read_json(run_directory(run_id) / "manifest.json", {})
     if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
         raise ValueError("queued research manifest does not match run_id")
@@ -72,8 +86,11 @@ def _queued_request(run_id: str) -> tuple[str, str, dict[str, list[str]] | None]
     asset_scope = str(manifest.get("asset_scope", ""))
     if mode not in MODES or asset_scope not in ASSET_SCOPES:
         raise ValueError("queued research manifest has an invalid mode or asset scope")
+    depth = str(manifest.get("depth") or "standard")
+    if depth not in DEPTHS:
+        raise ValueError("queued research manifest has an invalid depth")
     if manifest.get("full_universe", True):
-        return mode, asset_scope, None
+        return mode, asset_scope, None, depth
     raw_routes = manifest.get("symbols", {})
     if not isinstance(raw_routes, dict):
         raise ValueError("queued targeted research manifest has invalid symbol routes")
@@ -84,7 +101,7 @@ def _queued_request(run_id: str) -> tuple[str, str, dict[str, list[str]] | None]
     }
     if not routes:
         raise ValueError("queued targeted research manifest has no symbols")
-    return mode, asset_scope, routes
+    return mode, asset_scope, routes, depth
 
 
 def _run_fixed_research(
@@ -93,6 +110,7 @@ def _run_fixed_research(
     asset_scope: str,
     symbols: list[str] | None = None,
     symbols_by_type: dict[str, list[str]] | None = None,
+    depth: str | None = None,
     force_sync: bool = False,
     run_id_override: str | None = None,
     run_dir_override: Path | None = None,
@@ -107,6 +125,7 @@ def _run_fixed_research(
                 mode=mode,
                 asset_scope=asset_scope,
                 symbols=symbols,
+                depth=depth,
                 _force_sync=force_sync,
                 _symbols_by_type=symbols_by_type,
                 _run_id_override=run_id_override,
@@ -130,16 +149,31 @@ def _json_default(value: Any) -> Any:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows 控制台默认 GBK；结果里的中文与子进程输出残留的 U+FFFD
+    # 可能无法编码。降级替换而不是让最后一行 print 崩掉。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
     args = _parser().parse_args(argv)
     try:
         if args.queued_run_id is not None:
-            if args.mode is not None or args.asset_scope is not None or args.symbols is not None:
+            if (
+                args.mode is not None
+                or args.asset_scope is not None
+                or args.symbols is not None
+                or args.depth is not None
+            ):
                 raise ValueError("queued-run-id cannot be combined with request arguments")
-            mode, asset_scope, symbols_by_type = _queued_request(args.queued_run_id)
+            mode, asset_scope, symbols_by_type, depth = _queued_request(args.queued_run_id)
             result = _run_fixed_research(
                 mode=mode,
                 asset_scope=asset_scope,
                 symbols_by_type=symbols_by_type,
+                depth=depth,
                 force_sync=True,
                 run_id_override=args.queued_run_id,
                 run_dir_override=run_directory(args.queued_run_id),
@@ -151,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.mode,
                 asset_scope=args.asset_scope,
                 symbols=_validate_symbols(args.symbols),
+                depth=args.depth,
             )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=_json_default))
         return 0 if result.get("status") in {"success", "queued", "partial"} else 1

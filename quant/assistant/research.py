@@ -59,6 +59,7 @@ ASSET_SCOPE_MAP = {
     "all": ASSET_TYPES,
 }
 MODE_NAMES = {"daily", "monthly", "on_demand"}
+DEPTH_NAMES = {"quick", "standard", "full"}
 SYMBOL_FILE_RE = re.compile(r"^(?:stock|etf|fund)_?([0-9]{6})$", re.IGNORECASE)
 UNIVERSE_PATH = DATA_DIR / "universe.json"
 
@@ -244,11 +245,47 @@ def _freshness_passed(
     return (stale_count / asset_count) <= tolerance
 
 
+def _quality_for_depth(
+    quality: Mapping[str, Any],
+    facts: list[dict[str, Any]],
+    config: Mapping[str, Any],
+    *,
+    depth: str,
+) -> dict[str, Any]:
+    """按研究深度调整质量判定；quick 只读缓存，允许陈旧但仍拦截质量失败。
+
+    quick 容忍陈旧是把 freshness 判定整体放行，因此这里直接把 stale 置为
+    False；stale_assets 保留仅供结果展示。质量失败的标的仍会压低 coverage。
+    """
+    if depth != "quick":
+        return dict(quality)
+    tolerated = dict(quality)
+    passing = [item for item in facts if item.get("quality_status") == "pass"]
+    minimum = float(config.get("fetch", {}).get("min_universe_coverage", 0.95))
+    coverage = len(passing) / len(facts) if facts else 0.0
+    tolerated.update(
+        {
+            "stale": False,
+            "passed": bool(passing) and coverage >= minimum,
+            "coverage_ratio": coverage,
+            "eligible_asset_count": len(passing),
+            "eligible_assets": [
+                f"{item.get('asset_type', 'unknown')}:{item.get('symbol', 'unknown')}"
+                for item in passing
+            ],
+            "all_sources_failed": not bool(facts) or not bool(passing),
+            "stale_allowed_by_depth": True,
+        }
+    )
+    return tolerated
+
+
 def run_research(
     mode: str = "daily",
     asset_scope: str = "all",
     symbols: list[str] | None = None,
     *,
+    depth: str | None = None,
     _force_sync: bool = False,
     _target_date: str | None = None,
     _start_background_worker: bool | None = None,
@@ -280,6 +317,21 @@ def run_research(
         })
     directed_research = bool(requested_symbols) or _symbols_by_type is not None
     config = load_config()
+    if depth is None:
+        # daily/monthly 是定时维护链路，缺省必须保持全量刷新语义。
+        depth = (
+            "standard"
+            if mode in {"daily", "monthly"}
+            else str(config["research"].get("default_depth", "standard"))
+        )
+    depth = str(depth).strip().lower()
+    if depth not in DEPTH_NAMES:
+        raise ValueError(f"depth must be one of: {', '.join(sorted(DEPTH_NAMES))}")
+    if depth == "full" and explicit_routes:
+        raise ValueError(
+            "depth=full refreshes the whole selected universe; "
+            "omit symbols or use depth=standard/quick"
+        )
     if (
         not _force_sync
         and config["fetch"]["enabled"]
@@ -295,6 +347,7 @@ def run_research(
             start_background_worker=(
                 True if _start_background_worker is None else _start_background_worker
             ),
+            depth=depth,
         )
     started = _now()
     if _run_id_override is None:
@@ -347,9 +400,49 @@ def run_research(
     result_paths: dict[str, str] = {}
     research_progress_path = run_dir / "research-progress.json"
     research_phase_seq = 0
+    stage_timings: dict[str, dict[str, Any]] = {}
+    current_stage: dict[str, Any] = {"name": None, "started": None}
+
+    def _record_stage(phase: str) -> None:
+        now = _now()
+        if current_stage["name"] is not None and current_stage["name"] != str(phase):
+            name = current_stage["name"]
+            entry = stage_timings.setdefault(
+                name,
+                {"started_at": current_stage["started"].isoformat()},
+            )
+            entry["finished_at"] = now.isoformat()
+            entry["elapsed_seconds"] = round(
+                float(entry.get("elapsed_seconds") or 0.0)
+                + (now - current_stage["started"]).total_seconds(),
+                3,
+            )
+        if current_stage["name"] != str(phase):
+            stage_timings.setdefault(str(phase), {"started_at": now.isoformat()})
+            current_stage["name"] = str(phase)
+            current_stage["started"] = now
+
+    def _close_stage() -> None:
+        if current_stage["name"] is None:
+            return
+        now = _now()
+        name = current_stage["name"]
+        entry = stage_timings.setdefault(
+            name,
+            {"started_at": current_stage["started"].isoformat()},
+        )
+        entry["finished_at"] = now.isoformat()
+        entry["elapsed_seconds"] = round(
+            float(entry.get("elapsed_seconds") or 0.0)
+            + (now - current_stage["started"]).total_seconds(),
+            3,
+        )
+        current_stage["name"] = None
+        current_stage["started"] = None
 
     def report_research_phase(phase: str, **details: Any) -> None:
         nonlocal research_phase_seq
+        _record_stage(phase)
         research_phase_seq += 1
         record = {
             "run_id": run_id,
@@ -363,6 +456,7 @@ def run_research(
                 record[key] = details[key]
         atomic_write_json(research_progress_path, record)
     def touch_phase(phase: str) -> None:
+        _record_stage(phase)
         if reuse_run_dir:
             report_research_phase(phase)
         else:
@@ -398,7 +492,10 @@ def run_research(
         if explicit_routes:
             log_lines.append(f"symbol_routes={symbol_routes}")
 
-        if mode in set(config["research"]["refresh_modes"]):
+        if depth == "quick":
+            refresh["skipped_by_depth"] = "quick"
+            log_lines.append("depth=quick：跳过数据刷新，只读缓存数据与既有 provider。")
+        elif mode in set(config["research"]["refresh_modes"]):
             refresh = _refresh_data(
                 analyzed_types,
                 config,
@@ -412,7 +509,12 @@ def run_research(
             frames, facts = _scan_assets(asset_type, scope_symbols)
             all_frames[asset_type] = frames
             all_facts.extend(facts)
-        data_quality = _aggregate_quality(all_facts, config)
+        data_quality = _quality_for_depth(
+            _aggregate_quality(all_facts, config),
+            all_facts,
+            config,
+            depth=depth,
+        )
         data_quality["refresh"] = refresh
         data_quality["passed"] = bool(data_quality["passed"] and refresh.get("passed", False))
         universe_manifest = load_universe_manifest(UNIVERSE_PATH)
@@ -467,6 +569,10 @@ def run_research(
                     }
                 )
         if not all_facts:
+            if depth == "quick":
+                raise ValueError(
+                    "depth=quick 未找到任何缓存数据；请先用 depth=standard 或 full 刷新后重试。"
+                )
             raise ValueError("no asset data found in fixed data directories")
 
         touch_phase("scanned")
@@ -505,7 +611,12 @@ def run_research(
         }
         if "stock" in analyzed_types:
             stock_facts = [item for item in all_facts if item["asset_type"] == "stock"]
-            stock_quality = _aggregate_quality(stock_facts, config)
+            stock_quality = _quality_for_depth(
+                _aggregate_quality(stock_facts, config),
+                stock_facts,
+                config,
+                depth=depth,
+            )
             stock_refresh_ok = all(
                 result.get("status") in {"success", "reused"}
                 for result in refresh.get("results", [])
@@ -550,7 +661,12 @@ def run_research(
 
         if "stock" in analyzed_types:
             stock_facts = [item for item in all_facts if item["asset_type"] == "stock"]
-            stock_quality = _aggregate_quality(stock_facts, config)
+            stock_quality = _quality_for_depth(
+                _aggregate_quality(stock_facts, config),
+                stock_facts,
+                config,
+                depth=depth,
+            )
             stock_metrics = dict(stock_model)
             stock_metrics["model_available"] = bool(stock_model.get("model_available"))
             checks = model_gate_checks(stock_metrics, config["gate"])
@@ -628,7 +744,12 @@ def run_research(
                 config["risk"],
             )
             asset_facts = [item for item in all_facts if item["asset_type"] == asset_type]
-            asset_quality = _aggregate_quality(asset_facts, config)
+            asset_quality = _quality_for_depth(
+                _aggregate_quality(asset_facts, config),
+                asset_facts,
+                config,
+                depth=depth,
+            )
             checks = {
                 "data_quality_passed": bool(asset_quality["passed"]),
                 "freshness_passed": _freshness_passed(
@@ -711,12 +832,14 @@ def run_research(
             decision_support["failure_reasons"] = failure_reasons
             log_lines.append(f"publication blocked: {failure_reasons}")
 
+        _close_stage()
         manifest = {
             "run_id": run_id,
             "status": run_status,
             "started_at": started.isoformat(),
             "finished_at": _now().isoformat(),
             "mode": mode,
+            "depth": depth,
             "asset_scope": asset_scope,
             "asset_types": asset_types,
             "analyzed_types": analyzed_types,
@@ -729,6 +852,7 @@ def run_research(
             "data_end_date": data_quality.get("data_end_date"),
             "retry_count": int(config["fetch"]["retries"]),
             "failure_reasons": failure_reasons,
+            "stage_timings": _jsonable(stage_timings),
             "config_snapshot": config_snapshot(config),
         }
         result_paths = _write_run_files(
@@ -750,6 +874,7 @@ def run_research(
         status = {
             "run_id": run_id,
             "status": run_status,
+            "depth": depth,
             "finished_at": manifest["finished_at"],
             "data_end_date": data_quality.get("data_end_date"),
             "result_path": str(run_dir),
@@ -802,14 +927,17 @@ def run_research(
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         log_lines.append(f"failed: {error}")
+        _close_stage()
         manifest = {
             "run_id": run_id,
             "status": "failed",
             "started_at": started.isoformat(),
             "finished_at": _now().isoformat(),
             "mode": mode,
+            "depth": depth,
             "asset_scope": asset_scope,
             "error": error,
+            "stage_timings": _jsonable(stage_timings),
             "config_snapshot": config_snapshot(config),
         }
         if run_dir.exists():

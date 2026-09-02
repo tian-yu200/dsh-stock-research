@@ -24,21 +24,72 @@ from .paths import (
 )
 from .queueing import _fetch_state, _target_dates_for_job
 
+def _fetch_progress_snapshot(
+    asset_types: tuple[str, ...],
+    symbols: dict[str, list[str]] | None,
+) -> dict[str, Any] | None:
+    """只读抓取状态库，给出一个切片相对交易日目标的时效。
+
+    与抓取队列共用同一套 target_lag_trading_days 判定，因此这里的
+    pending/stale 就是"现在刷新会做什么"的直接答案。任何失败都返回
+    None，绝不影响快照主流程。
+    """
+    try:
+        config = research.load_config()
+        state = _fetch_state(config)
+        target_date = research._now().date().isoformat()
+        target_dates = _target_dates_for_job(asset_types, target_date, config)
+        progress = state.progress(
+            asset_types,
+            symbols=symbols,
+            target_date=target_dates,
+            max_age_days=int(config["fetch"]["max_data_age_days"]),
+        )
+    except Exception:
+        return None
+    return {
+        "target_dates": target_dates,
+        "total": int(progress.get("total", 0) or 0),
+        "completed": int(progress.get("completed", 0) or 0),
+        "pending": int(progress.get("pending", 0) or 0),
+        "failed": int(progress.get("failed", 0) or 0),
+        "stale": int(progress.get("stale", 0) or 0),
+        "coverage": float(progress.get("coverage", 0.0) or 0.0),
+    }
+
+
 def get_current_snapshot(asset_type: str | None = None, symbol: str | None = None) -> dict[str, Any]:
     current = read_json(research.ASSISTANT_RESULTS_DIR / "current.json")
-    if current is None:
-        return {
-            "status": "no_successful_run",
-            "message": "尚无成功研究结果；请先运行 run_research。",
-            "current_path": str(research.ASSISTANT_RESULTS_DIR / "current.json"),
-        }
-    current = research._sanitize_result_record(current)
-    if asset_type is None and symbol is None:
-        return current
     normalized_type = str(asset_type).strip().lower() if asset_type else None
     if normalized_type is not None and normalized_type not in research.ASSET_TYPES:
         raise ValueError(f"asset_type must be one of: {', '.join(research.ASSET_TYPES)}")
     normalized_symbol = validate_symbol(symbol) if symbol else None
+    if normalized_type:
+        freshness_types = (normalized_type,)
+        freshness_symbols = (
+            {normalized_type: [normalized_symbol]} if normalized_symbol else None
+        )
+    else:
+        freshness_types = tuple(research.ASSET_TYPES)
+        freshness_symbols = None
+    freshness = _fetch_progress_snapshot(freshness_types, freshness_symbols)
+
+    def attach(payload: dict[str, Any]) -> dict[str, Any]:
+        if freshness is not None:
+            payload["freshness"] = freshness
+        return payload
+
+    if current is None:
+        return attach(
+            {
+                "status": "no_successful_run",
+                "message": "尚无成功研究结果；请先运行 run_research。",
+                "current_path": str(research.ASSISTANT_RESULTS_DIR / "current.json"),
+            }
+        )
+    current = research._sanitize_result_record(current)
+    if asset_type is None and symbol is None:
+        return attach(current)
     paths = current.get("paths", {})
     model_signals = (
         read_json(fixed_path(paths["model_signals"]))
@@ -54,32 +105,36 @@ def get_current_snapshot(asset_type: str | None = None, symbol: str | None = Non
                 continue
             selected.append({"asset_type": category, **signal})
     if not selected:
-        return {
-            "status": "not_found_or_stale",
-            "requested_asset_type": normalized_type,
-            "requested_symbol": normalized_symbol,
-            "run_id": current.get("run_id"),
-            "data_end_date": current.get("data_end_date"),
-            "signals": [],
-            "reason": "当前成功快照没有匹配该资产类型和代码的信号。",
-            "result_path": research._fixed_reference(current.get("result_path")),
-        }
+        return attach(
+            {
+                "status": "not_found_or_stale",
+                "requested_asset_type": normalized_type,
+                "requested_symbol": normalized_symbol,
+                "run_id": current.get("run_id"),
+                "data_end_date": current.get("data_end_date"),
+                "signals": [],
+                "reason": "当前成功快照没有匹配该资产类型和代码的信号。",
+                "result_path": research._fixed_reference(current.get("result_path")),
+            }
+        )
     decision = current.get("decision_support", {})
     asset_decision = (
         decision.get("asset_paths", {}).get(normalized_type)
         if normalized_type and isinstance(decision, Mapping)
         else decision
     )
-    return {
-        "status": current.get("status"),
-        "run_id": current.get("run_id"),
-        "data_end_date": current.get("data_end_date"),
-        "result_path": research._fixed_reference(current.get("result_path")),
-        "requested_asset_type": normalized_type,
-        "requested_symbol": normalized_symbol,
-        "decision_support": asset_decision or {},
-        "signals": selected,
-    }
+    return attach(
+        {
+            "status": current.get("status"),
+            "run_id": current.get("run_id"),
+            "data_end_date": current.get("data_end_date"),
+            "result_path": research._fixed_reference(current.get("result_path")),
+            "requested_asset_type": normalized_type,
+            "requested_symbol": normalized_symbol,
+            "decision_support": asset_decision or {},
+            "signals": selected,
+        }
+    )
 
 
 def _latest_run_id() -> str | None:
@@ -188,6 +243,10 @@ def get_run_status(run_id: str | None = None) -> dict[str, Any]:
         "run_id",
         "status",
         "phase",
+        "depth",
+        "queue_wait_seconds",
+        "stage_timings",
+        "research_phase",
         "total",
         "completed",
         "pending",

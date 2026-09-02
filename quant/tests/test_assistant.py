@@ -299,6 +299,78 @@ class AssistantStateMachineTests(unittest.TestCase):
         model.assert_not_called()
         self._assert_current_unchanged(sentinel)
 
+    def test_quick_depth_tolerates_stale_cache_and_skips_refresh(self) -> None:
+        self._write_market_data("stock", "600519", end="2000-01-03")
+        self.config["fetch"]["max_data_age_days"] = 0
+        sentinel = self._write_sentinel_current()
+        unavailable = {
+            "model_available": False,
+            "model_name": "Qlib Alpha158 + LightGBM",
+            "error": "test model unavailable",
+            "test_rank_ic": float("nan"),
+            "rank_ic_ir": float("nan"),
+            "leakage_check": {"passed": False, "reason": "test"},
+        }
+
+        def unexpected_refresh(*args: object, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("depth=quick must not refresh data")
+
+        with patch.object(
+            research,
+            "_run_id",
+            return_value="20260825T100000Z-00000004",
+        ), patch.object(
+            research,
+            "_refresh_data",
+            side_effect=unexpected_refresh,
+        ), patch.object(
+            research,
+            "_run_qlib_stock_model",
+            return_value=unavailable,
+        ) as model:
+            result = research.run_research(
+                "on_demand",
+                "stock",
+                ["600519"],
+                depth="quick",
+                _force_sync=True,
+            )
+
+        manifest = json.loads(
+            (pathlib.Path(result["result_path"]) / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # 陈旧缓存被 quick 容忍：模型照常评估，仅因模型门槛失败而拦截发布。
+        self.assertNotIn("data_quality_or_refresh_failed", result["failure_reasons"])
+        self.assertIn("stock_model_or_risk_gate_failed", result["failure_reasons"])
+        model.assert_called_once()
+        self.assertTrue(result["rule_gates"]["stock"]["checks"]["freshness_passed"])
+        self._assert_current_unchanged(sentinel)
+        self.assertEqual(manifest["depth"], "quick")
+        self.assertTrue(manifest["stage_timings"])
+        self.assertIn("scanned", manifest["stage_timings"])
+        self.assertIn("gates", manifest["stage_timings"])
+
+    def test_depth_validation_rejects_unknown_and_full_with_symbols(self) -> None:
+        self._write_market_data("stock", "600519")
+        with self.assertRaisesRegex(ValueError, "depth must be one of"):
+            research.run_research(
+                "on_demand",
+                "stock",
+                ["600519"],
+                depth="fastest",
+                _force_sync=True,
+            )
+        with self.assertRaisesRegex(ValueError, "depth=full"):
+            research.run_research(
+                "on_demand",
+                "stock",
+                ["600519"],
+                depth="full",
+                _force_sync=True,
+            )
+
     def test_refresh_failure_skips_model_and_preserves_current(self) -> None:
         self._write_market_data("stock", "600519")
         self.config["fetch"]["enabled"] = True
@@ -657,6 +729,124 @@ class AssistantStateMachineTests(unittest.TestCase):
             targeted_job["metadata"]["symbols"],
             {"stock": sorted(symbols)},
         )
+
+    def test_queue_depth_is_recorded_and_participates_in_dedup(self) -> None:
+        symbols = ["600999", "601696"]
+        common = {
+            "mode": "on_demand",
+            "asset_scope": "stock",
+            "asset_types": ("stock",),
+            "config": self.config,
+            "symbols_by_type": {"stock": symbols},
+            "target_date": "2026-08-25",
+            "start_background_worker": False,
+        }
+        with patch.object(research, "_universe", return_value=["600000", "600001"]):
+            standard = research._queue_research(**common, depth="standard")
+            repeated = research._queue_research(**common, depth="standard")
+            quick = research._queue_research(**common, depth="quick")
+
+        self.assertEqual(standard["run_id"], repeated["run_id"])
+        self.assertNotEqual(standard["run_id"], quick["run_id"])
+        jobs = research._fetch_state(self.config).list_jobs(limit=10)
+        by_id = {job["job_id"]: job for job in jobs}
+        self.assertEqual(by_id[standard["run_id"]]["metadata"]["depth"], "standard")
+        self.assertEqual(by_id[quick["run_id"]]["metadata"]["depth"], "quick")
+        manifest = json.loads(
+            (pathlib.Path(quick["result_path"]) / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(manifest["depth"], "quick")
+        self.assertIn("快速请求已入队", quick["message"])
+
+    def test_queue_rejects_unknown_depth(self) -> None:
+        with self.assertRaisesRegex(ValueError, "depth must be one of"):
+            research._queue_research(
+                mode="on_demand",
+                asset_scope="stock",
+                asset_types=("stock",),
+                config=self.config,
+                symbols_by_type={"stock": ["600999"]},
+                target_date="2026-08-25",
+                start_background_worker=False,
+                depth="instant",
+            )
+
+    def test_current_snapshot_includes_read_only_fetch_freshness(self) -> None:
+        self._write_market_data("stock", "600519")
+        state = research._fetch_state(self.config)
+        state.register_assets("stock", ["600519", "600518"])
+        state.mark_success(
+            "stock",
+            "600519",
+            data_end_date="2026-08-25",
+            source="test",
+            rows=300,
+            refresh_interval_seconds=86400,
+        )
+        self._write_sentinel_current()
+
+        snapshot = research.get_current_snapshot()
+        filtered = research.get_current_snapshot("stock", "600519")
+
+        for payload in (snapshot, filtered):
+            self.assertIn("freshness", payload)
+            fresh = payload["freshness"]
+            self.assertIn("stock", fresh["target_dates"])
+            self.assertGreaterEqual(fresh["total"], 1)
+            self.assertGreaterEqual(fresh["completed"], 1)
+        self.assertEqual(filtered["freshness"]["total"], 1)
+        self.assertEqual(filtered["freshness"]["target_dates"]["stock"], "2026-08-25")
+
+    def test_start_background_worker_gives_targeted_jobs_larger_budget(self) -> None:
+        state = research._fetch_state(self.config)
+        targeted_id = "20260825T100000Z-tgt00001"
+        full_id = "20260825T100000Z-ful00001"
+        state.create_job(
+            targeted_id,
+            kind="research",
+            asset_scope="stock",
+            metadata={
+                "asset_types": ["stock"],
+                "symbols": {"stock": ["600519"]},
+                "full_universe": False,
+            },
+        )
+        state.create_job(
+            full_id,
+            kind="research",
+            asset_scope="stock",
+            metadata={
+                "asset_types": ["stock"],
+                "symbols": {},
+                "full_universe": True,
+            },
+        )
+        launched: list[list[str]] = []
+
+        class FakeProcess:
+            pid = 424242
+
+        def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+            launched.append(list(command))
+            return FakeProcess()
+
+        with patch(
+            "assistant.queueing.subprocess.Popen", side_effect=fake_popen
+        ):
+            research._start_background_worker(targeted_id, self.config)
+            research._start_background_worker(full_id, self.config)
+
+        self.assertEqual(len(launched), 2)
+        targeted_cmd, full_cmd = launched
+        self.assertIn("--time-budget", targeted_cmd)
+        budget = float(targeted_cmd[targeted_cmd.index("--time-budget") + 1])
+        self.assertGreaterEqual(
+            budget,
+            self.config["fetch"]["targeted_time_budget_seconds"],
+        )
+        self.assertNotIn("--time-budget", full_cmd)
 
 
 class StaleRunSweepTests(unittest.TestCase):

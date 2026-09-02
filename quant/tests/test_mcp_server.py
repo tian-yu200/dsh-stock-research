@@ -192,6 +192,7 @@ class McpToolContractUnitTests(unittest.TestCase):
             mode="on_demand",
             asset_scope="etf",
             symbols=["510300"],
+            depth=None,
         )
 
     def test_dispatch_applies_documented_defaults(self) -> None:

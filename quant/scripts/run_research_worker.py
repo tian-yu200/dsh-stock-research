@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,6 +104,10 @@ def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
         "result_run_id",
         "result_path",
         "finished_at",
+        "depth",
+        "queued_at",
+        "queue_wait_seconds",
+        "stage_timings",
         "message",
         "error",
         "cache_hit",
@@ -130,6 +135,7 @@ def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
                 "pending",
                 "failed",
                 "stale",
+                "bypassed_by_depth",
             )
             if key in fetch_gate
         }
@@ -200,7 +206,10 @@ def _compact_status(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _print_status(value: dict[str, Any]) -> None:
-    print(json.dumps(_jsonable(_compact_status(value)), ensure_ascii=False, sort_keys=True))
+    # ensure_ascii=True：worker 的 stdout 可能是 GBK 编码的 DEVNULL/重定向
+    # 文件，而状态里带着抓取子进程输出中的 U+FFFD 等不可编码字符；
+    # ASCII 转义保证打印永不失败（AGENTS.md 编码安全规则）。
+    print(json.dumps(_jsonable(_compact_status(value)), ensure_ascii=True, sort_keys=True))
 
 
 def _write_status(job_id: str, value: dict[str, Any]) -> None:
@@ -212,9 +221,51 @@ def _write_status(job_id: str, value: dict[str, Any]) -> None:
 
 def _set_phase(status_value: dict[str, Any], phase: str) -> None:
     phase = str(phase)
-    if status_value.get("phase") != phase:
-        status_value["phase"] = phase
-        status_value["phase_seq"] = int(status_value.get("phase_seq", 0)) + 1
+    if status_value.get("phase") == phase:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    previous = str(status_value.get("phase") or "")
+    if previous:
+        _close_stage_entry(status_value, previous, now)
+    status_value["phase"] = phase
+    status_value["phase_started_at"] = now
+    status_value["phase_seq"] = int(status_value.get("phase_seq", 0)) + 1
+
+
+def _close_stage_entry(
+    status_value: dict[str, Any],
+    stage: str,
+    finished_at: str,
+) -> None:
+    """Accumulate one phase transition into the per-run stage timings."""
+    started_at = status_value.get("phase_started_at")
+    if not started_at:
+        # 该阶段已收口过（如异常分支在终态之后再次收口），防止重复累计。
+        return
+    timings = status_value.setdefault("stage_timings", {})
+    entry = timings.setdefault(stage, {"started_at": str(started_at)})
+    try:
+        elapsed = (
+            datetime.fromisoformat(finished_at) - datetime.fromisoformat(str(started_at))
+        ).total_seconds()
+    except ValueError:
+        elapsed = 0.0
+    entry["elapsed_seconds"] = round(
+        float(entry.get("elapsed_seconds") or 0.0) + max(0.0, elapsed),
+        3,
+    )
+    entry["finished_at"] = finished_at
+    status_value["phase_started_at"] = None
+
+
+def _close_current_stage(status_value: dict[str, Any]) -> None:
+    phase = str(status_value.get("phase") or "")
+    if phase:
+        _close_stage_entry(
+            status_value,
+            phase,
+            datetime.now(timezone.utc).isoformat(),
+        )
 
 
 def _merge_research_progress(
@@ -308,6 +359,127 @@ def _latest_queued(state: FetchState) -> dict[str, Any] | None:
     return None
 
 
+def _publish_fetch_results(
+    status_value: dict[str, Any],
+    asset_types: tuple[str, ...],
+    results_by_type: dict[str, dict[str, Any]],
+) -> None:
+    status_value["fetch_results"] = [
+        results_by_type[asset_type]
+        for asset_type in asset_types
+        if asset_type in results_by_type
+    ]
+
+
+def _run_fetch_wave(
+    asset_types: tuple[str, ...],
+    *,
+    scripts: Path,
+    config: dict[str, Any],
+    job_id: str,
+    symbols: dict[str, list[str]],
+    full_universe: bool,
+    target_dates: dict[str, str],
+    deadline: float,
+    shutdown_grace: float,
+    progress_by_type: dict[str, Any],
+    status_value: dict[str, Any],
+    heartbeat: Callable[[], None],
+    heartbeat_lock: threading.RLock,
+) -> list[dict[str, Any]]:
+    """推进一个波次内全部资产类型的抓取，结果按 asset_types 原顺序返回。
+
+    股票脚本与基金脚本访问不同数据源，两通道并行不会提高同一端点的请求
+    速率；etf 与 otc_fund 共用基金脚本和数据源，保持同通道串行。所有通道
+    共享同一个 worker deadline；单通道或配置关闭时退化为纯串行。
+    """
+    stock_lane = tuple(asset_type for asset_type in asset_types if asset_type == "stock")
+    fund_lane = tuple(asset_type for asset_type in asset_types if asset_type != "stock")
+    lanes = [lane for lane in (stock_lane, fund_lane) if lane]
+    parallel = (
+        bool(config["fetch"].get("parallel_asset_fetch", True))
+        and len(lanes) > 1
+    )
+    results_by_type: dict[str, dict[str, Any]] = {}
+
+    def run_lane(lane: tuple[str, ...], count_basis: tuple[str, ...]) -> None:
+        for index, asset_type in enumerate(lane):
+            asset_progress = progress_by_type.get(asset_type) or {}
+            if int(asset_progress.get("pending", 0)) == 0:
+                with heartbeat_lock:
+                    results_by_type[asset_type] = {
+                        "asset_type": asset_type,
+                        "status": "cache_hit",
+                        "requested": len(symbols.get(asset_type, [])),
+                    }
+                    _publish_fetch_results(status_value, asset_types, results_by_type)
+                    heartbeat()
+                continue
+            with heartbeat_lock:
+                _set_phase(status_value, "fetch")
+                remaining = deadline - time.monotonic()
+            if remaining <= shutdown_grace:
+                break
+            allocation = max(
+                1.0,
+                (remaining - shutdown_grace) / max(1, len(count_basis) - index),
+            )
+            script = (
+                scripts / "fetch_stock_data.py"
+                if asset_type == "stock"
+                else scripts / "fetch_fund_data.py"
+            )
+            result = _run_fetch_script(
+                script,
+                asset_type=asset_type,
+                config=config,
+                time_budget=allocation,
+                job_id=job_id,
+                target_date=target_dates[asset_type],
+                deadline=deadline,
+                symbols=None if full_universe else symbols.get(asset_type, []),
+                heartbeat=heartbeat,
+            )
+            with heartbeat_lock:
+                results_by_type[asset_type] = result
+                _publish_fetch_results(status_value, asset_types, results_by_type)
+                heartbeat()
+                _run_rolling_scan(job_id, config, status_value)
+                _write_status(job_id, status_value)
+            if result["status"] in {"failed", "timeout"}:
+                # 超时是有检查点的正常波次收尾；真正的 child failed
+                # 仍允许完成其余类别，但本轮绝不进入研究发布阶段。
+                status_value["last_error"] = f"{asset_type} fetch worker {result['status']}"
+                print(
+                    f"[wave] {asset_type} fetch worker {result['status']}; "
+                    "continuing with remaining asset types",
+                    flush=True,
+                )
+            if time.monotonic() >= deadline:
+                break
+
+    if parallel:
+        threads = [
+            threading.Thread(
+                target=run_lane,
+                args=(lane, lane),
+                name=f"fetch-{lane[0]}",
+            )
+            for lane in lanes
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    else:
+        run_lane(asset_types, asset_types)
+    return [
+        results_by_type[asset_type]
+        for asset_type in asset_types
+        if asset_type in results_by_type
+    ]
+
+
 def _terminate_process_tree(process: subprocess.Popen[str], grace_seconds: float) -> None:
     if process.poll() is not None:
         return
@@ -345,6 +517,15 @@ def _run_bounded_command(
     heartbeat: Callable[[], None] | None = None,
     env: dict[str, str] | None = None,
  ) -> dict[str, Any]:
+    # 子进程统一 UTF-8（AGENTS.md 编码安全规则）：抓取/构建/研究子进程的
+    # 输出会被本进程按 UTF-8 解码，若子进程沿用 GBK 会把中文打成 U+FFFD，
+    # 这些字符再进入状态文件与 JSON 打印链路就会引爆编码错误。
+    child_env = {
+        **os.environ,
+        **(env or {}),
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
     creation_flags = 0
     popen_options: dict[str, Any] = {}
     if os.name == "nt":
@@ -363,7 +544,7 @@ def _run_bounded_command(
             stderr=err_file,
             text=False,
             creationflags=creation_flags,
-            env=env,
+            env=child_env,
             **popen_options,
         )
         started = time.monotonic()
@@ -431,7 +612,12 @@ def _run_research_process(
         heartbeat=heartbeat,
     )
     if completed["timed_out"]:
-        raise TimeoutError("research process exceeded its deadline")
+        raise TimeoutError(
+            "research process exceeded its deadline; "
+            "if the model cache was cold (provider rebuilt), the one-time "
+            "full training needs a larger budget "
+            "(fetch.targeted_time_budget_seconds for targeted jobs)"
+        )
     result = _last_json_object(completed["stdout"])
     if completed["returncode"] not in {0, 1} or result is None:
         detail = completed["stderr"][-1000:] or completed["stdout"][-1000:]
@@ -630,13 +816,21 @@ def _hold_awake() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows 上 stdout 可能是 GBK 管道；遇到不可编码字符降级而不是崩溃。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
     _hold_awake()
     args = _parser().parse_args(argv)
     config = load_config()
     state = FetchState(Path(config["fetch"]["state_db"]))
     job = state.get_job(args.job_id) if args.job_id else _latest_queued(state)
     if not job:
-        print(json.dumps({"status": "no_jobs"}, ensure_ascii=False))
+        print(json.dumps({"status": "no_jobs"}, ensure_ascii=True))
         return 0
     job_id = str(job["job_id"])
     if not state.claim_job(
@@ -645,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         print(json.dumps(
             {"job_id": job_id, "status": "already_running_or_finished"},
-            ensure_ascii=False,
+            ensure_ascii=True,
             sort_keys=True,
         ))
         return 0
@@ -677,8 +871,19 @@ def main(argv: list[str] | None = None) -> int:
     full_universe = bool(
         metadata.get("full_universe", not any(symbols.values()))
     )
+    depth = str(metadata.get("depth") or "standard")
     run_dir = run_directory(job_id)
     started = datetime.now(timezone.utc)
+    queued_at = str(job.get("created_at") or "") or None
+    queue_wait_seconds = None
+    if queued_at:
+        try:
+            queue_wait_seconds = round(
+                max(0.0, (started - datetime.fromisoformat(queued_at)).total_seconds()),
+                3,
+            )
+        except ValueError:
+            queue_wait_seconds = None
     state.update_job(job_id, status="running", started_at=started.isoformat())
     status_value = {
         "run_id": job_id,
@@ -686,13 +891,18 @@ def main(argv: list[str] | None = None) -> int:
         "status": "running",
         "worker_pid": os.getpid(),
         "started_at": started.isoformat(),
+        "queued_at": queued_at,
+        "queue_wait_seconds": queue_wait_seconds,
         "asset_scope": asset_scope,
         "asset_types": list(asset_types),
         "full_universe": full_universe,
+        "depth": depth,
         "target_date": target,
         "target_dates": target_dates,
         "result_path": str(run_dir),
         "phase": "cache_check",
+        "phase_started_at": started.isoformat(),
+        "stage_timings": {},
         "phase_seq": 1,
         "fetch_results": [],
         "progress_seq": 0,
@@ -719,32 +929,36 @@ def main(argv: list[str] | None = None) -> int:
         previous_completed=int(initial_progress.get("completed", 0)),
     )
     _write_status(job_id, status_value)
+    heartbeat_lock = threading.RLock()
 
     def heartbeat() -> None:
-        nonlocal last_completed
-        progress = state.progress(
-            asset_types,
-            symbols=symbols,
-            target_date=target_dates,
-            max_age_days=int(config["fetch"]["max_data_age_days"]),
-        )
-        last_completed = _record_progress(
-            status_value,
-            progress,
-            previous_completed=last_completed,
-        )
-        state.update_job(
-            job_id,
-            total=progress["total"],
-            completed=progress["completed"],
-            pending=progress["pending"],
-            failed=progress["failed"],
-            stale=progress["stale"],
-            coverage=progress["coverage"],
-        )
-        _merge_research_progress(run_dir, status_value)
-        _merge_qlib_build_progress(run_dir, status_value)
-        _write_status(job_id, status_value)
+        # 抓取波次可能以两条线程并行调用；RLock 允许波次函数在持有锁的
+        # 情况下再嵌套调用 heartbeat。
+        with heartbeat_lock:
+            nonlocal last_completed
+            progress = state.progress(
+                asset_types,
+                symbols=symbols,
+                target_date=target_dates,
+                max_age_days=int(config["fetch"]["max_data_age_days"]),
+            )
+            last_completed = _record_progress(
+                status_value,
+                progress,
+                previous_completed=last_completed,
+            )
+            state.update_job(
+                job_id,
+                total=progress["total"],
+                completed=progress["completed"],
+                pending=progress["pending"],
+                failed=progress["failed"],
+                stale=progress["stale"],
+                coverage=progress["coverage"],
+            )
+            _merge_research_progress(run_dir, status_value)
+            _merge_qlib_build_progress(run_dir, status_value)
+            _write_status(job_id, status_value)
 
     try:
         scripts = QUANT_ROOT / "scripts"
@@ -752,63 +966,38 @@ def main(argv: list[str] | None = None) -> int:
             1.0,
             float(config["fetch"].get("shutdown_grace_seconds", 45)),
         )
-        for index, asset_type in enumerate(asset_types):
-            asset_progress = initial_progress.get("by_asset_type", {}).get(
-                asset_type, {}
-            )
-            if int(asset_progress.get("pending", 0)) == 0:
-                fetch_results.append(
-                    {
-                        "asset_type": asset_type,
-                        "status": "cache_hit",
-                        "requested": len(symbols.get(asset_type, [])),
-                    }
+        # 快速深度只读缓存：跳过全部抓取子进程，也不因 pending 回队。
+        fetch_scope_types = () if depth == "quick" else tuple(asset_types)
+        if fetch_scope_types:
+            fetch_results.extend(
+                _run_fetch_wave(
+                    fetch_scope_types,
+                    scripts=scripts,
+                    config=config,
+                    job_id=job_id,
+                    symbols=symbols,
+                    full_universe=full_universe,
+                    target_dates=target_dates,
+                    deadline=deadline,
+                    shutdown_grace=shutdown_grace,
+                    progress_by_type=initial_progress.get("by_asset_type", {}),
+                    status_value=status_value,
+                    heartbeat=heartbeat,
+                    heartbeat_lock=heartbeat_lock,
                 )
-                status_value["fetch_results"] = fetch_results
-                heartbeat()
-                continue
-            _set_phase(status_value, "fetch")
-            remaining = deadline - time.monotonic()
-            if remaining <= shutdown_grace:
-                break
-            remaining_types = max(1, len(asset_types) - index)
-            allocation = max(
-                1.0,
-                (remaining - shutdown_grace) / remaining_types,
             )
-            script = (
-                scripts / "fetch_stock_data.py"
-                if asset_type == "stock"
-                else scripts / "fetch_fund_data.py"
-            )
-            result = _run_fetch_script(
-                script,
-                asset_type=asset_type,
-                config=config,
-                time_budget=allocation,
-                job_id=job_id,
-                target_date=target_dates[asset_type],
-                deadline=deadline,
-                symbols=None if full_universe else symbols.get(asset_type, []),
-                heartbeat=heartbeat,
-            )
-            fetch_results.append(result)
             status_value["fetch_results"] = fetch_results
-            heartbeat()
-            _run_rolling_scan(job_id, config, status_value)
-            _write_status(job_id, status_value)
-            if result["status"] in {"failed", "timeout"}:
-                # 超时是有检查点的正常波次收尾；真正的 child failed
-                # 仍允许完成其余类别，但本轮绝不进入研究发布阶段。
-                status_value["last_error"] = f"{asset_type} fetch worker {result['status']}"
-                print(
-                    f"[wave] {asset_type} fetch worker {result['status']}; "
-                    "continuing with remaining asset types",
-                    flush=True,
-                )
-            if time.monotonic() >= deadline:
-                break
 
+        if depth == "quick":
+            fetch_results.extend(
+                {
+                    "asset_type": asset_type,
+                    "status": "skipped_by_depth",
+                    "requested": len(symbols.get(asset_type, [])),
+                }
+                for asset_type in asset_types
+            )
+            status_value["fetch_results"] = fetch_results
         progress = state.progress(
             asset_types,
             symbols=symbols,
@@ -829,7 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
                 "progress": progress,
             }
         )
-        _run_rolling_scan(job_id, config, status_value)
+        if depth != "quick":
+            _run_rolling_scan(job_id, config, status_value)
         last_completed = _record_progress(
             status_value,
             progress,
@@ -855,6 +1045,10 @@ def main(argv: list[str] | None = None) -> int:
             "failed": progress["failed"],
             "stale": progress["stale"],
         }
+        if depth == "quick":
+            fetch_gate_passed = True
+            status_value["fetch_gate"]["passed"] = True
+            status_value["fetch_gate"]["bypassed_by_depth"] = "quick"
         if child_failed:
             failed_types = [
                 str(result.get("asset_type") or "unknown")
@@ -866,6 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
                 + ", ".join(failed_types)
             )
             finished_at = datetime.now(timezone.utc).isoformat()
+            _close_current_stage(status_value)
             status_value.update(
                 {
                     "status": "failed",
@@ -890,6 +1085,7 @@ def main(argv: list[str] | None = None) -> int:
                 result.get("status") in {"failed", "timeout"}
                 for result in fetch_results
             )
+            _close_current_stage(status_value)
             status_value.update(
                 {
                     "status": "queued",
@@ -907,7 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
 
         stock_refresh_performed = any(
             result.get("asset_type") == "stock"
-            and result.get("status") != "cache_hit"
+            and result.get("status") not in {"cache_hit", "skipped_by_depth"}
             for result in fetch_results
         )
         if stock_refresh_performed and full_universe:
@@ -961,8 +1157,19 @@ def main(argv: list[str] | None = None) -> int:
         _reset_research_progress(run_dir, status_value)
         _set_phase(status_value, "research")
         heartbeat()
+        # 模型缓存冷启动（provider 重建后的首次完整训练）没有中间检查点，
+        # 不能被波次预算截断：抓取已经完成，研究阶段允许延长到
+        # targeted_time_budget_seconds 的底线，训练成功后缓存随即可用。
+        research_deadline = max(
+            deadline,
+            time.monotonic()
+            + max(
+                60.0,
+                float(config["fetch"].get("targeted_time_budget_seconds", 3600)),
+            ),
+        )
         research_timeout = _remaining_stage_timeout(
-            deadline=deadline,
+            deadline=research_deadline,
             configured_timeout=max(
                 60.0,
                 float(config["fetch"].get("timeout_seconds", 900)),
@@ -996,6 +1203,7 @@ def main(argv: list[str] | None = None) -> int:
             if research_succeeded
             else "failed"
         )
+        _close_current_stage(status_value)
         status_value["finished_at"] = datetime.now(timezone.utc).isoformat()
         state.update_job(
             job_id,
@@ -1044,6 +1252,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(exc, TimeoutError)
             else "failed"
         )
+        _close_current_stage(status_value)
         status_value.update(
             {
                 "status": final_status,

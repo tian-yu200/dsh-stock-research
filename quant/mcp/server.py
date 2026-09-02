@@ -39,6 +39,9 @@ TOOLS = [
             "When data refresh is enabled, both targeted and full-universe requests "
             "return a run_id promptly and continue in a bounded background worker. "
             "Targeted requests only check and refresh the supplied symbols. "
+            "depth: quick reads cached data only (seconds, data may be stale); "
+            "standard refreshes targeted symbols only (default); "
+            "full refreshes the whole selected universe (slowest, background). "
             "This never connects to a broker or places orders."
         ),
         inputSchema={
@@ -56,6 +59,14 @@ TOOLS = [
                     "maxItems": 100,
                     "uniqueItems": True,
                 },
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "standard", "full"],
+                    "description": (
+                        "quick: cache only; standard: refresh requested symbols; "
+                        "full: refresh whole universe (not combinable with symbols)"
+                    ),
+                },
             },
             "required": ["mode", "asset_scope"],
             "additionalProperties": False,
@@ -63,7 +74,12 @@ TOOLS = [
     ),
     types.Tool(
         name="get_current_snapshot",
-        description="Read the latest successfully published research snapshot.",
+        description=(
+            "Read the latest successfully published research snapshot. "
+            "Includes a read-only freshness block (per trading-day targets): "
+            "pending/stale counts show whether a refresh would still find work, "
+            "so choose depth=quick when fresh and standard/full when stale."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -181,6 +197,11 @@ def validate_tool_arguments(name: str, arguments: dict[str, Any] | None) -> dict
                 or len(set(symbols)) != len(symbols)
             ):
                 raise ValueError("symbols must be a unique list of at most 100 market symbols")
+        depth = arguments.get("depth")
+        if depth is not None and depth not in {"quick", "standard", "full"}:
+            raise ValueError("invalid depth")
+        if depth == "full" and symbols:
+            raise ValueError("depth=full cannot be combined with symbols")
     elif name == "get_current_snapshot":
         asset_type = arguments.get("asset_type")
         if asset_type is not None and asset_type not in {"stock", "etf", "otc_fund"}:
@@ -224,6 +245,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]
             mode=values["mode"],
             asset_scope=values["asset_scope"],
             symbols=values.get("symbols"),
+            depth=values.get("depth"),
         ),
         "get_current_snapshot": lambda: get_current_snapshot(
             asset_type=values.get("asset_type"),

@@ -40,6 +40,37 @@ DSH_CWD=D:\dsh-股票
 
 省略 `-Symbols` 会按 `quant\data\universe.json` 扫描完整股票、ETF 或场外基金代码池。入口只接受固定模式、固定资产范围和最多 100 个六位代码，不接受输出目录、Python 路径或命令参数。
 
+### 研究深度 depth
+
+所有入口（MCP `run_research`、CLI `--depth`、`run-research.ps1 -Depth`）共用三级深度：
+
+```text
+quick      只读缓存 CSV 与既有 Qlib provider/模型缓存，不刷新任何行情；
+           秒级返回，数据可能陈旧（结果中带 data_end_date 与 stale_allowed_by_depth 标记）。
+standard   缺省值：daily/monthly 定时任务与带 -Symbols 的定向请求刷新指定代码，
+           全市场请求按代码池推进。
+full       忽略定向代码，刷新整个所选资产代码池并重建 provider；不能与 symbols 组合。
+```
+
+`quant\configs\assistant.yaml` 的 `research.default_depth` 只影响 on_demand 请求的缺省深度；daily/monthly 定时任务始终按 standard（全量维护）执行。
+
+注意冷启动：provider 每次重建（全市场维护后）都会使模型缓存失效，**重建后的第一笔股票分析**（quick 或 standard）需要完整训练一次模型——实测 8 线程约 26 分钟（训练无检查点，属每周期一次性成本），完成后缓存随即可用，同周期后续请求为秒级（实测缓存命中约 8 秒）。定向任务一次 worker 预算由 `fetch.targeted_time_budget_seconds`（缺省 3600 秒）保证，研究阶段也不会被全市场波次预算（`fetch.batch_time_budget_seconds`，600 秒）截断。另外研究阶段有全局锁：上一笔研究未结束时提交的新请求会失败，请等完成通知后再发下一笔。
+
+`get_current_snapshot` 返回只读 `freshness` 块：按交易日目标计算所选切片的 completed/pending/stale/coverage，与抓取队列判定一致。数据够新时先答 `quick`，`pending>0` 时再用 `standard` 刷新指定代码，即可把"询问到出结果"压到最短。
+
+抓取波次支持并行通道（`fetch.parallel_asset_fetch`，缺省开启）：股票脚本与基金脚本访问不同数据源，两通道并行不提高同一端点请求速率；etf 与 otc_fund 共用基金通道内部串行。全市场任务的抓取墙钟时间约等于两条通道中较慢者，而非两者之和。
+
+每次运行的 `status.json` 记录 `depth`、排队等待 `queue_wait_seconds` 与各阶段耗时 `stage_timings`（cache_check/fetch/qlib_build/research 等）；研究 `manifest.json` 也带 `depth` 与 `stage_timings`，用于后续定位耗时。
+
+```powershell
+# 秒级看某只股票的既有结论
+& 'D:\dsh-股票\bin\run-research.ps1' -Mode on_demand -AssetScope stock -Depth quick -Symbols 600519
+# 刷新该股票后出结论（分钟级）
+& 'D:\dsh-股票\bin\run-research.ps1' -Mode on_demand -AssetScope stock -Depth standard -Symbols 600519
+# 全代码池维护（后台波次推进，最慢）
+& 'D:\dsh-股票\bin\run-research.ps1' -Mode on_demand -AssetScope stock -Depth full
+```
+
 ## 自动任务
 
 以当前 Windows 用户注册每周一至周五 18:30 的任务：

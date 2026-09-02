@@ -58,10 +58,12 @@ DEFAULTS: dict[str, Any] = {
             "otc_fund": 200,
         },
         "batch_time_budget_seconds": 600,
+        "targeted_time_budget_seconds": 3600,
         "shutdown_grace_seconds": 45,
         "max_workers": 3,
         "requests_per_second": 1.0,
         "request_timeout_seconds": 20,
+        "parallel_asset_fetch": True,
         "heartbeat_interval_seconds": 5,
         "worker_stalled_seconds": 60,
         "backoff_base_seconds": 2,
@@ -95,6 +97,7 @@ DEFAULTS: dict[str, Any] = {
         "hypothetical_capital": 100000.0,
         "refresh_modes": ["daily", "monthly", "on_demand"],
         "transaction_cost_bps": 10.0,
+        "default_depth": "standard",
     },
     "risk": {
         "max_single_weight": 0.20,
@@ -120,7 +123,12 @@ DEFAULTS: dict[str, Any] = {
         "subsample": 0.8,
         "lambda_l1": 0.1,
         "lambda_l2": 0.1,
-        "num_threads": 2,
+        # 机器为 10 核 16 线程（i7-12650H）；线程数只影响训练速度不改学习
+        # 行为，但它是模型缓存键的一部分，调整会触发一次重新训练。
+        "num_threads": 8,
+        # Alpha158（158 列、数百万行）下列式优先是 LightGBM 的自然选择，
+        # 显式固定可跳过每次训练前的方向探测。
+        "force_col_wise": True,
         "num_boost_round": 300,
         "early_stopping_rounds": 30,
     },

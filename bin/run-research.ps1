@@ -6,6 +6,9 @@ param(
     [ValidateSet('all', 'stock', 'etf', 'otc_fund')]
     [string]$AssetScope = 'all',
 
+    [ValidateSet('quick', 'standard', 'full')]
+    [string]$Depth,
+
     [string[]]$Symbols
 )
 
@@ -22,7 +25,13 @@ if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) {
 }
 
 $arguments = @($entry, '--mode', $Mode, '--asset-scope', $AssetScope)
+if ($Depth) {
+    $arguments += @('--depth', $Depth)
+}
 if ($null -ne $Symbols -and $Symbols.Count -gt 0) {
+    if ($Depth -eq 'full') {
+        throw 'depth=full 会刷新整个代码池，不能与 -Symbols 同时使用；请用 quick 或 standard。'
+    }
     $arguments += '--symbols'
     $arguments += $Symbols
 }

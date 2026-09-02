@@ -421,10 +421,11 @@ class ResearchSnapshotTests(unittest.TestCase):
         self.assertEqual(
             set(status),
             {"run_id", "status", "finished_at", "data_end_date", "result_path",
-             "failure_reasons"},
+             "failure_reasons", "depth"},
         )
         self.assertEqual(status["run_id"], RUN_ID)
         self.assertEqual(status["status"], "success")
+        self.assertEqual(status["depth"], "standard")
         self.assertEqual(status["finished_at"], FIXED_NOW_ISO)
         self.assertEqual(status["data_end_date"], DATA_END)
         self.assertEqual(status["failure_reasons"], [])
@@ -435,13 +436,16 @@ class ResearchSnapshotTests(unittest.TestCase):
         self.assertEqual(
             set(manifest),
             {
-                "run_id", "status", "started_at", "finished_at", "mode",
+                "run_id", "status", "started_at", "finished_at", "mode", "depth",
                 "asset_scope", "asset_types", "analyzed_types",
                 "requested_symbols", "data_sources", "data_end_date",
                 "retry_count", "failure_reasons", "config_snapshot", "paths",
+                "stage_timings",
             },
         )
         self.assertEqual(manifest["status"], "success")
+        self.assertEqual(manifest["depth"], "standard")
+        self.assertTrue(manifest["stage_timings"])
         self.assertEqual(manifest["started_at"], FIXED_NOW_ISO)
         self.assertEqual(manifest["finished_at"], FIXED_NOW_ISO)
         self.assertEqual(manifest["mode"], "on_demand")
@@ -720,7 +724,8 @@ class ResearchSnapshotTests(unittest.TestCase):
         run_status = research.get_run_status(RUN_ID)
         self.assertEqual(
             set(run_status),
-            {"run_id", "status", "finished_at", "data_end_date", "result_path"},
+            {"run_id", "status", "finished_at", "data_end_date", "result_path",
+             "depth"},
         )
         self.assertEqual(run_status["status"], "success")
         self.assertEqual(run_status["finished_at"], FIXED_NOW_ISO)

@@ -125,8 +125,14 @@ def _queue_research(
     symbols_by_type: Mapping[str, Iterable[str]] | None = None,
     target_date: str | None = None,
     start_background_worker: bool = True,
+    depth: str = "standard",
 ) -> dict[str, Any]:
     """Persist a research request without holding the MCP call open."""
+    depth = str(depth or "standard").strip().lower()
+    if depth not in research.DEPTH_NAMES:
+        raise ValueError(
+            f"depth must be one of: {', '.join(sorted(research.DEPTH_NAMES))}"
+        )
     state = _fetch_state(config)
     full_universe = symbols_by_type is None
     requested_routes = (
@@ -161,6 +167,7 @@ def _queue_research(
             metadata.get("asset_scope") != asset_scope
             or metadata.get("mode") != mode
             or bool(metadata.get("full_universe", True)) != full_universe
+            or str(metadata.get("depth", "standard")) != depth
         ):
             continue
         existing_target_date = metadata.get("target_date")
@@ -255,6 +262,7 @@ def _queue_research(
         asset_scope=asset_scope,
         metadata={
             "mode": mode,
+            "depth": depth,
             "asset_scope": asset_scope,
             "asset_types": list(selected_types),
             "symbols": routes,
@@ -281,6 +289,7 @@ def _queue_research(
         "asset_scope": asset_scope,
         "asset_types": list(selected_types),
         "full_universe": full_universe,
+        "depth": depth,
         "target_date": effective_target_date,
         "target_dates": target_dates,
         "phase": "cache_check",
@@ -293,9 +302,13 @@ def _queue_research(
         "last_heartbeat_at": started.isoformat(),
         "result_path": str(run_dir),
         "message": (
-            "全市场请求已入队；后台会按批次推进。"
-            if full_universe
-            else "定向请求已入队；后台只会检查和刷新指定代码。"
+            "快速请求已入队：只读缓存数据，不刷新行情。"
+            if depth == "quick"
+            else (
+                "全市场请求已入队；后台会按批次推进。"
+                if full_universe
+                else "定向请求已入队；后台只会检查和刷新指定代码。"
+            )
         ),
     }
     atomic_write_json(run_dir / "status.json", status)
@@ -307,6 +320,7 @@ def _queue_research(
             "status": "queued",
             "started_at": started.isoformat(),
             "mode": mode,
+            "depth": depth,
             "asset_scope": asset_scope,
             "asset_types": list(selected_types),
             "symbols": routes,
@@ -357,6 +371,21 @@ def _start_background_worker(
     script = Path(__file__).resolve().parents[1] / "scripts" / "run_research_worker.py"
     if not script.exists():
         return {"started": False, "reason": "worker_script_missing"}
+    command = [sys.executable, str(script), "--job-id", job_id]
+    # 全市场任务按波次预算分批推进并回队；定向任务是一次性请求，必须给
+    # 模型缓存冷启动（provider 重建后的首次完整训练）留足时间，否则研究
+    # 阶段会在波次预算处被杀，且每次重试都从零训练，永远无法发布缓存。
+    wave_budget = float(config["fetch"].get("batch_time_budget_seconds", 600))
+    targeted_budget = float(
+        config["fetch"].get("targeted_time_budget_seconds", 3600)
+    )
+    try:
+        job = _fetch_state(config).get_job(job_id)
+        metadata = job.get("metadata", {}) if isinstance(job, dict) else {}
+        if job and not bool(metadata.get("full_universe", True)):
+            command += ["--time-budget", str(max(wave_budget, targeted_budget))]
+    except Exception:
+        pass
     try:
         creation_flags = 0
         if os.name == "nt":
@@ -364,13 +393,19 @@ def _start_background_worker(
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 | getattr(subprocess, "DETACHED_PROCESS", 0)
             )
+        child_env = {
+            **os.environ,
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+        }
         process = subprocess.Popen(
-            [sys.executable, str(script), "--job-id", job_id],
+            command,
             cwd=str(script.parents[1]),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
+            env=child_env,
             close_fds=os.name != "nt",
         )
         return {"started": True, "pid": process.pid}
@@ -398,6 +433,8 @@ def _run_refresh_command(
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=int(config["fetch"]["timeout_seconds"]),
                 check=False,
             )
