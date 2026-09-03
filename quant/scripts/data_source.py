@@ -79,6 +79,21 @@ def fetch_a_stock_daily(symbol: str, start="20200101", end="20991231") -> pd.Dat
                 )
                 df.attrs["akshare_source"] = name
                 df.attrs["adjustment"] = "hfq"
+                try:
+                    from price_guards import validate_daily_bars as _pg_validate
+                    from price_guards import ths_crosscheck as _pg_crosscheck
+                    from price_guards import ths_patch_recent as _pg_patch
+                    _pg_c, _pg_b, _pg_r = _pg_validate(df, source=name, symbol=symbol)
+                    if len(_pg_b) > 0 and len(df) >= 20:
+                        _pg_chk = _pg_crosscheck(symbol, df)
+                        if _pg_chk.get("conflict"):
+                            df, _pg_rep = _pg_patch(symbol, df)
+                            print("  [" + symbol + "] 同花顺复核修复 " + str(_pg_rep.get("patched", 0)) + " 行 (" + str(_pg_chk.get("detail")) + ")")
+                            df.attrs["ths_repaired"] = _pg_rep.get("patched", 0)
+                        else:
+                            print("  [" + symbol + "] 本地验货报警 " + str(len(_pg_b)) + " 行，复核无分歧，保留待查")
+                except Exception as _pg_exc:
+                    print("  [" + symbol + "] 同花顺复核跳过: " + type(_pg_exc).__name__)
                 return df
             empty_sources.append(name)
             print(f"  [{symbol}] {name}源返回空行情")

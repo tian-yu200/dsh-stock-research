@@ -171,6 +171,16 @@ def merge_daily_frames(
     else:
         combined = incoming.copy()
     result = normalize_daily_bars(combined, source=source)
+    try:
+        from price_guards import validate_daily_bars as _pg_validate
+        from price_guards import write_quarantine as _pg_quarantine
+        _pg_clean, _pg_bad, _pg_reasons = _pg_validate(result, source=source, symbol=existing_path.stem)
+        if len(_pg_bad) > 0:
+            _pg_qpath = _pg_quarantine(existing_path.parent, existing_path.stem, _pg_bad, _pg_reasons)
+            print("  [" + existing_path.stem + "] 价格守卫隔离 " + str(len(_pg_bad)) + " 行 -> " + str(_pg_qpath))
+            result = _pg_clean
+    except Exception as _pg_exc:
+        print("  [" + existing_path.stem + "] 价格守卫跳过: " + type(_pg_exc).__name__)
     for key, value in incoming.attrs.items():
         result.attrs[key] = value
     return result

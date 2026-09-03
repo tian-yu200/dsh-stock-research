@@ -200,6 +200,25 @@ def _liquidity_check(frame: pd.DataFrame, asset_type: str) -> dict[str, Any]:
     }
 
 
+def _price_consistency_check(frame: pd.DataFrame, symbol: str = "") -> dict[str, Any]:
+    try:
+        from scripts.price_guards import validate_daily_bars
+    except ImportError:
+        scripts_root = Path(__file__).resolve().parents[1] / "scripts"
+        if str(scripts_root) not in sys.path:
+            sys.path.insert(0, str(scripts_root))
+        from price_guards import validate_daily_bars
+    try:
+        cutoff = str(frame["date"].iloc[max(0, len(frame) - 250)])
+        _, bad, reasons = validate_daily_bars(frame, source="data_layer", symbol=symbol)
+        recent = [r["date"] for r in reasons if r["date"] >= cutoff][-10:]
+        old = [r["date"] for r in reasons if r["date"] < cutoff]
+        gaps = [float(r.get("gap", 0) or 0) for r in reasons]
+        devs = [float(r.get("deviation", 0) or 0) for r in reasons]
+        passed = not recent
+        return {"status": "pass" if passed else "fail", "passed": passed, "bad_rows": len(recent), "bad_dates": recent, "warn_old_rows": len(old), "max_deviation": round(max(devs) if devs else 0.0, 4), "max_gap": round(max(gaps) if gaps else 0.0, 4)}
+    except Exception as exc:
+        return {"status": "skipped", "passed": True, "reason": type(exc).__name__}
 def _load_asset(asset_type: str, symbol: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     path = _data_file(asset_type, symbol)
     if not path.exists():
@@ -265,6 +284,9 @@ def _load_asset(asset_type: str, symbol: str) -> tuple[pd.DataFrame, dict[str, A
         or (frame["low"] > frame[["open", "close"]].min(axis=1)).any()
     ):
         issues.append("ohlc_inconsistent")
+    consistency = _price_consistency_check(frame, symbol)
+    if not consistency["passed"]:
+        issues.append("price_scale_suspect")
     adjustment_check = _adjustment_check(path, asset_type)
     if not adjustment_check["passed"]:
         issues.append("adjustment_provenance_mismatch")
@@ -287,6 +309,7 @@ def _load_asset(asset_type: str, symbol: str) -> tuple[pd.DataFrame, dict[str, A
             ),
         },
         "adjustment_or_nav": adjustment_check,
+        "price_consistency": consistency,
         "liquidity": liquidity,
     }
     quality = "pass" if not issues else "fail"

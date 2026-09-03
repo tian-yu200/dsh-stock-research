@@ -345,5 +345,102 @@ class ResearchPoolDiscoveryTests(unittest.TestCase):
             self.assertEqual(funds, OTC_POOL)
 
 
+
+class PriceGuardsTests(unittest.TestCase):
+    def _clean_frame(self, n=70, price=15.0):
+        from price_guards import validate_daily_bars
+        dates = pd.bdate_range("2026-01-05", periods=n)
+        closes = [price + 0.2 * ((i % 7) - 3) for i in range(n)]
+        vols = [6000000 + 100000 * (i % 5) for i in range(n)]
+        return pd.DataFrame({"date": [d.strftime("%Y-%m-%d") for d in dates], "open": closes, "high": [c + 0.2 for c in closes], "low": [c - 0.2 for c in closes], "close": closes, "volume": vols, "amount": [c * v for c, v in zip(closes, vols)], "turnover": [0.007] * n}), validate_daily_bars
+    def test_clean_history_has_zero_quarantine(self):
+        frame, validate = self._clean_frame()
+        clean, bad, reasons = validate(frame, source="unit", symbol="TEST01")
+        self.assertEqual(len(bad), 0)
+        self.assertEqual(len(clean), len(frame))
+    def test_scaled_segment_is_quarantined_with_chain(self):
+        frame, validate = self._clean_frame()
+        dirty = frame.copy()
+        for i in (68, 69):
+            dirty.at[i, "open"] = 39.29
+            dirty.at[i, "high"] = 40.14
+            dirty.at[i, "low"] = 38.96
+            dirty.at[i, "close"] = 39.10
+        clean, bad, reasons = validate(dirty, source="unit", symbol="TEST01")
+        self.assertEqual(len(bad), 2)
+        self.assertEqual([r["reasons"] for r in reasons], [["gap_up_scale_break"]] * 2)
+        self.assertEqual(len(clean), len(frame) - 2)
+    def test_ex_division_row_is_kept(self):
+        frame, validate = self._clean_frame()
+        adj = frame.copy()
+        i = 69
+        adj.at[i, "open"] = round(frame.at[i, "close"] / 2, 2)
+        adj.at[i, "close"] = round(frame.at[i, "close"] / 2, 2)
+        adj.at[i, "high"] = adj.at[i, "close"] + 0.1
+        adj.at[i, "low"] = adj.at[i, "close"] - 0.1
+        adj.at[i, "volume"] = frame.at[i, "volume"] * 2
+        clean, bad, reasons = validate(adj, source="unit", symbol="TEST01")
+        self.assertEqual(len(bad), 0)
+        self.assertEqual(len(clean), len(frame))
+    def test_quarantine_file_roundtrip(self):
+        from price_guards import validate_daily_bars, write_quarantine
+        frame, _ = self._clean_frame()
+        dirty = frame.copy()
+        dirty.at[69, "open"] = 39.29
+        dirty.at[69, "close"] = 39.10
+        dirty.at[69, "high"] = 40.14
+        dirty.at[69, "low"] = 38.96
+        _, bad, reasons = validate_daily_bars(dirty, source="unit", symbol="TEST01")
+        self.assertEqual(len(bad), 1)
+        with tempfile.TemporaryDirectory(prefix="quar-", dir=ROOT / "tests") as directory:
+            path = write_quarantine(pathlib.Path(directory), "TEST01", bad, reasons)
+            self.assertTrue(path is not None and path.exists())
+            back = pd.read_csv(path)
+            self.assertEqual(len(back), 1)
+    def test_merge_hook_drops_corrupt_rows(self):
+        from fetch_utils import merge_daily_frames
+        from price_guards import validate_daily_bars
+        frame, _ = self._clean_frame(n=40)
+        with tempfile.TemporaryDirectory(prefix="merge-", dir=ROOT / "tests") as directory:
+            target = pathlib.Path(directory) / "TEST01.csv"
+            frame.to_csv(target, index=False)
+            incoming = frame.tail(3).copy()
+            incoming.at[incoming.index[-1], "open"] = 39.29
+            incoming.at[incoming.index[-1], "close"] = 39.10
+            merged = merge_daily_frames(target, incoming, source="unit TEST01")
+            self.assertNotIn(39.10, list(merged["close"]))
+            qpath = pathlib.Path(directory) / "quarantine" / "TEST01.quarantine.csv"
+            self.assertTrue(qpath.exists())
+
+
+    def test_exdiv_down_gap_is_kept(self):
+        from price_guards import validate_daily_bars
+        frame = pd.DataFrame({"date": ["2026-01-05", "2026-01-06", "2026-01-07"], "open": [10.0, 10.1, 5.05], "high": [10.2, 10.3, 5.2], "low": [9.8, 9.9, 4.9], "close": [10.1, 10.0, 5.0], "volume": [1000000, 1100000, 2200000], "amount": [10100000.0, 11000000.0, 11000000.0], "turnover": [0.01, 0.011, 0.011]})
+        clean, bad, _ = validate_daily_bars(frame, source="unit", symbol="EXDIV")
+        self.assertEqual(len(bad), 0)
+        self.assertEqual(len(clean), 3)
+    def test_halt_resume_gap_is_kept(self):
+        from price_guards import validate_daily_bars
+        frame = pd.DataFrame({"date": ["2026-01-05", "2026-04-10"], "open": [10.0, 15.0], "high": [10.2, 16.0], "low": [9.8, 14.0], "close": [10.1, 15.5], "volume": [1000000, 900000], "amount": [10100000.0, 13950000.0], "turnover": [0.01, 0.009]})
+        clean, bad, _ = validate_daily_bars(frame, source="unit", symbol="HALT")
+        self.assertEqual(len(bad), 0)
+        self.assertEqual(len(clean), 2)
+
+
+    def test_bj_limit_move_is_kept(self):
+        from price_guards import validate_daily_bars
+        frame = pd.DataFrame({"date": ["2026-01-12", "2026-01-13"], "open": [7.0, 9.12], "high": [7.2, 9.2], "low": [6.9, 8.8], "close": [7.05, 9.17], "volume": [73000000, 73000000], "amount": [511000000.0, 669000000.0], "turnover": [0.29, 0.29]})
+        clean, bad, _ = validate_daily_bars(frame, source="unit", symbol="920001")
+        self.assertEqual(len(bad), 0)
+        self.assertEqual(len(clean), 2)
+
+
+    def test_ipo_first_rows_are_kept(self):
+        from price_guards import validate_daily_bars
+        frame = pd.DataFrame({"date": ["2026-05-15", "2026-05-18", "2026-05-19"], "open": [120.0, 100.0, 92.0], "high": [150.0, 107.0, 100.28], "low": [120.0, 91.0, 90.21], "close": [120.67, 95.26, 93.6], "volume": [36246293, 24325958, 17715750], "amount": [4712710709.0, 2380860100.0, 1710343900.0], "turnover": [0.75, 0.5, 0.36]})
+        clean, bad, _ = validate_daily_bars(frame, source="unit", symbol="001393")
+        self.assertEqual(len(bad), 0)
+        self.assertEqual(len(clean), 3)
+
 if __name__ == "__main__":
     unittest.main()
