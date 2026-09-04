@@ -82,6 +82,221 @@ class FetchStateTests(unittest.TestCase):
 
         self.assertEqual(pending, ["000002", "000003"])
 
+    def test_cache_reconciliation_clears_failure_after_csv_advances(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fetch-reconcile-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets(
+                "stock",
+                ["000001"],
+                data_end_dates={"000001": "2026-08-26"},
+            )
+            claimed = state.claim_due(
+                "stock",
+                symbols=["000001"],
+                target_date="2026-08-27",
+                owner="worker-a",
+            )
+            self.assertEqual(len(claimed), 1)
+            state.mark_failure(
+                "stock",
+                "000001",
+                error="AttributeError: 'str' object has no attribute 'date'",
+                failure_class="upstream_error",
+                backoff_base_seconds=120,
+                backoff_max_seconds=120,
+                owner="worker-a",
+            )
+
+            reconciled = state.reconcile_cached_assets(
+                "stock",
+                {"000001": "2026-08-27"},
+            )
+
+            self.assertEqual(reconciled, 1)
+            self.assertEqual(
+                state.claim_due(
+                    "stock",
+                    symbols=["000001"],
+                    target_date="2026-08-27",
+                    owner="worker-b",
+                ),
+                [],
+            )
+            progress = state.progress(
+                ["stock"],
+                symbols={"stock": ["000001"]},
+                target_date="2026-08-27",
+            )
+            self.assertEqual(progress["completed"], 1)
+            connection = sqlite3.connect(state.path)
+            try:
+                row = connection.execute(
+                    """
+                    SELECT data_end_date, last_success_date, status, last_error,
+                           failure_class, next_retry_at
+                    FROM assets WHERE asset_type = 'stock' AND symbol = '000001'
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(
+                row,
+                ("2026-08-27", "2026-08-27", "success", None, None, None),
+            )
+
+    def test_cache_reconciliation_keeps_newer_failure_state(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fetch-reconcile-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets(
+                "stock",
+                ["000001"],
+                data_end_dates={"000001": "2026-08-26"},
+            )
+            claimed = state.claim_due(
+                "stock",
+                symbols=["000001"],
+                target_date="2026-08-27",
+                owner="worker-a",
+            )
+            self.assertEqual(len(claimed), 1)
+            state.mark_failure(
+                "stock",
+                "000001",
+                error="temporary upstream failure",
+                failure_class="upstream_error",
+                backoff_base_seconds=120,
+                backoff_max_seconds=120,
+                owner="worker-a",
+            )
+
+            reconciled = state.reconcile_cached_assets(
+                "stock",
+                {"000001": "2026-08-26"},
+            )
+
+            self.assertEqual(reconciled, 0)
+            connection = sqlite3.connect(state.path)
+            try:
+                row = connection.execute(
+                    """
+                    SELECT data_end_date, last_success_date, status, last_error
+                    FROM assets WHERE asset_type = 'stock' AND symbol = '000001'
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(
+                row,
+                (
+                    "2026-08-26",
+                    "2026-08-26",
+                    "failed",
+                    "temporary upstream failure",
+                ),
+            )
+
+    def test_lifecycle_snapshot_stops_claims_and_revives_active_symbols(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fetch-lifecycle-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("stock", ["000001", "000002"])
+            connection = sqlite3.connect(state.path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE assets
+                    SET status = 'failed', failure_class = 'empty_window', attempt_count = 2
+                    WHERE asset_type = 'stock' AND symbol = '000001'
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            applied = state.apply_lifecycle_snapshot(
+                "stock",
+                {
+                    "complete": True,
+                    "candidates": ["000001", "000002"],
+                    "active": ["000002"],
+                    "inactive_candidates": ["000001"],
+                    "sources": {"exchange": 1, "eastmoney": 1, "sina": 1},
+                },
+            )
+
+            self.assertEqual(applied, {"inactivated": 1, "revived": 0})
+            self.assertEqual(
+                state.claim_due(
+                    "stock",
+                    symbols=["000001"],
+                    target_date="2026-08-27",
+                    owner="worker-a",
+                ),
+                [],
+            )
+            progress = state.progress(
+                ["stock"],
+                symbols={"stock": ["000001"]},
+                target_date="2026-08-27",
+            )
+            self.assertEqual(progress["completed"], 1)
+            self.assertEqual(progress["pending"], 0)
+
+            revived = state.apply_lifecycle_snapshot(
+                "stock",
+                {
+                    "complete": True,
+                    "candidates": ["000001"],
+                    "active": ["000001"],
+                    "inactive_candidates": [],
+                    "sources": {"exchange": 1, "eastmoney": 1, "sina": 1},
+                },
+            )
+
+            self.assertEqual(revived, {"inactivated": 0, "revived": 1})
+            claimed = state.claim_due(
+                "stock",
+                symbols=["000001"],
+                target_date="2026-08-27",
+                owner="worker-b",
+            )
+            self.assertEqual([row["symbol"] for row in claimed], ["000001"])
+
+    def test_incomplete_lifecycle_snapshot_cannot_inactivate_symbols(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fetch-lifecycle-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("stock", ["000001"])
+            connection = sqlite3.connect(state.path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE assets
+                    SET status = 'failed', failure_class = 'empty_window', attempt_count = 2
+                    WHERE asset_type = 'stock' AND symbol = '000001'
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            applied = state.apply_lifecycle_snapshot(
+                "stock",
+                {
+                    "complete": False,
+                    "candidates": ["000001"],
+                    "active": [],
+                    "inactive_candidates": ["000001"],
+                },
+            )
+
+            self.assertEqual(applied, {"inactivated": 0, "revived": 0})
+            claimed = state.claim_due(
+                "stock",
+                symbols=["000001"],
+                target_date="2026-08-27",
+                owner="worker-a",
+            )
+            self.assertEqual([row["symbol"] for row in claimed], ["000001"])
+
     def test_claim_success_and_retry_backoff_are_persistent(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fetch-state-", dir=ROOT / "tests") as directory:
             state = FetchState(pathlib.Path(directory) / "state.sqlite3")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import pathlib
 import sys
 import tempfile
@@ -34,6 +35,24 @@ class _FetchStateSpy:
 
     def mark_quarantined(self, kind: str, symbol: str, **kwargs) -> None:
         self.quarantines.append((symbol, kwargs))
+
+
+class _LifecycleStateSpy:
+    def __init__(self, candidates: list[str]) -> None:
+        self.candidates = candidates
+        self.applied: list[dict] = []
+
+    def lifecycle_candidates(self, asset_type: str, symbols: list[str]) -> list[str]:
+        return self.candidates
+
+    def apply_lifecycle_snapshot(self, asset_type: str, snapshot: dict) -> dict[str, int]:
+        self.applied.append(snapshot)
+        inactivated = (
+            len(snapshot.get("inactive_candidates", []))
+            if snapshot.get("complete") is True
+            else 0
+        )
+        return {"inactivated": inactivated, "revived": 0}
 
 
 def _bars(date: str) -> pd.DataFrame:
@@ -175,6 +194,47 @@ class StockWorkerTests(unittest.TestCase):
             state.quarantines[0][1]["field_anomalies"],
             {"volume": {"conflicting_rows": 1}},
         )
+
+    def test_cached_lifecycle_snapshot_defers_candidates_it_did_not_check(self) -> None:
+        state = _LifecycleStateSpy(["000001", "000002"])
+        snapshot = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "complete": True,
+            "candidates": ["000001", "000003"],
+            "active": [],
+            "unresolved_candidates": [],
+            "inactive_candidates": ["000001", "000003"],
+            "sources": {"exchange": 5000, "eastmoney": 5000, "sina": 5000},
+            "errors": {},
+        }
+
+        with patch.object(worker, "discover_stock_lifecycle") as discover:
+            result = worker._reconcile_stock_lifecycle(
+                state,
+                ["000001", "000002"],
+                {"stock_lifecycle": snapshot},
+            )
+
+        discover.assert_not_called()
+        self.assertEqual(len(state.applied), 1)
+        self.assertEqual(result["candidate_count"], 2)
+        self.assertEqual(result["checked_count"], 1)
+        self.assertEqual(result["deferred_count"], 1)
+        self.assertTrue(result["cached"])
+        self.assertEqual(state.applied[0]["candidates"], ["000001"])
+        self.assertEqual(state.applied[0]["inactive_candidates"], ["000001"])
+
+    def test_lifecycle_reconciliation_skips_catalogs_without_candidates(self) -> None:
+        state = _LifecycleStateSpy([])
+
+        with patch.object(worker, "discover_stock_lifecycle") as discover:
+            result = worker._reconcile_stock_lifecycle(state, ["000001"], {})
+
+        discover.assert_not_called()
+        self.assertEqual(state.applied, [])
+        self.assertEqual(result["candidate_count"], 0)
+        self.assertEqual(result["checked_count"], 0)
+        self.assertEqual(result["deferred_count"], 0)
 
 
 if __name__ == "__main__":

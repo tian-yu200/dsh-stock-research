@@ -187,6 +187,154 @@ class FetchState:
         complete = {str(row["symbol"]) for row in rows}
         return [symbol for symbol in values if symbol not in complete]
 
+    def reconcile_cached_assets(
+        self,
+        asset_type: str,
+        data_end_dates: Mapping[str, str | None],
+    ) -> int:
+        """Accept CSV progress that is newer than the durable queue state."""
+        values = {
+            str(symbol).strip().upper(): str(end_date)
+            for symbol, end_date in data_end_dates.items()
+            if str(symbol).strip() and end_date
+        }
+        if not values:
+            return 0
+        updated = 0
+        now = iso_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for symbol, cached_end in values.items():
+                cursor = connection.execute(
+                    """
+                    UPDATE assets
+                    SET data_end_date = ?,
+                        last_success_date = ?,
+                        next_retry_at = NULL,
+                        status = 'success',
+                        last_error = NULL,
+                        failure_class = NULL,
+                        failure_details_json = NULL,
+                        lease_owner = NULL,
+                        lease_until = NULL,
+                        updated_at = ?
+                    WHERE asset_type = ? AND symbol = ?
+                      AND status != 'running'
+                      AND ? > MAX(
+                          COALESCE(data_end_date, ''),
+                          COALESCE(last_success_date, '')
+                      )
+                    """,
+                    (cached_end, cached_end, now, asset_type, symbol, cached_end),
+                )
+                updated += max(0, int(cursor.rowcount))
+            connection.commit()
+        return updated
+
+    def lifecycle_candidates(
+        self,
+        asset_type: str,
+        symbols: Iterable[str],
+        *,
+        failure_class: str = "empty_window",
+        min_attempts: int = 2,
+    ) -> list[str]:
+        """Return repeatedly empty assets eligible for catalog confirmation."""
+        selected = set(self._symbols(symbols))
+        if not selected:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT symbol
+                FROM assets
+                WHERE asset_type = ?
+                  AND (
+                      status = 'inactive'
+                      OR (
+                          status = 'failed'
+                          AND failure_class = ?
+                          AND attempt_count >= ?
+                      )
+                  )
+                ORDER BY symbol
+                """,
+                (asset_type, failure_class, max(1, int(min_attempts))),
+            ).fetchall()
+        return [str(row["symbol"]) for row in rows if row["symbol"] in selected]
+
+    def apply_lifecycle_snapshot(
+        self,
+        asset_type: str,
+        snapshot: Mapping[str, Any],
+    ) -> dict[str, int]:
+        """Apply confirmed inactivity and revive symbols seen as active."""
+        active_value = snapshot.get("active", [])
+        inactive_value = snapshot.get("inactive_candidates", [])
+        active = self._symbols(
+            active_value if isinstance(active_value, (list, tuple, set)) else []
+        )
+        active_set = set(active)
+        inactive = [
+            symbol
+            for symbol in self._symbols(
+                inactive_value
+                if isinstance(inactive_value, (list, tuple, set))
+                else []
+            )
+            if symbol not in active_set
+        ]
+        evidence = {
+            "generated_at": snapshot.get("generated_at"),
+            "sources": snapshot.get("sources", {}),
+        }
+        details = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        result = {"inactivated": 0, "revived": 0}
+        now = iso_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for symbol in active:
+                cursor = connection.execute(
+                    """
+                    UPDATE assets
+                    SET status = 'pending',
+                        next_retry_at = NULL,
+                        last_error = NULL,
+                        failure_class = NULL,
+                        failure_details_json = NULL,
+                        lease_owner = NULL,
+                        lease_until = NULL,
+                        updated_at = ?
+                    WHERE asset_type = ? AND symbol = ?
+                      AND status = 'inactive'
+                    """,
+                    (now, asset_type, symbol),
+                )
+                result["revived"] += max(0, int(cursor.rowcount))
+            if snapshot.get("complete") is True:
+                for symbol in inactive:
+                    cursor = connection.execute(
+                        """
+                        UPDATE assets
+                        SET status = 'inactive',
+                            next_retry_at = NULL,
+                            last_error = 'absent from exchange, Eastmoney, and Sina catalogs',
+                            failure_class = 'inactive_catalog',
+                            failure_details_json = ?,
+                            lease_owner = NULL,
+                            lease_until = NULL,
+                            updated_at = ?
+                        WHERE asset_type = ? AND symbol = ?
+                          AND status = 'failed'
+                          AND failure_class = 'empty_window'
+                          AND attempt_count >= 2
+                        """,
+                        (details, now, asset_type, symbol),
+                    )
+                    result["inactivated"] += max(0, int(cursor.rowcount))
+            connection.commit()
+        return result
+
     def claim_due(
         self,
         asset_type: str,
@@ -209,7 +357,7 @@ class FetchState:
         # A newer target date may bypass a prior success refresh once.
         clauses = [
             "asset_type = ?",
-            "status != 'quarantined'",
+            "status NOT IN ('quarantined', 'inactive')",
             "(lease_until IS NULL OR lease_until < ?)",
             """(
                 (next_retry_at IS NULL OR next_retry_at <= ?)
@@ -573,6 +721,7 @@ class FetchState:
                     ).fetchall()
                 )
         completed = 0
+        inactive = 0
         failed = 0
         stale = 0
         pending = 0
@@ -587,7 +736,9 @@ class FetchState:
                 (value for value in (data_end_date, last_success_date) if value),
                 default=None,
             )
-            complete = bool(end_date and end_date >= asset_target_date)
+            inactive_flag = row["status"] == "inactive"
+            complete = inactive_flag or bool(end_date and end_date >= asset_target_date)
+            inactive += int(inactive_flag)
             if complete:
                 completed += 1
             else:
@@ -595,7 +746,7 @@ class FetchState:
             if row["status"] in {"failed", "quarantined"}:
                 failed += 1
             stale_flag = False
-            if max_age_days is not None:
+            if max_age_days is not None and not inactive_flag:
                 if not end_date:
                     stale_flag = True
                 else:
@@ -611,6 +762,7 @@ class FetchState:
                 {
                     "total": 0,
                     "completed": 0,
+                    "inactive": 0,
                     "pending": 0,
                     "failed": 0,
                     "stale": 0,
@@ -619,6 +771,7 @@ class FetchState:
             )
             group["total"] += 1
             group["completed"] += int(complete)
+            group["inactive"] += int(inactive_flag)
             group["pending"] += int(not complete)
             group["failed"] += int(row["status"] in {"failed", "quarantined"})
             if max_age_days is not None:
@@ -627,6 +780,7 @@ class FetchState:
         return {
             "total": total,
             "completed": completed,
+            "inactive": inactive,
             "pending": pending,
             "failed": failed,
             "stale": stale,

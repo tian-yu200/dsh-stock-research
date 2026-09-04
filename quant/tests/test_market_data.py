@@ -23,6 +23,7 @@ from market_data import (
 from universe import (
     discover_etf_universe,
     discover_otc_fund_universe,
+    discover_stock_lifecycle,
     discover_stock_universe,
     discover_universe,
     infer_exchange,
@@ -270,6 +271,66 @@ class ResearchPoolDiscoveryTests(unittest.TestCase):
     def test_stock_pool_accepts_new_shenzhen_prefix(self) -> None:
         self.assertTrue(is_allowed("302132"))
         self.assertFalse(is_allowed("30213"))
+
+    def test_stock_lifecycle_requires_all_catalogs_before_marking_inactive(self) -> None:
+        class FakeAk:
+            @staticmethod
+            def stock_info_sh_name_code(**_kwargs) -> pd.DataFrame:
+                return pd.DataFrame({"证券代码": ["600519"], "证券简称": ["A"]})
+
+            @staticmethod
+            def stock_info_sz_name_code(**_kwargs) -> pd.DataFrame:
+                return pd.DataFrame({"A股代码": ["000001"], "A股简称": ["B"]})
+
+            @staticmethod
+            def stock_info_bj_name_code() -> pd.DataFrame:
+                return pd.DataFrame({"证券代码": ["830001"], "证券简称": ["C"]})
+
+            @staticmethod
+            def stock_zh_a_spot_em() -> pd.DataFrame:
+                return pd.DataFrame({"代码": ["000002"], "名称": ["D"]})
+
+            @staticmethod
+            def stock_zh_a_spot() -> pd.DataFrame:
+                return pd.DataFrame({"代码": ["600519"], "名称": ["A"]})
+
+        snapshot = discover_stock_lifecycle(
+            ["000001", "000002", "000999"],
+            FakeAk,
+        )
+
+        self.assertTrue(snapshot["complete"])
+        self.assertEqual(snapshot["active"], ["000001"])
+        self.assertEqual(snapshot["unresolved_candidates"], ["000002"])
+        self.assertEqual(snapshot["inactive_candidates"], ["000999"])
+
+    def test_stock_lifecycle_never_marks_inactive_when_a_catalog_fails(self) -> None:
+        class IncompleteAk:
+            @staticmethod
+            def stock_info_sh_name_code(**_kwargs) -> pd.DataFrame:
+                return pd.DataFrame({"证券代码": ["600519"]})
+
+            @staticmethod
+            def stock_info_sz_name_code(**_kwargs) -> pd.DataFrame:
+                raise RuntimeError("exchange unavailable")
+
+            @staticmethod
+            def stock_info_bj_name_code() -> pd.DataFrame:
+                return pd.DataFrame({"证券代码": ["830001"]})
+
+            @staticmethod
+            def stock_zh_a_spot_em() -> pd.DataFrame:
+                return pd.DataFrame({"代码": ["000002"]})
+
+            @staticmethod
+            def stock_zh_a_spot() -> pd.DataFrame:
+                return pd.DataFrame({"代码": ["600519"]})
+
+        snapshot = discover_stock_lifecycle(["000999"], IncompleteAk)
+
+        self.assertFalse(snapshot["complete"])
+        self.assertEqual(snapshot["inactive_candidates"], [])
+        self.assertEqual(snapshot["unresolved_candidates"], ["000999"])
 
     def test_stock_pool_discovers_valid_existing_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="stocks-", dir=ROOT / "tests") as directory:

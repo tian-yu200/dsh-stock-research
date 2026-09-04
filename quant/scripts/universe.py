@@ -132,6 +132,72 @@ def discover_stock_universe(client: Any | None = None) -> list[dict[str, str]]:
     )
 
 
+def discover_stock_lifecycle(
+    candidates: Iterable[str],
+    client: Any | None = None,
+) -> dict[str, Any]:
+    """Cross-check possible inactive stocks against independent catalogs."""
+    client = _require_akshare(client)
+    candidate_symbols = sorted(
+        {symbol for value in candidates if (symbol := normalize_symbol(value))}
+    )
+    exchange_symbols: set[str] = set()
+    eastmoney_symbols: set[str] = set()
+    sina_symbols: set[str] = set()
+    errors: dict[str, str] = {}
+
+    calls = (
+        (
+            "exchange_sh_main",
+            lambda: client.stock_info_sh_name_code(symbol="主板A股"),
+            exchange_symbols,
+        ),
+        (
+            "exchange_sh_star",
+            lambda: client.stock_info_sh_name_code(symbol="科创板"),
+            exchange_symbols,
+        ),
+        (
+            "exchange_sz",
+            lambda: client.stock_info_sz_name_code(symbol="A股列表"),
+            exchange_symbols,
+        ),
+        ("exchange_bj", lambda: client.stock_info_bj_name_code(), exchange_symbols),
+        ("eastmoney", lambda: client.stock_zh_a_spot_em(), eastmoney_symbols),
+        ("sina", lambda: client.stock_zh_a_spot(), sina_symbols),
+    )
+    for source, call, destination in calls:
+        try:
+            records = _catalog(call(), asset_type="stock", source=source)
+            destination.update(item["symbol"] for item in records)
+        except Exception as exc:
+            errors[source] = f"{type(exc).__name__}: {exc}"
+
+    candidates_set = set(candidate_symbols)
+    active = candidates_set & exchange_symbols
+    complete = not errors
+    if complete:
+        inactive = candidates_set - exchange_symbols - eastmoney_symbols - sina_symbols
+        unresolved = candidates_set - active - inactive
+    else:
+        inactive = set()
+        unresolved = candidates_set - active
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "complete": complete,
+        "candidates": candidate_symbols,
+        "active": sorted(active),
+        "unresolved_candidates": sorted(unresolved),
+        "inactive_candidates": sorted(inactive),
+        "sources": {
+            "exchange": len(exchange_symbols),
+            "eastmoney": len(eastmoney_symbols),
+            "sina": len(sina_symbols),
+        },
+        "errors": errors,
+    }
+
+
 def discover_etf_universe(client: Any | None = None) -> list[dict[str, str]]:
     client = _require_akshare(client)
     errors: list[str] = []

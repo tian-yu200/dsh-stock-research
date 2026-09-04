@@ -36,6 +36,7 @@ from fetch_utils import (
 )
 from universe import (
     discover_stock_universe,
+    discover_stock_lifecycle,
     load_universe_manifest,
     manifest_symbols,
     normalize_symbol,
@@ -47,6 +48,8 @@ DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data" / "stocks"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UNIVERSE_PATH = DATA_DIR.parent / "universe.json"
 DEFAULT_POOL = ["600519", "000001", "300750", "600036", "000858"]
+LIFECYCLE_CACHE_SECONDS = 86400
+INCOMPLETE_LIFECYCLE_CACHE_SECONDS = 3600
 
 
 def is_allowed(code: str) -> bool:
@@ -356,6 +359,95 @@ def _refresh_manifest(
     print(f"[目录] A股代码 {len(catalog)} 个，已缓存到 {UNIVERSE_PATH}")
 
 
+def _lifecycle_snapshot_is_fresh(snapshot: dict[str, Any]) -> bool:
+    generated_at = snapshot.get("generated_at")
+    if not generated_at:
+        return False
+    try:
+        generated = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    ttl = (
+        LIFECYCLE_CACHE_SECONDS
+        if snapshot.get("complete") is True
+        else INCOMPLETE_LIFECYCLE_CACHE_SECONDS
+    )
+    age = (datetime.now(timezone.utc) - generated.astimezone(timezone.utc)).total_seconds()
+    return 0 <= age < ttl
+
+
+def _reconcile_stock_lifecycle(
+    state: FetchState,
+    codes: list[str],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    candidates = state.lifecycle_candidates("stock", codes)
+    if not candidates:
+        return {
+            "candidate_count": 0,
+            "checked_count": 0,
+            "complete": True,
+            "cached": False,
+            "inactivated": 0,
+            "revived": 0,
+            "unresolved_count": 0,
+            "deferred_count": 0,
+            "errors": {},
+        }
+
+    cached_value = manifest.get("stock_lifecycle")
+    cached_snapshot = cached_value if isinstance(cached_value, dict) else {}
+    cached = _lifecycle_snapshot_is_fresh(cached_snapshot)
+    if cached:
+        snapshot = cached_snapshot
+    else:
+        try:
+            snapshot = discover_stock_lifecycle(candidates)
+        except Exception as exc:
+            snapshot = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "complete": False,
+                "candidates": candidates,
+                "active": [],
+                "unresolved_candidates": candidates,
+                "inactive_candidates": [],
+                "sources": {},
+                "errors": {"discovery": f"{type(exc).__name__}: {exc}"},
+            }
+        write_universe_manifest(UNIVERSE_PATH, {"stock_lifecycle": snapshot})
+
+    candidate_set = set(candidates)
+    checked = candidate_set & {
+        str(value) for value in snapshot.get("candidates", [])
+    }
+    scoped_snapshot = dict(snapshot)
+    scoped_snapshot["candidates"] = sorted(checked)
+    for field in ("active", "unresolved_candidates", "inactive_candidates"):
+        scoped_snapshot[field] = sorted(
+            candidate_set & {str(value) for value in snapshot.get(field, [])}
+        )
+    applied = state.apply_lifecycle_snapshot("stock", scoped_snapshot)
+    result = {
+        "candidate_count": len(candidates),
+        "checked_count": len(checked),
+        "complete": snapshot.get("complete") is True,
+        "cached": cached,
+        "inactivated": applied["inactivated"],
+        "revived": applied["revived"],
+        "unresolved_count": len(scoped_snapshot["unresolved_candidates"]),
+        "deferred_count": len(set(candidates) - checked),
+        "errors": snapshot.get("errors", {}),
+    }
+    print(
+        "[生命周期] 候选 {candidate_count}，检查 {checked_count}，"
+        "停用 {inactivated}，恢复 {revived}，待复核 {unresolved_count}，"
+        "延后 {deferred_count}".format(**result)
+    )
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.limit is not None and args.limit < 1:
@@ -378,6 +470,11 @@ def main(argv: list[str] | None = None) -> int:
     state.reclaim_orphaned_leases()
     data_end_dates = {code: cached_end_date(_data_path(code)) for code in codes}
     state.register_assets("stock", codes, data_end_dates=data_end_dates)
+    cache_reconciled = state.reconcile_cached_assets("stock", data_end_dates)
+    if cache_reconciled:
+        print(f"[缓存协调] 从 CSV 恢复 {cache_reconciled} 个已落盘标的")
+    manifest = load_universe_manifest(UNIVERSE_PATH) or {}
+    lifecycle = _reconcile_stock_lifecycle(state, codes, manifest)
     requeued = 0
     if args.requeue_failure_class:
         requeued = state.requeue_quarantined(
@@ -551,6 +648,8 @@ def main(argv: list[str] | None = None) -> int:
         "errors": errors,
         "error_classes": error_classes,
         "field_anomalies": field_anomalies,
+        "cache_reconciled": cache_reconciled,
+        "lifecycle": lifecycle,
         "requeued": requeued,
         "state_db": str(pathlib.Path(args.state_db).resolve()),
         "limited": limited,
