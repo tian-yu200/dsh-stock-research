@@ -55,6 +55,15 @@ class _LifecycleStateSpy:
         return {"inactivated": inactivated, "revived": 0}
 
 
+class _ClaimStateSpy:
+    def __init__(self) -> None:
+        self.requests: list[list[str]] = []
+
+    def claim_due(self, kind: str, *, symbols: list[str], **kwargs) -> list[dict]:
+        self.requests.append(list(symbols))
+        return [{"symbol": symbols[0]}] if symbols else []
+
+
 def _bars(date: str) -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -71,6 +80,48 @@ def _bars(date: str) -> pd.DataFrame:
 
 
 class StockWorkerTests(unittest.TestCase):
+    def test_worker_does_not_reclaim_symbols_attempted_in_same_run(self) -> None:
+        state = _ClaimStateSpy()
+        attempted: set[str] = set()
+        codes = ["920001", "920002"]
+
+        first = worker._claim_unattempted(
+            state,
+            codes,
+            attempted,
+            limit=1,
+            target_date="2026-09-02",
+            lease_seconds=1800,
+            owner="test-owner",
+        )
+        second = worker._claim_unattempted(
+            state,
+            codes,
+            attempted,
+            limit=1,
+            target_date="2026-09-02",
+            lease_seconds=1800,
+            owner="test-owner",
+        )
+        exhausted = worker._claim_unattempted(
+            state,
+            codes,
+            attempted,
+            limit=1,
+            target_date="2026-09-02",
+            lease_seconds=1800,
+            owner="test-owner",
+        )
+
+        self.assertEqual([item["symbol"] for item in first], ["920001"])
+        self.assertEqual([item["symbol"] for item in second], ["920002"])
+        self.assertEqual(exhausted, [])
+        self.assertEqual(
+            state.requests,
+            [["920001", "920002"], ["920002"]],
+        )
+
+
     def _fetch(
         self,
         path: pathlib.Path,

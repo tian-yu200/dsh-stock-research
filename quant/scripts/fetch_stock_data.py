@@ -448,6 +448,32 @@ def _reconcile_stock_lifecycle(
     return result
 
 
+def _claim_unattempted(
+    state: FetchState,
+    codes: list[str],
+    attempted: set[str],
+    *,
+    limit: int,
+    target_date: str,
+    lease_seconds: int,
+    owner: str,
+) -> list[dict[str, Any]]:
+    """Claim due symbols at most once during this worker invocation."""
+    candidates = [code for code in codes if code not in attempted]
+    if not candidates:
+        return []
+    due = state.claim_due(
+        "stock",
+        symbols=candidates,
+        limit=limit,
+        target_date=target_date,
+        lease_seconds=lease_seconds,
+        owner=owner,
+    )
+    attempted.update(str(item["symbol"]) for item in due)
+    return due
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.limit is not None and args.limit < 1:
@@ -504,11 +530,13 @@ def main(argv: list[str] | None = None) -> int:
     error_classes: dict[str, int] = {}
     field_anomalies: list[dict[str, Any]] = []
     claimed_limit = min(batch_size, workers * 2)
+    attempted: set[str] = set()
 
     while deadline is None or time.monotonic() < deadline:
-        due = state.claim_due(
-            "stock",
-            symbols=codes,
+        due = _claim_unattempted(
+            state,
+            codes,
+            attempted,
             limit=claimed_limit,
             target_date=target,
             lease_seconds=max(30, int(args.lease_seconds)),
