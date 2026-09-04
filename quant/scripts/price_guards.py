@@ -54,7 +54,7 @@ def overnight_gap_flags(frame, *, threshold=None, symbol=""):
 def validate_daily_bars(frame, *, source="", symbol=""):
     work = frame.copy().reset_index(drop=True)
     try:
-        work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
     except Exception:
         pass
     kept_ratio = []
@@ -67,7 +67,12 @@ def validate_daily_bars(frame, *, source="", symbol=""):
         c = float(row.get("close") or 0)
         v = float(row.get("volume") or 0)
         a = float(row.get("amount") or 0)
-        ds = str(row.get("date"))
+        date_value = row.get("date")
+        ds = (
+            pd.Timestamp(date_value).date().isoformat()
+            if pd.notna(date_value)
+            else str(date_value)
+        )
         implied = (a / v) if v else None
         ratio = (implied / c) if (implied and c) else None
         if i == 0 or i < 10:

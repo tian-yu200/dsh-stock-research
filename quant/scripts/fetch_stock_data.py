@@ -17,6 +17,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any
 
+import pandas as pd
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from data_source import NoDailyBarsError, fetch_a_stock_daily
@@ -160,6 +162,14 @@ def _data_path(code: str) -> pathlib.Path:
 def _write_success(code: str, frame: Any, path: pathlib.Path) -> dict[str, Any]:
     merged = merge_daily_frames(path, frame, source=f"stock {code}")
     atomic_write_frame(merged, path)
+    latest_date = pd.to_datetime(merged["date"], errors="coerce").max()
+    if pd.isna(latest_date):
+        raise DailyBarSchemaError.for_source(
+            f"stock {code}",
+            "no valid date remains after price guards",
+            failure_class="invalid_required_values",
+            field_anomalies={"date": {"invalid_rows": int(len(merged))}},
+        )
     metadata = {
         "asset_type": "stock",
         "symbol": code,
@@ -167,7 +177,7 @@ def _write_success(code: str, frame: Any, path: pathlib.Path) -> dict[str, Any]:
         "interface": frame.attrs.get("akshare_interface"),
         "adjustment": frame.attrs.get("adjustment", "hfq"),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "data_end_date": merged["date"].max().date().isoformat(),
+        "data_end_date": pd.Timestamp(latest_date).date().isoformat(),
         "rows": int(len(merged)),
     }
     if frame.attrs.get("field_anomalies"):

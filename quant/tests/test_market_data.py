@@ -412,6 +412,24 @@ class PriceGuardsTests(unittest.TestCase):
             qpath = pathlib.Path(directory) / "quarantine" / "TEST01.quarantine.csv"
             self.assertTrue(qpath.exists())
 
+    def test_stock_write_success_handles_guarded_date_strings(self):
+        from fetch_stock_data import _write_success
+
+        frame, _ = self._clean_frame(n=20)
+        frame.at[frame.index[-1], "open"] = 39.29
+        frame.at[frame.index[-1], "high"] = 40.14
+        frame.at[frame.index[-1], "low"] = 38.96
+        frame.at[frame.index[-1], "close"] = 39.10
+        with tempfile.TemporaryDirectory(prefix="stock-write-", dir=ROOT / "tests") as directory:
+            target = pathlib.Path(directory) / "TEST01.csv"
+
+            metadata = _write_success("TEST01", frame, target)
+
+            self.assertEqual(metadata["data_end_date"], "2026-01-29")
+            self.assertEqual(metadata["rows"], 19)
+            self.assertTrue(target.exists())
+            self.assertTrue(target.with_suffix(".meta.json").exists())
+
 
     def test_exdiv_down_gap_is_kept(self):
         from price_guards import validate_daily_bars
