@@ -95,6 +95,11 @@ DEFAULTS: dict[str, Any] = {
         "weight_strategy": "equal_score",
         "require_full_universe_for_weights": True,
         "min_qlib_score_for_weights": 0.0,
+        # 宁缺毋滥过滤器：默认关闭（测试夹具使用合成低成交额数据，fail-open 设计）。
+        # 生产环境在 configs/assistant.yaml 中显式开启，三项任一命中即剔除候选。
+        "pool_exclude_st": False,
+        "min_listing_age_calendar_days": 90,
+        "min_avg_amount_20d": 0.0,
         "technical_lookback_days": 260,
         "hypothetical_capital": 100000.0,
         "refresh_modes": ["daily", "monthly", "on_demand"],

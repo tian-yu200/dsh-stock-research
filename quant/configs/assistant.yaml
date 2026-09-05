@@ -81,6 +81,12 @@ research:
   # 只输出信号与门槛，不产生买入权重。入选者个体 qlib 得分必须为正。
   require_full_universe_for_weights: true
   min_qlib_score_for_weights: 0.0
+  # 宁缺毋滥过滤器（2026-09-05 用户规则）：打分后、取 top-k 前剔除
+  # ST/*ST/退市整理、上市不满约 60 个交易日（90 日历日）的次新、
+  # 20 日均成交额低于 1000 万元的低流动性标的。剔除明细写入 run 的 log_lines。
+  pool_exclude_st: true
+  min_listing_age_calendar_days: 90
+  min_avg_amount_20d: 10000000.0
   technical_lookback_days: 260
   hypothetical_capital: 100000.0
   refresh_modes:

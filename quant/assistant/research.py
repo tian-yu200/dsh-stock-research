@@ -281,6 +281,61 @@ def _quality_for_depth(
     return tolerated
 
 
+def _pool_quality_filter(
+    signals: list[dict[str, Any]],
+    facts_by_symbol: Mapping[str, Mapping[str, Any]],
+    config: Mapping[str, Any],
+    as_of_date: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """宁缺毋滥：在生成买入权重前剔除不合格候选（打分后、取 top-k 前）。
+
+    剔除三类：ST/*ST/退市整理（名称标记）、上市不满 min_listing_age_calendar_days
+    （约 60 个交易日）的次新、20 日均成交额低于 min_avg_amount_20d 的低流动性标的。
+    缺数据的候选按合格处理（fail-open）：数据层对所有股票始终产出
+    name/start_date/liquidity，缺项只出现在测试夹具与极端场景。
+    返回 (合格信号, 剔除明细)，剔除明细保持原始排名顺序（前列即最可惜的落榜者）。
+    """
+    research_cfg = config.get("research") or {}
+    exclude_st = bool(research_cfg.get("pool_exclude_st", False))
+    min_age_days = int(research_cfg.get("min_listing_age_calendar_days", 90) or 0)
+    min_avg_amount = float(research_cfg.get("min_avg_amount_20d", 0.0) or 0.0)
+    as_of = pd.Timestamp(as_of_date) if as_of_date else None
+    eligible: list[dict[str, Any]] = []
+    exclusions: list[dict[str, Any]] = []
+    for signal in signals:
+        symbol = str(signal.get("symbol") or "")
+        fact = facts_by_symbol.get(symbol) or {}
+        name = str(fact.get("name") or "")
+        reason = None
+        if exclude_st and name:
+            upper = name.upper()
+            if "ST" in upper or "退" in name:
+                reason = "st_or_delisting"
+        if reason is None and min_age_days > 0 and as_of is not None:
+            start_date = fact.get("start_date")
+            if start_date:
+                try:
+                    age_days = (as_of - pd.Timestamp(start_date)).days
+                except (TypeError, ValueError):
+                    age_days = None
+                if age_days is not None and age_days < min_age_days:
+                    reason = "new_listing"
+        if reason is None and min_avg_amount > 0:
+            liquidity = (fact.get("checks") or {}).get("liquidity") or {}
+            avg_amount = liquidity.get("average_amount_20d")
+            if avg_amount is not None:
+                try:
+                    if float(avg_amount) < min_avg_amount:
+                        reason = "low_liquidity"
+                except (TypeError, ValueError):
+                    pass
+        if reason:
+            exclusions.append({"symbol": symbol, "name": name, "reason": reason})
+        else:
+            eligible.append(signal)
+    return eligible, exclusions
+
+
 def run_research(
     mode: str = "daily",
     asset_scope: str = "all",
@@ -699,7 +754,22 @@ def run_research(
                 )
             gate_passed = all(checks.values())
             if gate_passed:
-                ranked = technical_signals["stock"]["signals"][: int(config["research"]["stock_topk"])]
+                facts_by_symbol = {item.get("symbol"): item for item in stock_facts}
+                eligible_signals, pool_exclusions = _pool_quality_filter(
+                    technical_signals["stock"]["signals"],
+                    facts_by_symbol,
+                    config,
+                    str(data_quality.get("data_end_date") or ""),
+                )
+                for exclusion in pool_exclusions[:10]:
+                    log_lines.append(
+                        f"[宁缺毋滥] {exclusion['symbol']} {exclusion.get('name', '')} 剔除: {exclusion['reason']}"
+                    )
+                if pool_exclusions:
+                    log_lines.append(
+                        f"[宁缺毋滥] 共剔除 {len(pool_exclusions)} 个候选（ST/退市整理/次新/低流动性）"
+                    )
+                ranked = eligible_signals[: int(config["research"]["stock_topk"])]
                 min_score = float(config["research"].get("min_qlib_score_for_weights", 0.0))
                 screened = []
                 for signal in ranked:
