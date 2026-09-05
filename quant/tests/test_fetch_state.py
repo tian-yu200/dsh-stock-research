@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pandas as pd
@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from assistant import paths, research
 from assistant.config import DEFAULTS
-from fetch_state import FetchState
+from fetch_state import FetchState, iso_now
 from fetch_utils import cached_end_date, merge_daily_frames
 
 
@@ -709,6 +709,72 @@ class QueuedResearchTests(unittest.TestCase):
                     ).read_text(encoding="utf-8")
                 )["status"],
                 "queued",
+            )
+
+    def test_advance_due_for_stale_only_wakes_lagging_success_rows(self) -> None:
+        """收盘后补数：只强制"数据落后且还在睡"的成功标的，其余不动。"""
+        with tempfile.TemporaryDirectory(prefix="fetch-postclose-", dir=ROOT / "tests") as directory:
+            db_path = pathlib.Path(directory) / "state.sqlite3"
+            state = FetchState(db_path)
+            state.register_assets("stock", ["000001", "000002", "000003", "000004"])
+            state.register_assets("etf", ["510300"])
+            # 000001：落后且在睡（next_retry 在未来）→ 应被强制到期
+            state.mark_success("stock", "000001", data_end_date="2026-09-03",
+                               source="test", rows=10, refresh_interval_seconds=86400)
+            # 000002：数据已是最新 → 不动
+            state.mark_success("stock", "000002", data_end_date="2026-09-05",
+                               source="test", rows=10, refresh_interval_seconds=86400)
+            # 000003：落后但持有未过期租约（在途）→ 不动
+            state.mark_success("stock", "000003", data_end_date="2026-09-03",
+                               source="test", rows=10, refresh_interval_seconds=86400)
+            with state._connect() as connection:
+                # lease_until 与 next_retry_at 一样用 ISO 字符串比较，
+                # 测试里必须写同格式，不能用 SQLite datetime('now')
+                connection.execute(
+                    "UPDATE assets SET lease_owner = 'w1', lease_until = ? "
+                    "WHERE symbol = '000003'",
+                    (iso_now(datetime.now(timezone.utc) + timedelta(minutes=10)),),
+                )
+            # 000004：失败状态 → 不动（走失败重试路径）
+            state.mark_failure("stock", "000004", error="x", backoff_base_seconds=60,
+                               backoff_max_seconds=60)
+            # 510300：其他资产类型的落后标的 → 默认不在范围内
+            state.mark_success("etf", "510300", data_end_date="2026-09-01",
+                               source="test", rows=10, refresh_interval_seconds=86400)
+
+            forced = state.advance_due_for_stale(before_date="2026-09-05", asset_types=("stock",))
+            self.assertEqual(forced, 1)
+
+            with state._connect() as connection:
+                connection.row_factory = sqlite3.Row
+                rows = {
+                    row["symbol"]: dict(row)
+                    for row in connection.execute(
+                        "SELECT symbol, status, next_retry_at FROM assets"
+                    )
+                }
+            self.assertIsNone(rows["000001"]["next_retry_at"])
+            self.assertIsNotNone(rows["000002"]["next_retry_at"])
+            self.assertIsNotNone(rows["000003"]["next_retry_at"])
+            self.assertIsNotNone(rows["000004"]["next_retry_at"])
+            self.assertIsNotNone(rows["510300"]["next_retry_at"])
+
+            # 已到期的行不再重复计数
+            self.assertEqual(
+                state.advance_due_for_stale(before_date="2026-09-05", asset_types=("stock",)),
+                0,
+            )
+
+            # 不限资产类型时，落后的 ETF 也会被唤醒
+            self.assertEqual(state.advance_due_for_stale(before_date="2026-09-05"), 1)
+
+    def test_advance_due_for_stale_empty_asset_types_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fetch-postclose2-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("stock", ["000001"])
+            self.assertEqual(
+                state.advance_due_for_stale(before_date="2026-09-05", asset_types=[]),
+                0,
             )
 
 

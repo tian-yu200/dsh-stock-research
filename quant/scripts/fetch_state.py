@@ -539,6 +539,46 @@ class FetchState:
             )
         return cursor.rowcount > 0
 
+    def advance_due_for_stale(
+        self,
+        *,
+        before_date: str,
+        asset_types: Iterable[str] | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """把 data_end_date 落后 before_date 的成功标的强制置为到期。
+
+        收盘后补数专用：mark_success 的刷新计时器（next_retry_at = 成功
+        时刻 + refresh_interval）与 A 股收盘不对齐——在数据源发布当日
+        K 线之前抓到"确认无新数据"的标的会再睡满一个周期，滞后逐日
+        复利。这里清空落后标的的 next_retry_at，让下一轮 wave 立即
+        认领。只动 status='success' 且租约已释放的行；本就已到期的行
+        不重复计数。返回本次被强制到期的标的数。
+        """
+        current = iso_now(now or utc_now())
+        query = """
+            UPDATE assets
+            SET next_retry_at = NULL,
+                updated_at = ?
+            WHERE status = 'success'
+              AND data_end_date IS NOT NULL
+              AND data_end_date < ?
+              AND (lease_until IS NULL OR lease_until <= ?)
+              AND next_retry_at IS NOT NULL
+              AND next_retry_at > ?
+        """
+        params: list[Any] = [current, before_date, current, current]
+        if asset_types is not None:
+            types = sorted({str(value) for value in asset_types})
+            if not types:
+                return 0
+            placeholders = ",".join("?" for _ in types)
+            query += f" AND asset_type IN ({placeholders})"
+            params.extend(types)
+        with self._connect() as connection:
+            cursor = connection.execute(query, params)
+            return max(0, int(cursor.rowcount))
+
     def mark_failure(
         self,
         asset_type: str,

@@ -11,6 +11,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1381,6 +1382,101 @@ def errors(limit: int = 50) -> dict[str, Any]:
     }
 
 
+def _refresh_calendar_dates() -> list[str]:
+    """拉取交易日历（在线优先、缓存兜底），返回升序 ISO 日期列表。
+
+    失败时返回空列表——调用方退化为"以全市场已观测的最大 data_end_date
+    为基准"，postclose 仍能把落后最多的标的补到当前已知最新。
+    """
+    try:
+        from trading_calendar import _atomic_write_calendar, _online_calendar
+
+        calendar = _online_calendar()
+        _atomic_write_calendar(calendar)
+        return sorted(calendar["trade_date"].astype(str))
+    except Exception:
+        pass
+    try:
+        from trading_calendar import _cached_calendar
+
+        calendar = _cached_calendar()
+        return sorted(calendar["trade_date"].astype(str))
+    except Exception:
+        return []
+
+
+def latest_expected_trading_date(
+    calendar_dates: list[str],
+    today: date | None = None,
+) -> str | None:
+    """今日（上海时区）是交易日则取今日，否则取之前最近的一个交易日。
+
+    纯函数，便于离线测试；calendar_dates 为空时返回 None。
+    """
+    today = today or datetime.now(TIMEZONE).date()
+    past = [value for value in calendar_dates if value <= today.isoformat()]
+    return past[-1] if past else None
+
+
+def run_postclose(
+    *,
+    job_id: str | None = None,
+    run_research_now: bool = True,
+) -> dict[str, Any]:
+    """收盘后数据保鲜：把落后最新交易日的标的全部强制到期并触发研究。
+
+    动机：24 小时刷新计时器与收盘不对齐，收盘后新 K 线要等到次日同一
+    时刻才进入抓取窗口，滞后逐日复利；界面侧只能把滞后标的踢出海选，
+    根治必须靠数据侧主动补齐。全部已是最新时跳过重研究（省 1.5-2 小时）。
+    """
+    config = load_config()
+    state = FetchState(Path(config["fetch"]["state_db"]))
+    calendar_dates = _refresh_calendar_dates()
+    expected_date = latest_expected_trading_date(calendar_dates)
+    if expected_date is None:
+        # 日历完全不可用：退化为"补到全市场已观测的最新一天"（弱保证）。
+        connection = sqlite3.connect(
+            f"file:{Path(config['fetch']['state_db']).resolve()}?mode=ro", uri=True
+        )
+        try:
+            row = connection.execute(
+                "SELECT MAX(data_end_date) FROM assets WHERE status = 'success'"
+            ).fetchone()
+        finally:
+            connection.close()
+        expected_date = str(row[0]) if row and row[0] else None
+    if expected_date is None:
+        return {
+            "action": "postclose",
+            "status": "skipped",
+            "reason": "trading calendar unavailable and no observed data dates",
+        }
+
+    forced_by_type = {
+        asset_type: state.advance_due_for_stale(
+            before_date=expected_date, asset_types=(asset_type,)
+        )
+        for asset_type in ASSET_TYPES
+    }
+    total_forced = sum(forced_by_type.values())
+    summary: dict[str, Any] = {
+        "action": "postclose",
+        "status": "ok",
+        "trading_date": expected_date,
+        "forced_due": forced_by_type,
+        "total_forced": total_forced,
+    }
+    if total_forced == 0:
+        summary["research"] = {"status": "skipped", "reason": "all data already current"}
+        return summary
+    if not run_research_now:
+        # 只强制到期，让 10 分钟一次的调度 tick 自行认领补抓。
+        summary["research"] = {"status": "deferred_to_scheduler"}
+        return summary
+    summary["research"] = run_once(job_id=job_id)
+    return summary
+
+
 def pause(reason: str = "paused by operator") -> dict[str, Any]:
     record = {
         "status": "paused",
@@ -1417,7 +1513,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--action",
-        choices=("once", "start", "status", "pause", "resume", "errors", "coverage"),
+        choices=("once", "start", "postclose", "status", "pause", "resume", "errors", "coverage"),
         default="status",
     )
     parser.add_argument("--limit", type=int, default=50)
@@ -1431,6 +1527,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action in {"once", "start"}:
             value = run_once(job_id=args.job_id)
+        elif args.action == "postclose":
+            value = run_postclose(job_id=args.job_id)
         elif args.action == "status":
             value = status()
         elif args.action == "pause":

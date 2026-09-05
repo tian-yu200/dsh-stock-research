@@ -674,5 +674,107 @@ class QueuedTargetDateTests(unittest.TestCase):
             self.assertNotEqual(result["job_id"], old_id)
 
 
+class PostCloseTests(unittest.TestCase):
+    def test_latest_expected_trading_date_rolls_back_to_previous_trading_day(self) -> None:
+        from datetime import date as date_type
+
+        calendar = ["2026-09-04", "2026-09-07", "2026-09-08"]
+        # 周五当天 → 周五
+        self.assertEqual(
+            continuous.latest_expected_trading_date(calendar, date_type(2026, 9, 4)),
+            "2026-09-04",
+        )
+        # 周六 → 退回周五
+        self.assertEqual(
+            continuous.latest_expected_trading_date(calendar, date_type(2026, 9, 5)),
+            "2026-09-04",
+        )
+        # 周日 → 仍退回周五
+        self.assertEqual(
+            continuous.latest_expected_trading_date(calendar, date_type(2026, 9, 6)),
+            "2026-09-04",
+        )
+        # 日历为空 → None
+        self.assertIsNone(continuous.latest_expected_trading_date([], date_type(2026, 9, 6)))
+
+    def test_postclose_skips_research_when_all_data_current(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="postclose-fresh-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.register_assets("stock", ["600000"])
+            state.mark_success("stock", "600000", data_end_date="2026-09-05",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(root / "fetch_state.sqlite3")
+            with patch.object(continuous, "load_config", return_value=config),                     patch.object(continuous, "_refresh_calendar_dates",
+                                 return_value=["2026-09-04", "2026-09-05"]),                     patch.object(continuous, "run_once") as run_once_mock:
+                value = continuous.run_postclose()
+            self.assertEqual(value["status"], "ok")
+            self.assertEqual(value["trading_date"], "2026-09-05")
+            self.assertEqual(value["total_forced"], 0)
+            self.assertEqual(value["research"]["status"], "skipped")
+            run_once_mock.assert_not_called()
+
+    def test_postclose_forces_stale_symbols_then_runs_research(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="postclose-stale-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.register_assets("stock", ["600000", "600001"])
+            state.mark_success("stock", "600000", data_end_date="2026-09-03",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            state.mark_success("stock", "600001", data_end_date="2026-09-05",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(root / "fetch_state.sqlite3")
+            run_once_mock = Mock(return_value={"status": "ok", "job_id": "job-1"})
+            with patch.object(continuous, "load_config", return_value=config),                     patch.object(continuous, "_refresh_calendar_dates",
+                                 return_value=["2026-09-04", "2026-09-05"]),                     patch.object(continuous, "run_once", run_once_mock):
+                value = continuous.run_postclose(job_id="postclose-1")
+            self.assertEqual(value["status"], "ok")
+            self.assertEqual(value["forced_due"], {"stock": 1, "etf": 0, "otc_fund": 0})
+            self.assertEqual(value["total_forced"], 1)
+            run_once_mock.assert_called_once_with(job_id="postclose-1")
+            # 被强制的标的已可被 wave 立即认领
+            self.assertEqual(
+                len(state.claim_due("stock", symbols=["600000"], limit=5,
+                                    target_date="2026-09-05", owner="w")),
+                1,
+            )
+
+    def test_postclose_can_defer_research_to_scheduler_tick(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="postclose-defer-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.register_assets("stock", ["600000"])
+            state.mark_success("stock", "600000", data_end_date="2026-09-03",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(root / "fetch_state.sqlite3")
+            with patch.object(continuous, "load_config", return_value=config),                     patch.object(continuous, "_refresh_calendar_dates",
+                                 return_value=["2026-09-05"]),                     patch.object(continuous, "run_once") as run_once_mock:
+                value = continuous.run_postclose(run_research_now=False)
+            self.assertEqual(value["total_forced"], 1)
+            self.assertEqual(value["research"]["status"], "deferred_to_scheduler")
+            run_once_mock.assert_not_called()
+
+    def test_postclose_falls_back_to_observed_max_date_without_calendar(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="postclose-nocal-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.register_assets("stock", ["600000", "600001"])
+            state.mark_success("stock", "600000", data_end_date="2026-09-03",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            state.mark_success("stock", "600001", data_end_date="2026-09-04",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(root / "fetch_state.sqlite3")
+            with patch.object(continuous, "load_config", return_value=config),                     patch.object(continuous, "_refresh_calendar_dates", return_value=[]),                     patch.object(continuous, "run_once") as run_once_mock:
+                value = continuous.run_postclose(run_research_now=False)
+            # 退化基准 = 全市场观测最大日期 2026-09-04，只唤醒 9-03 的标的
+            self.assertEqual(value["trading_date"], "2026-09-04")
+            self.assertEqual(value["total_forced"], 1)
+            run_once_mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
