@@ -1,5 +1,9 @@
 # Workspace Stability Rule
 
+## 研究管线不变量（修改代码前必读）
+
+修改 `quant/scripts/`（data_source、market_data、price_guards、fetch_*、continuous_research）或 `quant/assistant/`（research、data_layer、qlib_model）之前，**必须先阅读 `quant/docs/研究管线不变量.md`**。该文件记录 2026-09-05 大修中被实证的不变量与禁忌：市场前缀映射（920=北交所→bj）、源级熔断与确定性异常重试语义、非正价格行丢弃、价格守卫的 A/B 黄金基线、worker 预算 7200s 的依据、16GB 内存约束下的训练窗口、海选原则门槛语义（定向研究 failed 是设计行为）、以及 job 台账 stderr 误报的判读方法。违反这些规则的修改曾导致 900+ 标的卡死一天、扫描 9 小时跑不完、模型 OOM。
+
 When working in this repository, treat any command that may run longer than 30 seconds, scan the full market, recurse through large data/log directories, run a full test suite, or emit more than 200 lines / 20 KB as a heavy operation. Apply this procedure as one hard rule:
 
 1. Keep foreground work bounded. Use focused file reads and queries (`rg`, `Select-Object -First`, `Get-Content -Tail`) and cap returned output at 200 lines or 20 KB. Summarize counts and samples instead of returning complete JSONL sessions, logs, recursive listings, SQLite rows, or full source files.
