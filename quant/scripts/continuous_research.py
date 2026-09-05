@@ -54,8 +54,10 @@ WORKER_LOG_DIR = CONTINUOUS_DIR / "workers"
 # 每个 wave 的抓取预算。外部触发间隔约 10 分钟；预算必须接近触发间隔，
 # 否则大部分时间空转等待下一次触发（240s 预算 + 10min 间隔时吞吐仅约 2 标的/分钟）。
 # 壁钟上限必须覆盖 抓取预算 + qlib 重建 + 研究运行：抓取门槛首次通过的
-# 那一轮 wave 会在同一进程内连续跑完三个阶段，预算 3300s + 研究约 30min。
-WORKER_TIME_BUDGET_SECONDS = 3300
+# 那一轮 wave 会在同一进程内连续跑完三个阶段。冷启动全市场分析（31k 标的
+# 逐个算技术信号）实测需要 1 小时以上，3300s 会在分析中途耗尽（2026-09-05
+# 实证：fetch+qlib 约 10min，分析 58min 未完），故提到 7200s。
+WORKER_TIME_BUDGET_SECONDS = 7200
 WORKER_WALL_TIMEOUT_SECONDS = 8400
 STALE_AFTER_SECONDS = 21600
 LONG_STALE_EXTRA_DAYS = 20

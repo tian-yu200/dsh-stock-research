@@ -6,6 +6,7 @@ instruction, and failed stock model gates always produce cash/observe output.
 """
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -596,6 +597,10 @@ def run_research(
             )
 
         touch_phase("signals")
+        # 模型工作流要一次性分配数 GiB 的 Alpha158 特征矩阵；技术信号已算完，
+        # 行情帧此后不再被使用（模型走 Qlib provider 自有通道），显式释放腾内存。
+        all_frames.clear()
+        gc.collect()
         stock_model = {
             "model_available": False,
             "model_name": "Qlib Alpha158 + LightGBM",
@@ -682,17 +687,40 @@ def run_research(
                 if result.get("label") in {"stock", "qlib_provider"}
             )
             checks["leakage_check_passed"] = bool(stock_model.get("leakage_check", {}).get("passed", False))
-            gate_passed = all(checks.values())
+            # 海选原则（有能者居之）：定向研究只输出信号与门槛，不参与权重排名。
+            require_screen = bool(config["research"].get("require_full_universe_for_weights", True))
+            checks["full_universe_screen_passed"] = (not require_screen) or (not directed_research)
+            checks["positive_signal_passed"] = True
             stock_requested = {}
+            screen_block_reason = ""
+            if not checks["full_universe_screen_passed"]:
+                screen_block_reason = (
+                    "定向研究仅输出信号与门槛；个股目标权重只由全市场海选排名产生，不生成个股买入目标权重。"
+                )
+            gate_passed = all(checks.values())
             if gate_passed:
                 ranked = technical_signals["stock"]["signals"][: int(config["research"]["stock_topk"])]
-                stock_requested = build_target_weights(
-                    ranked,
-                    "stock",
-                    config["risk"],
-                    budget=run_budget,
-                    strategy=weight_strategy,
-                )
+                min_score = float(config["research"].get("min_qlib_score_for_weights", 0.0))
+                screened = []
+                for signal in ranked:
+                    try:
+                        score = float(signal.get("qlib_score"))
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(score) and score > min_score:
+                        screened.append(signal)
+                checks["positive_signal_passed"] = bool(screened)
+                if not screened:
+                    gate_passed = False
+                    screen_block_reason = "海选前列无个体得分为正的候选，不生成个股买入目标权重。"
+                else:
+                    stock_requested = build_target_weights(
+                        screened,
+                        "stock",
+                        config["risk"],
+                        budget=run_budget,
+                        strategy=weight_strategy,
+                    )
             asset_types_for_weights = {symbol: "stock" for symbol in stock_requested}
             risk_result = enforce_target_weights(
                 stock_requested,
@@ -713,7 +741,7 @@ def run_research(
                 }
             else:
                 stock_decision = cash_only_decision(
-                    "个股模型或风险门槛未通过，不生成个股买入目标权重。",
+                    screen_block_reason or "个股模型或风险门槛未通过，不生成个股买入目标权重。",
                     capital=float(config["research"]["hypothetical_capital"]),
                 )
             rule_gates["stock"] = {

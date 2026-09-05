@@ -5,6 +5,7 @@ Catches cases like 603826 2026-08-28 before bad rows reach CSV caches.
 from __future__ import annotations
 import urllib.request
 from pathlib import Path
+from statistics import median
 import pandas as pd
 IMPLIED_DEVIATION_THRESHOLD = 0.25
 OVERNIGHT_GAP_THRESHOLD = 0.30
@@ -57,22 +58,44 @@ def validate_daily_bars(frame, *, source="", symbol=""):
         work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
     except Exception:
         pass
+    row_count = len(work)
+
+    def _column_values(name: str) -> list:
+        # 逐行 .loc 访问是全市场扫描的吞吐瓶颈（31k 标的 × 数千行），
+        # 这里一次性转成纯 Python 标量列表；NaN 保持 NaN（真值），与原
+        # `float(row.get(col) or 0)` 的 `or` 语义逐分支等价。
+        if name in work.columns:
+            return pd.to_numeric(work[name], errors="coerce").tolist()
+        return [None] * row_count
+
+    opens = _column_values("open")
+    closes = _column_values("close")
+    volumes = _column_values("volume")
+    amounts = _column_values("amount")
+
+    if "date" in work.columns:
+        date_col = work["date"]
+        if pd.api.types.is_datetime64_any_dtype(date_col):
+            ds_list = date_col.dt.strftime("%Y-%m-%d").fillna("NaT").tolist()
+        else:
+            ds_list = [
+                pd.Timestamp(value).date().isoformat() if pd.notna(value) else str(value)
+                for value in date_col
+            ]
+    else:
+        ds_list = ["None"] * row_count
+
     kept_ratio = []
-    keep = [True] * len(work)
+    keep = [True] * row_count
     reasons = []
     prev_close, prev_date, prev_vol, prev_amt = None, None, None, None
-    for i in range(len(work)):
-        row = work.loc[i]
-        o = float(row.get("open") or 0)
-        c = float(row.get("close") or 0)
-        v = float(row.get("volume") or 0)
-        a = float(row.get("amount") or 0)
-        date_value = row.get("date")
-        ds = (
-            pd.Timestamp(date_value).date().isoformat()
-            if pd.notna(date_value)
-            else str(date_value)
-        )
+    thr = gap_threshold_for(symbol)
+    for i in range(row_count):
+        o = float(opens[i] or 0)
+        c = float(closes[i] or 0)
+        v = float(volumes[i] or 0)
+        a = float(amounts[i] or 0)
+        ds = ds_list[i]
         implied = (a / v) if v else None
         ratio = (implied / c) if (implied and c) else None
         if i == 0 or i < 10:
@@ -81,9 +104,8 @@ def validate_daily_bars(frame, *, source="", symbol=""):
             prev_close, prev_date, prev_vol, prev_amt = c or None, ds, v or None, a or None
             continue
         gap = (o / prev_close - 1.0) if (o and prev_close) else 0.0
-        med = float(pd.Series(kept_ratio[-60:]).median()) if len(kept_ratio) >= 20 else None
+        med = median(kept_ratio[-60:]) if len(kept_ratio) >= 20 else None
         dev = abs(ratio / med - 1.0) if (ratio and med) else 0.0
-        thr = gap_threshold_for(symbol)
         big_gap = abs(gap) > thr
         verdict, why = "keep", []
         if big_gap:

@@ -219,12 +219,32 @@ def _price_consistency_check(frame: pd.DataFrame, symbol: str = "") -> dict[str,
         return {"status": "pass" if passed else "fail", "passed": passed, "bad_rows": len(recent), "bad_dates": recent, "warn_old_rows": len(old), "max_deviation": round(max(devs) if devs else 0.0, 4), "max_gap": round(max(gaps) if gaps else 0.0, 4)}
     except Exception as exc:
         return {"status": "skipped", "passed": True, "reason": type(exc).__name__}
+_MANIFEST_CACHE: dict[str, tuple[tuple[int, int], Any]] = {}
+
+
+def _cached_universe_manifest(path: Path) -> Any:
+    """按 (mtime_ns, size) 缓存 universe manifest——全市场扫描曾对每个标的
+    重新解析整份 manifest（31k 次 × ~42ms ≈ 22 分钟纯浪费）。"""
+    key = str(path)
+    try:
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return load_universe_manifest(path)
+    cached = _MANIFEST_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    value = load_universe_manifest(path)
+    _MANIFEST_CACHE[key] = (stamp, value)
+    return value
+
+
 def _load_asset(asset_type: str, symbol: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     path = _data_file(asset_type, symbol)
     if not path.exists():
         raise FileNotFoundError(path)
     raw = pd.read_csv(path)
-    manifest = load_universe_manifest(research.UNIVERSE_PATH)
+    manifest = _cached_universe_manifest(research.UNIVERSE_PATH)
     name = manifest_names(manifest, asset_type).get(symbol)
     raw_date_column = next(
         (column for column in raw.columns if str(column).strip() in {"date", "日期", "净值日期"}),

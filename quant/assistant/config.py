@@ -93,6 +93,8 @@ DEFAULTS: dict[str, Any] = {
         "stock_label_horizon": 20,
         "stock_topk": 3,
         "weight_strategy": "equal_score",
+        "require_full_universe_for_weights": True,
+        "min_qlib_score_for_weights": 0.0,
         "technical_lookback_days": 260,
         "hypothetical_capital": 100000.0,
         "refresh_modes": ["daily", "monthly", "on_demand"],

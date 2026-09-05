@@ -107,7 +107,8 @@ STOCK_CHECK_KEYS = {
     "data_quality_and_model_available", "mean_rank_ic_threshold",
     "rank_ic_ir_threshold", "top_bottom_excess_return_threshold",
     "test_max_drawdown_threshold", "data_quality_passed", "freshness_passed",
-    "refresh_passed", "leakage_check_passed", "risk_constraints_passed",
+    "refresh_passed", "leakage_check_passed", "full_universe_screen_passed",
+    "positive_signal_passed", "risk_constraints_passed",
 }
 PATH_CHECK_KEYS = {
     "data_quality_passed", "freshness_passed", "refresh_passed",
@@ -527,7 +528,10 @@ class ResearchSnapshotTests(unittest.TestCase):
             self.assertFalse(fact["freshness"]["stale"])
             self.assertEqual(
                 set(fact["checks"]),
-                {"schema", "duplicate_dates", "adjustment_or_nav", "liquidity"}
+                {
+                    "schema", "duplicate_dates", "adjustment_or_nav", "liquidity",
+                }
+                | ({"price_consistency"} if symbol in STOCKS or symbol in ETFS else set())
                 | ({"ohlc_values"} if symbol in STOCKS or symbol in ETFS else {"nav_values"}),
             )
             adjustment = fact["checks"]["adjustment_or_nav"]
@@ -777,6 +781,8 @@ class ResearchSnapshotTests(unittest.TestCase):
         self.assertTrue(stock_gate["checks"]["freshness_passed"])
         self.assertTrue(stock_gate["checks"]["refresh_passed"])
         self.assertTrue(stock_gate["checks"]["leakage_check_passed"])
+        self.assertTrue(stock_gate["checks"]["full_universe_screen_passed"])
+        self.assertTrue(stock_gate["checks"]["positive_signal_passed"])
         self.assertTrue(stock_gate["checks"]["risk_constraints_passed"])
         self.assertEqual(stock_gate["model_metrics"], blocked_model)
         self.assertEqual(stock_gate["risk"]["target_weights"], {})
@@ -846,6 +852,52 @@ class ResearchSnapshotTests(unittest.TestCase):
 
         run_status = research.get_run_status(RUN_ID)
         self.assertEqual(run_status["status"], "failed")
+
+
+    # ---------- 用例 3：定向研究即使模型通过也不产生权重（海选原则） ----------
+
+    def test_directed_stock_run_withholds_weights_pending_full_screen(self) -> None:
+        sentinel = {
+            "run_id": "sentinel-success",
+            "status": "success",
+            "decision_support": {"target_weights": {"OLD": 0.10}},
+        }
+        paths.atomic_write_json(self.results_dir / "current.json", sentinel)
+
+        with patch.object(
+            research, "_run_id", return_value=RUN_ID
+        ), patch.object(
+            research, "_run_qlib_stock_model",
+            return_value=copy.deepcopy(STOCK_MODEL_STUB),
+        ):
+            result = research.run_research("on_demand", "stock", ["600519"], _force_sync=True)
+
+        run_dir = self._run_dir()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reasons"], ["stock_model_or_risk_gate_failed"])
+
+        rule_gates = self._read_json(run_dir / "rule_gates.json")
+        stock_gate = rule_gates["stock"]
+        self.assertFalse(stock_gate["passed"])
+        self.assertEqual(set(stock_gate["checks"]), STOCK_CHECK_KEYS)
+        self.assertFalse(stock_gate["checks"]["full_universe_screen_passed"])
+        self.assertTrue(stock_gate["checks"]["mean_rank_ic_threshold"])
+
+        # 信号照常输出：定向研究保留验信号的能力，只是不能变成推荐权重。
+        model_signals = self._read_json(run_dir / "model_signals.json")
+        stock_signals = model_signals["stock"]["signals"]
+        self.assertEqual([signal["symbol"] for signal in stock_signals], ["600519"])
+        self.assertAlmostEqual(stock_signals[0]["qlib_score"], 1.5)
+
+        decision_support = self._read_json(run_dir / "decision_support.json")
+        stock_decision = decision_support["asset_paths"]["stock"]
+        self.assertEqual(stock_decision["status"], "cash_or_observe")
+        self.assertEqual(stock_decision["target_weights"], {})
+        self.assertEqual(stock_decision["cash_weight"], 1.0)
+        self.assertIn("海选", stock_decision["reason"])
+
+        current = self._read_json(self.results_dir / "current.json")
+        self.assertEqual(current, sentinel)
 
 
 if __name__ == "__main__":

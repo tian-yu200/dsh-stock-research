@@ -161,6 +161,19 @@ def normalize_daily_bars(frame: pd.DataFrame, *, source: str = "unknown") -> pd.
     for column in numeric_columns:
         data[column] = pd.to_numeric(data[column], errors="coerce")
 
+    # A 股有效价格恒为正；上游偶尔给出 0 价格行（停牌占位/改码前脏数据），
+    # 必须丢弃而不是留给下游制造 -100% 假收益。全部为 0 时视同空响应。
+    nonpositive = (data.loc[:, ("open", "high", "low", "close")] <= 0)
+    if bool(nonpositive.any().any()):
+        bad_rows = nonpositive.any(axis=1)
+        dropped = int(bad_rows.sum())
+        data = data.loc[~bad_rows].reset_index(drop=True)
+        field_anomalies["price_nonpositive"] = {"dropped_rows": dropped}
+        if data.empty:
+            raise EmptyDailyBarResponse(
+                f"{source}: all {dropped} rows had non-positive prices"
+            )
+
     invalid_required = data.loc[:, REQUIRED_COLUMNS[1:]].isna().any(axis=1)
     if invalid_required.any():
         invalid_count = int(invalid_required.sum())

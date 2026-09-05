@@ -246,6 +246,52 @@ class StockWorkerTests(unittest.TestCase):
             {"volume": {"conflicting_rows": 1}},
         )
 
+    def test_deterministic_exception_skips_in_run_retries(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="stock-worker-", dir=ROOT / "tests"
+        ) as directory:
+            path = pathlib.Path(directory) / "000016.csv"
+            state = _FetchStateSpy()
+            error = AttributeError("'str' object has no attribute 'date'")
+            with patch.object(worker, "fetch_a_stock_daily", side_effect=error) as fetch:
+                result = self._fetch(path, state, response=error, patch_fetch=False)
+
+        self.assertEqual(result[0:2], ("000016", False))
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(state.failures[0][1]["failure_class"], "upstream_error")
+
+    def test_all_sources_failed_class_is_passed_through(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="stock-worker-", dir=ROOT / "tests"
+        ) as directory:
+            path = pathlib.Path(directory) / "000016.csv"
+            state = _FetchStateSpy()
+            error = RuntimeError("000016 所有数据源均失败: KeyError 'date'")
+            error.failure_class = "all_sources_failed"
+            error.deterministic = True
+            with patch.object(worker, "fetch_a_stock_daily", side_effect=error) as fetch:
+                result = self._fetch(path, state, response=error, patch_fetch=False)
+
+        self.assertEqual(result[0:2], ("000016", False))
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(
+            state.failures[0][1]["failure_class"], "all_sources_failed"
+        )
+
+    def test_transient_exception_still_uses_backoff_retries(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="stock-worker-", dir=ROOT / "tests"
+        ) as directory:
+            path = pathlib.Path(directory) / "000016.csv"
+            state = _FetchStateSpy()
+            error = ConnectionError("boom")
+            with patch.object(worker, "fetch_a_stock_daily", side_effect=error) as fetch:
+                result = self._fetch(path, state, response=error, patch_fetch=False)
+
+        self.assertEqual(result[0:2], ("000016", False))
+        self.assertEqual(fetch.call_count, 4)
+        self.assertEqual(state.failures[0][1]["failure_class"], "upstream_error")
+
     def test_cached_lifecycle_snapshot_defers_candidates_it_did_not_check(self) -> None:
         state = _LifecycleStateSpy(["000001", "000002"])
         snapshot = {

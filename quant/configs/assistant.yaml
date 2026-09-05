@@ -76,6 +76,11 @@ research:
   stock_label_horizon: 20
   stock_topk: 3
   weight_strategy: equal_score
+  # 海选原则（有能者居之）：个股目标权重只能由全市场筛选
+  # （未指定 symbols 的全量研究）产生的排名给出；定向单票研究
+  # 只输出信号与门槛，不产生买入权重。入选者个体 qlib 得分必须为正。
+  require_full_universe_for_weights: true
+  min_qlib_score_for_weights: 0.0
   technical_lookback_days: 260
   hypothetical_capital: 100000.0
   refresh_modes:
@@ -124,16 +129,19 @@ model:
   early_stopping_rounds: 30
 
 dataset:
-  start_time: "2020-01-02"
-  fit_start_time: "2020-04-01"
-  fit_end_time: "2022-12-28"
+  # 2026-09 前滚：原窗口 2020→2022 训练数据陈旧三年半，且全宇宙 Alpha158
+  # 特征矩阵 7.8M 行（4.59 GiB）超出 16GB 内存（MemoryError 实证）。
+  # 前滚到 2023→2026 后约 4.1M 行（~2.4 GiB），内存可容纳且数据新鲜。
+  start_time: "2023-01-03"
+  fit_start_time: "2023-04-01"
+  fit_end_time: "2025-09-30"
   segments:
     train:
-      - "2020-04-01"
-      - "2022-12-28"
+      - "2023-04-01"
+      - "2025-09-30"
     valid:
-      - "2023-01-03"
-      - "2024-06-26"
+      - "2025-10-09"
+      - "2026-03-31"
     test:
-      - "2024-07-01"
+      - "2026-04-01"
       - "2099-12-31"

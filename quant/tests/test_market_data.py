@@ -75,6 +75,38 @@ class NormalizeDailyBarsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing required columns"):
             normalize_daily_bars(frame, source="broken")
 
+    def test_drops_nonpositive_price_rows_and_records_anomaly(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "date": ["2019-05-22", "2019-05-23", "2019-05-24"],
+                "open": [1.0, 0.0, 1.1],
+                "high": [1.2, 0.0, 1.3],
+                "low": [0.9, 0.0, 1.0],
+                "close": [1.1, 0.0, 1.2],
+                "volume": [100, 200, 300],
+            }
+        )
+
+        result = normalize_daily_bars(frame, source="test")
+
+        self.assertEqual(result["date"].dt.strftime("%Y-%m-%d").tolist(), ["2019-05-22", "2019-05-24"])
+        self.assertEqual(result.attrs["field_anomalies"]["price_nonpositive"], {"dropped_rows": 1})
+
+    def test_all_nonpositive_prices_raise_empty_response(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "date": ["2019-05-23", "2019-07-12"],
+                "open": [0.0, 0.0],
+                "high": [0.0, 0.0],
+                "low": [0.0, 0.0],
+                "close": [0.0, 0.0],
+                "volume": [100, 200],
+            }
+        )
+
+        with self.assertRaises(EmptyDailyBarResponse):
+            normalize_daily_bars(frame, source="test")
+
     def test_merges_consistent_duplicate_alias_columns(self) -> None:
         frame = pd.DataFrame(
             {

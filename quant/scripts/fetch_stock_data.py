@@ -21,7 +21,11 @@ import pandas as pd
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from data_source import NoDailyBarsError, fetch_a_stock_daily
+from data_source import (
+    _DETERMINISTIC_EXCEPTIONS,
+    NoDailyBarsError,
+    fetch_a_stock_daily,
+)
 from market_data import DailyBarSchemaError
 from fetch_state import DEFAULT_DB_PATH, FetchState
 from fetch_utils import (
@@ -282,7 +286,15 @@ def _fetch_one(
             break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-            failure_info = {"failure_class": "upstream_error"}
+            failure_info = {
+                "failure_class": getattr(exc, "failure_class", None) or "upstream_error"
+            }
+            deterministic = isinstance(exc, _DETERMINISTIC_EXCEPTIONS) or getattr(
+                exc, "deterministic", False
+            )
+            if deterministic:
+                # 解析类异常秒级重试不会改变结果：不烧退避预算，交给下一波次
+                break
             if attempt < attempts:
                 delay = min(
                     backoff_max,
