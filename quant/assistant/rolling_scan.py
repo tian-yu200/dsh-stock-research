@@ -10,10 +10,15 @@
   的完整研究，本模块输出一律标记 ``preliminary: true``。
 - 只以只读方式访问 fetch_state.sqlite3 的 assets 表判断"哪些票已成功、
   数据截止日是否更新"，不参与抓取队列写入，避免与抓取进程竞争。
-- 数据行变更（data_end_date 变化）触发重算，未变则沿用已有得分。
+- 数据行变更（data_end_date / rows / source 任一变化）触发重算：CSV 被整体重写
+  （如跨源复权基准切换）时 data_end_date 往往不变，只有内容指纹能识别，
+  这是 2026-09-02 毒分数事故（499 条 r20=31756% 的分数永不重算）的教训。
+- 快照按 data_end_date 相对全市场基准交易日的滞后分层层展示覆盖率；
+  落后 >= max_trading_lag_days 个交易日的标的踢出海选池。
 """
 from __future__ import annotations
 
+import bisect
 import json
 import sqlite3
 import sys
@@ -49,6 +54,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "stale_after_days": 15,
     "max_symbols_per_pass": 800,
     "score_table_limit": 500,
+    # 行情新鲜度：落后基准交易日达到该数值的标的踢出海选池。
+    "max_trading_lag_days": 2,
+    # 物理合理性门槛：A股日线（后复权）不可能出现的常态外数值，
+    # 一旦出现几乎必然是复权基准断裂残留（2026-09-02 事故特征）。
+    "max_abs_return_20d": 1.5,
+    "max_abs_return_60d": 1.5,
+    "max_volatility_60d": 3.0,
 }
 
 SCORE_FIELDS = (
@@ -142,7 +154,7 @@ def _read_state(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
             dict(row)
             for row in connection.execute(
                 """
-                SELECT asset_type, symbol, data_end_date FROM assets
+                SELECT asset_type, symbol, data_end_date, rows, source FROM assets
                 WHERE status = 'success'
                 ORDER BY asset_type, symbol
                 """
@@ -195,6 +207,7 @@ class RollingScanStore:
                     name TEXT,
                     quality_status TEXT,
                     analyzed_at TEXT NOT NULL,
+                    source TEXT,
                     trend_score REAL,
                     return_20d REAL,
                     return_60d REAL,
@@ -228,6 +241,12 @@ class RollingScanStore:
                 );
                 """
             )
+            # 2026-09 事故后新增的内容指纹列：旧库平滑迁移。
+            existing_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(scores)")
+            }
+            if "source" not in existing_columns:
+                connection.execute("ALTER TABLE scores ADD COLUMN source TEXT")
 
     def scored_end_dates(self) -> dict[tuple[str, str], str | None]:
         with self._connect() as connection:
@@ -236,6 +255,27 @@ class RollingScanStore:
             ).fetchall()
         return {
             (str(row["asset_type"]), str(row["symbol"])): row["data_end_date"]
+            for row in rows
+        }
+
+    def scored_fingerprints(
+        self,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """已打分标的的内容指纹（end_date + rows + source）。
+
+        重写 CSV（如跨源复权基准切换）常常不改变 data_end_date，
+        只有 rows/source 能识别"同末日期、不同内容"的毒分数。
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT asset_type, symbol, data_end_date, rows, source FROM scores"
+            ).fetchall()
+        return {
+            (str(row["asset_type"]), str(row["symbol"])): {
+                "end_date": row["data_end_date"],
+                "rows": row["rows"],
+                "source": row["source"],
+            }
             for row in rows
         }
 
@@ -256,6 +296,7 @@ class RollingScanStore:
             "name",
             "quality_status",
             "analyzed_at",
+            "source",
             *SCORE_FIELDS,
         ]
         statement = """
@@ -335,6 +376,133 @@ class RollingScanStore:
             )
 
 
+def _cached_calendar_dates(basis: str) -> set[str]:
+    """读取本地交易日历缓存（只读、不联网）；缺失或未覆盖基准日时返回空集。
+
+    交易日历缓存在量化内核里可随时离线重建（scripts/trading_calendar.py），
+    所以这里宁可退化为"用全市场观测日期近似交易日"，也不引入网络依赖。
+    """
+    path = Path(__file__).resolve().parents[1] / "data" / "benchmarks" / "trade_calendar.csv"
+    try:
+        raw = pd.read_csv(path)
+    except Exception:
+        return set()
+    values = pd.to_datetime(raw.iloc[:, 0], errors="coerce").dropna()
+    dates = sorted({value.strftime("%Y-%m-%d") for value in values})
+    if not dates or dates[-1] < basis:
+        return set()
+    return {value for value in dates if value <= basis}
+
+
+def _trading_lag_map(
+    state_rows: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> tuple[str | None, dict[tuple[str, str], int], str]:
+    """计算每只标的相对全市场基准交易日的交易日滞后。
+
+    基准日 = 池内资产类型（股票/ETF）已成功标的的最大 data_end_date。
+    返回 ``(基准日, {(asset_type, symbol): lag}, 日历来源)``。
+    """
+    pool_types = {str(value) for value in settings["pool_asset_types"]}
+    dated = [row for row in state_rows if row.get("data_end_date")]
+    if not dated:
+        return None, {}, "none"
+    pool_dates = [
+        str(row["data_end_date"]) for row in dated if str(row["asset_type"]) in pool_types
+    ]
+    basis = max(pool_dates, default=max(str(row["data_end_date"]) for row in dated))
+    observed = {str(row["data_end_date"]) for row in dated}
+    calendar = _cached_calendar_dates(basis)
+    union = sorted(calendar | observed)
+    if basis not in union:
+        union.append(basis)
+        union.sort()
+    index_by_date = {value: position for position, value in enumerate(union)}
+    basis_position = index_by_date[basis]
+    lags: dict[tuple[str, str], int] = {}
+    for row in dated:
+        value = str(row["data_end_date"])
+        position = index_by_date.get(value)
+        if position is None:
+            position = bisect.bisect_left(union, value)
+        lags[(str(row["asset_type"]), str(row["symbol"]))] = max(0, basis_position - position)
+    return basis, lags, "calendar_cache" if calendar else "observed_only"
+
+
+_FRESHNESS_LAYERS: tuple[tuple[str, str, int, int | None], ...] = (
+    ("current", "当日", 0, 0),
+    ("lag1", "落后1个交易日", 1, 1),
+    ("lag2", "落后2个交易日", 2, 2),
+    ("lag3_4", "落后3-4个交易日", 3, 4),
+    ("lag5_plus", "落后5个交易日以上", 5, None),
+)
+
+
+def _freshness_summary(
+    state_rows: list[dict[str, Any]],
+    lags: dict[tuple[str, str], int],
+    basis: str | None,
+    calendar_source: str,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """按 data_end_date 滞后分层汇总覆盖率（供界面展示与告警）。"""
+    max_lag = int(settings["max_trading_lag_days"])
+    total = len(state_rows)
+
+    def bucket(lag: int | None) -> str:
+        if lag is None:
+            return "unknown"
+        for key, _, low, high in _FRESHNESS_LAYERS:
+            if lag >= low and (high is None or lag <= high):
+                return key
+        return "unknown"
+
+    counts: dict[str, int] = {key: 0 for key, _, _, _ in _FRESHNESS_LAYERS}
+    counts["unknown"] = 0
+    by_type: dict[str, dict[str, int]] = {}
+    stale_count = 0
+    for row in state_rows:
+        asset_type = str(row["asset_type"])
+        lag = lags.get((asset_type, str(row["symbol"])))
+        if lag is not None and lag >= max_lag:
+            stale_count += 1
+        key = bucket(lag)
+        counts[key] += 1
+        by_type.setdefault(asset_type, {})[key] = by_type.get(asset_type, {}).get(key, 0) + 1
+    layers = [
+        {
+            "key": key,
+            "label": label,
+            "min_lag": low,
+            "max_lag": high,
+            "count": counts[key],
+            "ratio": round(counts[key] / total, 4) if total else 0.0,
+        }
+        for key, label, low, high in _FRESHNESS_LAYERS
+    ]
+    layers.append(
+        {
+            "key": "unknown",
+            "label": "日期缺失",
+            "min_lag": None,
+            "max_lag": None,
+            "count": counts["unknown"],
+            "ratio": round(counts["unknown"] / total, 4) if total else 0.0,
+        }
+    )
+    return {
+        "basis_date": basis,
+        "basis_note": "池内资产类型已成功标的的最大 data_end_date",
+        "calendar_source": calendar_source,
+        "total": total,
+        "stale_after_trading_days": max_lag,
+        "stale_count": stale_count,
+        "stale_ratio": round(stale_count / total, 4) if total else 0.0,
+        "layers": layers,
+        "by_asset_type": by_type,
+    }
+
+
 def _analyze_one(
     row: dict[str, Any],
     names: dict[str, str],
@@ -349,6 +517,7 @@ def _analyze_one(
         "name": names.get(symbol),
         "quality_status": None,
         "analyzed_at": utc_now_iso(),
+        "source": row.get("source"),
         **{field: None for field in SCORE_FIELDS},
     }
     try:
@@ -376,17 +545,20 @@ def _rank_scores(
     rows: list[dict[str, Any]],
     settings: dict[str, Any],
     today: date,
+    lags: dict[tuple[str, str], int] | None = None,
 ) -> dict[str, tuple[list[dict[str, Any]], dict[str, str]]]:
     """Rank eligible rows within each pool asset type by trend_score.
 
     Returns ``{asset_type: (ranked_rows, ineligibility_reasons)}`` so every
     pool type opens its own top-N once it has enough eligible samples.
     """
+    lags = lags or {}
     return {
         str(asset_type): _rank_one_type(
             [dict(row) for row in rows if str(row["asset_type"]) == str(asset_type)],
             settings,
             today,
+            lags,
         )
         for asset_type in settings["pool_asset_types"]
     }
@@ -396,10 +568,13 @@ def _rank_one_type(
     rows: list[dict[str, Any]],
     settings: dict[str, Any],
     today: date,
+    lags: dict[tuple[str, str], int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     min_rows = int(settings["min_rows"])
     min_amount = float(settings["min_average_amount_20d"])
     stale_after = int(settings["stale_after_days"])
+    max_trading_lag = int(settings["max_trading_lag_days"])
+    lags = lags or {}
     eligible: list[dict[str, Any]] = []
     ineligible: dict[str, str] = {}
     for row in rows:
@@ -418,9 +593,27 @@ def _rank_one_type(
                 age = None
         if age is None or age > stale_after:
             reasons.append("数据过期")
+        lag = lags.get((str(row["asset_type"]), str(row["symbol"])))
+        if lag is not None and lag >= max_trading_lag:
+            reasons.append(f"行情落后 {lag} 个交易日")
         amount = row.get("average_amount_20d")
         if amount is None or float(amount) < min_amount:
             reasons.append(f"20日日均成交额低于 {min_amount:.0f} 元")
+        # 物理合理性门槛：后复权日线不可能出现的常态外数值，几乎必然是
+        # 复权基准断裂残留（2026-09-02 事故），绝不能当成趋势机会。
+        for field, limit, label in (
+            ("return_20d", settings["max_abs_return_20d"], "20日收益"),
+            ("return_60d", settings["max_abs_return_60d"], "60日收益"),
+        ):
+            value = row.get(field)
+            if value is not None and abs(float(value)) > float(limit):
+                reasons.append(f"{label}超出物理合理范围")
+        volatility = row.get("volatility_60d_annualized")
+        if (
+            volatility is not None
+            and float(volatility) > float(settings["max_volatility_60d"])
+        ):
+            reasons.append("60日波动率超出物理合理范围")
         if reasons:
             ineligible[key] = "；".join(reasons)
         else:
@@ -431,7 +624,11 @@ def _rank_one_type(
     return eligible, ineligible
 
 
-def _pool_item(row: dict[str, Any], rank: int) -> dict[str, Any]:
+def _pool_item(
+    row: dict[str, Any],
+    rank: int,
+    lag: int | None = None,
+) -> dict[str, Any]:
     item: dict[str, Any] = {
         "rank": rank,
         "asset_type": row["asset_type"],
@@ -444,9 +641,36 @@ def _pool_item(row: dict[str, Any], rank: int) -> dict[str, Any]:
             "data_end_date": row.get("data_end_date"),
             "rows": row.get("rows"),
             "analyzed_at": row.get("analyzed_at"),
+            "trading_lag_days": lag,
         }
     )
     return item
+
+
+def _fingerprint_changed(
+    fingerprint: dict[str, Any] | None,
+    state_row: dict[str, Any],
+) -> bool:
+    """判断已打分指纹与抓取状态是否不一致（不一致则需要重算）。
+
+    只在两侧都有值时比较 rows/source：NULL 侧（历史记录或异常记录）
+    不参与比较，避免错误记录每轮 pass 被无意义地重算。
+    """
+    if fingerprint is None:
+        return True
+    if fingerprint.get("end_date") != state_row.get("data_end_date"):
+        return True
+    scored_rows = fingerprint.get("rows")
+    state_rows_count = state_row.get("rows")
+    if scored_rows is not None and state_rows_count is not None:
+        if int(scored_rows) != int(state_rows_count):
+            return True
+    scored_source = fingerprint.get("source")
+    state_source = state_row.get("source")
+    if scored_source is not None and state_source is not None:
+        if str(scored_source) != str(state_source):
+            return True
+    return False
 
 
 def run_rolling_pass(
@@ -457,16 +681,19 @@ def run_rolling_pass(
 ) -> dict[str, Any]:
     """Run one incremental rolling-scan pass and publish the snapshot.
 
-    Analyzes symbols whose fetch succeeded and whose ``data_end_date`` changed
-    since the last pass, re-ranks the eligible subset, diffs the pool against
-    the previous pass to append enter/exit events, and atomically rewrites the
-    rolling snapshot JSON. Never touches the fetch queue.
+    Analyzes symbols whose fetch succeeded and whose data fingerprint
+    (``data_end_date`` + ``rows`` + ``source``) changed since the last pass,
+    re-ranks the eligible subset, diffs the pool against the previous pass to
+    append enter/exit events, and atomically rewrites the rolling snapshot
+    JSON. Never touches the fetch queue.
     """
     config = config or research.load_config()
     settings = _settings(config)
     started = time.monotonic()
     state_rows, totals = _read_state(fixed_path(config["fetch"]["state_db"]))
     coverage = _coverage(totals)
+    basis_date, lags, calendar_source = _trading_lag_map(state_rows, settings)
+    freshness = _freshness_summary(state_rows, lags, basis_date, calendar_source, settings)
     store = RollingScanStore(fixed_path(settings["state_db"]))
 
     try:
@@ -478,12 +705,11 @@ def run_rolling_pass(
         for asset_type in ("stock", "etf", "otc_fund")
     }
 
-    scored = store.scored_end_dates()
+    scored = store.scored_fingerprints()
     pending = [
         row
         for row in state_rows
-        if scored.get((str(row["asset_type"]), str(row["symbol"])))
-        != row.get("data_end_date")
+        if _fingerprint_changed(scored.get((str(row["asset_type"]), str(row["symbol"]))), row)
     ]
     # 池内资产类型优先分析，避免被未入池类型（如场外基金）的大批积压饿死。
     pool_first = {str(value) for value in settings["pool_asset_types"]}
@@ -501,7 +727,9 @@ def run_rolling_pass(
     store.upsert_scores(analyzed)
 
     all_rows = store.all_scores()
-    ranking = _rank_scores(all_rows, settings, datetime.now(timezone.utc).date())
+    ranking = _rank_scores(
+        all_rows, settings, datetime.now(timezone.utc).date(), lags
+    )
     min_sample = int(settings["min_sample"])
     pool_size = int(settings["pool_size"])
     eligible_count = sum(len(ranked) for ranked, _ in ranking.values())
@@ -603,16 +831,26 @@ def run_rolling_pass(
         "analyzed_this_pass": len(analyzed),
         "pending_remaining": pending_total - len(selected),
         "pool": [
-            _pool_item(rows_by_key[key], rank_by_key[key]) for key in pool_keys
+            _pool_item(
+                rows_by_key[key],
+                rank_by_key[key],
+                lags.get((key.split(":", 1)[0], key.split(":", 1)[1])),
+            )
+            for key in pool_keys
         ],
         "recent_events": store.recent_events(_EVENT_HISTORY_LIMIT),
         "score_table": [
-            _pool_item(row, rank)
+            _pool_item(
+                row,
+                rank,
+                lags.get((str(row["asset_type"]), str(row["symbol"]))),
+            )
             for asset_type, (ranked, _) in ranking.items()
             for rank, row in enumerate(
                 ranked[: int(settings["score_table_limit"])], start=1
             )
         ],
+        "freshness": freshness,
         "settings": {
             key: settings[key]
             for key in (
@@ -622,6 +860,10 @@ def run_rolling_pass(
                 "min_rows",
                 "min_average_amount_20d",
                 "stale_after_days",
+                "max_trading_lag_days",
+                "max_abs_return_20d",
+                "max_abs_return_60d",
+                "max_volatility_60d",
             )
         },
         "disclaimer": (
@@ -642,6 +884,7 @@ def run_rolling_pass(
         "pool_size": len(pool_keys),
         "events_added": len(events),
         "coverage": coverage,
+        "freshness": freshness,
         "snapshot_path": str(snapshot_path),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }

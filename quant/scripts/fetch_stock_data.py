@@ -29,6 +29,7 @@ from data_source import (
 from market_data import DailyBarSchemaError
 from fetch_state import DEFAULT_DB_PATH, FetchState
 from fetch_utils import (
+    BaselineDiscontinuityError,
     RateLimiter,
     atomic_write_frame,
     atomic_write_json,
@@ -216,6 +217,7 @@ def _fetch_one(
     last_error: str | None = None
     confirmed_empty = False
     failure_info: dict[str, Any] | None = None
+    discont_backup: pathlib.Path | None = None
     for attempt in range(1, attempts + 1):
         if deadline is not None and time.monotonic() >= deadline:
             last_error = "worker deadline reached before next request"
@@ -229,6 +231,9 @@ def _fetch_one(
                 break
             frame = fetch_a_stock_daily(code, start=start, end=end)
             metadata = _write_success(code, frame, path)
+            if discont_backup is not None:
+                # 全量重取已成功替换坏历史，备份可以丢弃
+                discont_backup.unlink(missing_ok=True)
             state.mark_success(
                 "stock",
                 code,
@@ -284,6 +289,18 @@ def _fetch_one(
             # 用 24 小时退避，避免每轮 wave 都重新确认全部死代码。
             confirmed_empty = True
             break
+        except BaselineDiscontinuityError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            failure_info = {"failure_class": exc.failure_class}
+            if discont_backup is None:
+                # 拼接基准断裂：本地历史不可信（2026-09-02 毒数据事故根源）。
+                # 把 CSV 挪开，降级为同源全量重取一次；挪开后 merge 无既有序列
+                # 可比，守卫自然放行干净的全量序列。
+                discont_backup = path.with_name(path.name + ".discont.bak")
+                os.replace(path, discont_backup)
+                start = next_start_date(None, "20200101")
+                continue
+            break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             failure_info = {
@@ -309,6 +326,9 @@ def _fetch_one(
                     delay = min(delay, remaining)
                 if delay:
                     time.sleep(delay)
+    if discont_backup is not None and discont_backup.exists():
+        # 全量重取没有完成（deadline/网络失败）：还原现场，下一波次从头再来
+        os.replace(discont_backup, path)
     if confirmed_empty:
         failure_backoff_base = failure_backoff_max = 86400
     else:

@@ -196,7 +196,9 @@ def normalize_daily_bars(frame: pd.DataFrame, *, source: str = "unknown") -> pd.
             field_anomalies={"volume": {"negative_rows": invalid_count}},
         )
 
-    data = data.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    # kind="stable"：同日期重复行保持拼接顺序，keep="last" 才能确定性地
+    # 保留新抓的行（快速排序对重复键的次序不确定，增量修订会被随机丢弃）。
+    data = data.sort_values("date", kind="stable").drop_duplicates("date", keep="last").reset_index(drop=True)
     if field_anomalies:
         data.attrs["field_anomalies"] = field_anomalies
     return data

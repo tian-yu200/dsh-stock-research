@@ -324,6 +324,7 @@ def get_rolling_scan(
             "updated_at",
             "job_id",
             "coverage",
+            "freshness",
             "scored_total",
             "eligible_count",
             "analyzed_this_pass",

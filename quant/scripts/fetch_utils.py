@@ -21,6 +21,28 @@ except ImportError:  # pragma: no cover - AkShare normally brings requests
 
 UTC = timezone.utc
 
+# 基准连续性守卫阈值（2026-09-02 毒数据事故的防线，见 quant/docs/研究管线不变量.md）
+# 相邻交易日收盘比值超过该值视为复权基准断裂（跨源拼接的 60 倍台阶特征）。
+BASIS_STEP_RATIO = 1.5
+# 重叠日期收盘比值中位数偏离超过该值视为两段序列口径不一致。
+BASIS_OVERLAP_MEDIAN_DEVIATION = 0.10
+BASIS_OVERLAP_MIN_DATES = 3
+
+
+class BaselineDiscontinuityError(RuntimeError):
+    """增量拼接的前后收盘价基准断裂（跨源/复权口径切换特征）。
+
+    实证：2026-09-02 部分标的在东财/腾讯失败后落到新浪后复权通道，
+    ~200 元的新行被拼到 ~3 元历史上，60 倍台阶毒化全部下游指标。
+    调用方（fetch_stock_data / fetch_fund_data）捕获后应把本地 CSV
+    挪开并降级为同源全量重取，而不是把拼接结果写盘。
+    """
+
+    def __init__(self, source: str, detail: str) -> None:
+        self.failure_class = "baseline_discontinuity"
+        self.deterministic = True
+        super().__init__(f"{source}: {detail}")
+
 
 class FundNavValidationError(ValueError):
     """Deterministic OTC NAV schema or value validation failure."""
@@ -156,6 +178,56 @@ def atomic_write_json(value: Any, path: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def assert_basis_continuity(
+    existing: pd.DataFrame,
+    combined: pd.DataFrame,
+    *,
+    source: str,
+    symbol: str,
+) -> None:
+    """校验拼接边界与重叠日期的收盘价基准连续性，断裂时抛异常拒写。
+
+    ``existing`` 与 ``combined`` 都应是 ``normalize_daily_bars`` 的输出
+    （已排序去重、date/close 列名规范）。两道检查：
+    1. 边界台阶：existing 末行 close 与 combined 首个新增日期 close 的比值
+       超出 ``[1/BASIS_STEP_RATIO, BASIS_STEP_RATIO]`` → 断裂；
+    2. 重叠日期：两段序列同日收盘比值中位数偏离超过
+       ``BASIS_OVERLAP_MEDIAN_DEVIATION`` → 口径不一致。
+    """
+    if existing is None or existing.empty or combined is None or combined.empty:
+        return
+    cut = existing["date"].max()
+    new_rows = combined[combined["date"] > cut]
+    prev_rows = combined[combined["date"] <= cut]
+    if not new_rows.empty and not prev_rows.empty:
+        prev_close = float(prev_rows["close"].iloc[-1])
+        first_close = float(new_rows["close"].iloc[0])
+        if prev_close > 0 and first_close > 0:
+            ratio = first_close / prev_close
+            if ratio > BASIS_STEP_RATIO or ratio < 1.0 / BASIS_STEP_RATIO:
+                prev_date = pd.Timestamp(prev_rows["date"].iloc[-1]).date().isoformat()
+                new_date = pd.Timestamp(new_rows["date"].iloc[0]).date().isoformat()
+                raise BaselineDiscontinuityError(
+                    source,
+                    f"拼接边界基准断裂 close {prev_close:.4g}({prev_date}) -> "
+                    f"{first_close:.4g}({new_date})，比值 {ratio:.2f} "
+                    f"超出 [{1.0 / BASIS_STEP_RATIO:.2f}, {BASIS_STEP_RATIO:.2f}]",
+                )
+    shared = existing.merge(combined, on="date", suffixes=("_old", "_new"))
+    shared = shared.dropna(subset=["close_old", "close_new"])
+    shared = shared[(shared["close_old"] > 0) & (shared["close_new"] > 0)]
+    if len(shared) < BASIS_OVERLAP_MIN_DATES:
+        return
+    deviation = (shared["close_new"] / shared["close_old"] - 1.0).abs()
+    median_deviation = float(deviation.median())
+    if median_deviation > BASIS_OVERLAP_MEDIAN_DEVIATION:
+        raise BaselineDiscontinuityError(
+            source,
+            f"重叠日期收盘中位偏离 {median_deviation:.2%} 超过 "
+            f"{BASIS_OVERLAP_MEDIAN_DEVIATION:.0%}（{len(shared)} 个重叠日，疑似口径切换）",
+        )
+
+
 def merge_daily_frames(
     existing_path: Path,
     incoming: pd.DataFrame,
@@ -169,8 +241,24 @@ def merge_daily_frames(
             existing = pd.DataFrame()
         combined = pd.concat([existing, incoming], ignore_index=True)
     else:
+        existing = pd.DataFrame()
         combined = incoming.copy()
     result = normalize_daily_bars(combined, source=source)
+    if not existing.empty:
+        # 基准连续性守卫：在写盘前拦下跨源/跨口径拼接（毒数据事故根源）。
+        # normalize 会重排日期，所以用整体归一后的 existing 对照 combined；
+        # 守卫自身异常不阻断正常抓取，只有基准断裂才拒写。
+        try:
+            assert_basis_continuity(
+                normalize_daily_bars(existing, source=source),
+                result,
+                source=source,
+                symbol=existing_path.stem,
+            )
+        except BaselineDiscontinuityError:
+            raise
+        except Exception as _guard_exc:
+            print("  [" + existing_path.stem + "] 基准连续性守卫跳过: " + type(_guard_exc).__name__)
     try:
         from price_guards import validate_daily_bars as _pg_validate
         from price_guards import write_quarantine as _pg_quarantine

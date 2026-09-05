@@ -107,6 +107,17 @@ def validate_daily_bars(frame, *, source="", symbol=""):
         med = median(kept_ratio[-60:]) if len(kept_ratio) >= 20 else None
         dev = abs(ratio / med - 1.0) if (ratio and med) else 0.0
         big_gap = abs(gap) > thr
+        # 开盘缺失（新浪通道已知形态：open=0/NaN）时 gap 恒为 0 或 NaN，
+        # 跳变检测被整体绕过——2026-09-02 基准断裂正是借这条通道进入。
+        # 此时退化为 close-to-close 检测（同一阈值、同一停牌豁免），
+        # 开盘正常的行判定路径完全不变。
+        open_missing = (not o) or o != o
+        if prev_close and c and open_missing:
+            close_jump = abs(c / prev_close - 1.0)
+            if close_jump != close_jump:
+                close_jump = 0.0
+        else:
+            close_jump = 0.0
         verdict, why = "keep", []
         if big_gap:
             try:
@@ -127,9 +138,18 @@ def validate_daily_bars(frame, *, source="", symbol=""):
                     why.append("exdiv_confirmed")
                 else:
                     verdict, why = "quarantine", ["gap_down_unconfirmed"]
+        elif close_jump > thr:
+            try:
+                day_gap = (pd.Timestamp(ds) - pd.Timestamp(prev_date)).days if prev_date else 1
+            except Exception:
+                day_gap = 1
+            if day_gap > 10:
+                why.append("halt_resume_unjudged")
+            else:
+                verdict, why = "quarantine", ["close_jump_scale_break"]
         if verdict == "quarantine":
             keep[i] = False
-            reasons.append({"date": ds, "symbol": symbol, "source": source, "reasons": why, "gap": round(gap, 4), "deviation": round(dev, 4)})
+            reasons.append({"date": ds, "symbol": symbol, "source": source, "reasons": why, "gap": round(close_jump if close_jump else gap, 4), "deviation": round(dev, 4)})
             continue
         if ratio and ratio == ratio:
             kept_ratio.append(ratio)

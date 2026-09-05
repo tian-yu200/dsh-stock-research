@@ -553,5 +553,99 @@ class PriceGuardsTests(unittest.TestCase):
         self.assertEqual(len(bad), 0)
         self.assertEqual(len(clean), 3)
 
+
+
+    def test_duplicate_dates_keep_last_row_deterministically(self):
+        # 回归：快速排序对重复日期键不稳定，keep="last" 曾随机保留旧行，
+        # 增量修订会被静默丢弃（2026-09 重叠口径事故的隐患之一）。
+        dates = [f"2026-01-{day:02d}" for day in range(1, 29)]
+        existing = pd.DataFrame(
+            {
+                "date": dates,
+                "open": [3.0] * 28,
+                "high": [3.1] * 28,
+                "low": [2.9] * 28,
+                "close": [3.0] * 28,
+                "volume": [1000.0] * 28,
+                "amount": [3000.0] * 28,
+                "turnover": [1.0] * 28,
+            }
+        )
+        revision = existing.tail(14).copy()
+        revision["close"] = 200.0
+        normalized = normalize_daily_bars(
+            pd.concat([existing, revision], ignore_index=True), source="unit"
+        )
+        closes = dict(zip(normalized["date"].dt.strftime("%Y-%m-%d"), normalized["close"]))
+        revised = [value for key, value in closes.items() if key >= "2026-01-15"]
+        self.assertTrue(all(value == 200.0 for value in revised))
+
+
+class PriceGuardCloseJumpTests(unittest.TestCase):
+    """开盘缺失（open=0/NaN）时退化 close-to-close 跳变检测（2026-09 事故盲区）。"""
+
+    @staticmethod
+    def _frame(closes, opens, dates):
+        return pd.DataFrame(
+            {
+                "date": dates,
+                "open": opens,
+                "high": [max(o, c) * 1.01 for o, c in zip(opens, closes)],
+                "low": [min(o, c) * 0.99 for o, c in zip(opens, closes)],
+                "close": closes,
+                "volume": [1000.0] * len(closes),
+                "amount": [c * 1000.0 for c in closes],
+                "turnover": [1.0] * len(closes),
+            }
+        )
+
+    def _history(self):
+        dates = list(pd.bdate_range("2026-01-05", periods=20).strftime("%Y-%m-%d"))
+        return self._frame([3.0] * 20, [3.03] * 20, dates)
+
+    def test_zero_open_with_basis_jump_is_quarantined(self):
+        from price_guards import validate_daily_bars
+        poison = self._frame([200.0], [0.0], ["2026-02-02"])
+        clean, bad, reasons = validate_daily_bars(
+            pd.concat([self._history(), poison], ignore_index=True),
+            source="unit",
+            symbol="600654",
+        )
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(reasons[-1]["reasons"], ["close_jump_scale_break"])
+
+    def test_nan_open_with_basis_jump_is_quarantined(self):
+        from price_guards import validate_daily_bars
+        poison = self._frame([200.0], [float("nan")], ["2026-02-02"])
+        clean, bad, reasons = validate_daily_bars(
+            pd.concat([self._history(), poison], ignore_index=True),
+            source="unit",
+            symbol="600654",
+        )
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(reasons[-1]["reasons"], ["close_jump_scale_break"])
+
+    def test_missing_open_with_normal_move_is_kept(self):
+        from price_guards import validate_daily_bars
+        normal = self._frame([3.03], [0.0], ["2026-02-02"])
+        clean, bad, _ = validate_daily_bars(
+            pd.concat([self._history(), normal], ignore_index=True),
+            source="unit",
+            symbol="600654",
+        )
+        self.assertEqual(len(bad), 0)
+        self.assertEqual(len(clean), 21)
+
+    def test_halt_resume_jump_with_missing_open_stays_exempt(self):
+        from price_guards import validate_daily_bars
+        # 距上一行超过 10 个自然日的停牌复牌：维持既有豁免语义
+        resume = self._frame([200.0], [0.0], ["2026-03-20"])
+        clean, bad, reasons = validate_daily_bars(
+            pd.concat([self._history(), resume], ignore_index=True),
+            source="unit",
+            symbol="600654",
+        )
+        self.assertEqual(len(bad), 0)
+
 if __name__ == "__main__":
     unittest.main()

@@ -433,5 +433,188 @@ class RollingScanTests(unittest.TestCase):
         self.assertEqual(compact["rolling_scan"]["pool_size"], 30)
 
 
+    def test_content_fingerprint_change_triggers_rescore(self) -> None:
+        """CSV 被整体重写（同 end_date、不同 rows/source）必须触发重算。
+
+        2026-09-02 毒分数事故：只比较 data_end_date 时，被跨源重写的
+        CSV 永远不会进 pending，毒分数原样复读进快照。
+        """
+        with tempfile.TemporaryDirectory(prefix="rolling-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            for symbol, drift in SYMBOL_DRIFTS.items():
+                _write_csv(root / "stocks", symbol, drift)
+            _make_state(root, list(SYMBOL_DRIFTS))
+            config = _config(root)
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                rolling_scan.run_rolling_pass("job-1", config=config)
+
+            # 模拟跨源重写：删中间一行（end_date 不变）、行数与来源变化
+            frame = pd.read_csv(root / "stocks" / "600000.csv")
+            frame.drop(frame.index[10]).to_csv(root / "stocks" / "600000.csv", index=False)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.mark_success(
+                "stock",
+                "600000",
+                data_end_date=END_DATE,
+                source="sina-hfq",
+                rows=259,
+                refresh_interval_seconds=86400,
+            )
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                summary = rolling_scan.run_rolling_pass("job-1", config=config)
+            self.assertEqual(summary["analyzed_this_pass"], 1)
+            store = rolling_scan.RollingScanStore(root / "rolling_scan.sqlite3")
+            row = {item["symbol"]: item for item in store.all_scores()}["600000"]
+            self.assertEqual(row["rows"], 259)
+            self.assertEqual(row["source"], "sina-hfq")
+
+            # 指纹一致后不再重算
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                repeat = rolling_scan.run_rolling_pass("job-1", config=config)
+            self.assertEqual(repeat["analyzed_this_pass"], 0)
+
+    def test_trading_lag_kicks_stale_symbols_from_pool(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rolling-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            for symbol, drift in SYMBOL_DRIFTS.items():
+                _write_csv(root / "stocks", symbol, drift)
+            _make_state(root, list(SYMBOL_DRIFTS))
+            config = _config(root)
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                rolling_scan.run_rolling_pass("job-1", config=config)
+
+            # 600000 停在 2 个交易日前、600001 停在 1 个交易日前：
+            # 台账与得分库同步改写，不触发重算，只在排名时按滞后剔除。
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.mark_success(
+                "stock", "600000",
+                data_end_date="2026-08-26", source="test", rows=260,
+                refresh_interval_seconds=86400,
+            )
+            state.mark_success(
+                "stock", "600001",
+                data_end_date="2026-08-27", source="test", rows=260,
+                refresh_interval_seconds=86400,
+            )
+            _execute_sql(root, "UPDATE scores SET data_end_date = '2026-08-26' WHERE symbol = '600000'")
+            _execute_sql(root, "UPDATE scores SET data_end_date = '2026-08-27' WHERE symbol = '600001'")
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                summary = rolling_scan.run_rolling_pass("job-1", config=config)
+            self.assertEqual(summary["analyzed_this_pass"], 0)
+
+            snapshot = json.loads((root / "rolling_scan.json").read_text(encoding="utf-8"))
+            self.assertNotIn("600000", [item["symbol"] for item in snapshot["pool"]])
+            self.assertIn("600001", [item["symbol"] for item in snapshot["pool"]])
+            store = rolling_scan.RollingScanStore(root / "rolling_scan.sqlite3")
+            events = {event["symbol"]: event for event in store.recent_events(10)}
+            self.assertEqual(events["600000"]["event"], "exit")
+            self.assertIn("行情落后 2 个交易日", events["600000"]["reason"])
+            # 落后 1 个交易日属于正常波动容差，仍在池内（enter 事件不受影响）
+            self.assertIn("600001", [item["symbol"] for item in snapshot["pool"]])
+
+    def test_freshness_layers_published_in_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rolling-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            for symbol, drift in SYMBOL_DRIFTS.items():
+                _write_csv(root / "stocks", symbol, drift)
+            _make_state(root, list(SYMBOL_DRIFTS))
+            config = _config(root)
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                rolling_scan.run_rolling_pass("job-1", config=config)
+            # 让 600000 的得分与台账一致地停在 2 个交易日前（不触发重算）
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.mark_success(
+                "stock", "600000",
+                data_end_date="2026-08-26", source="test", rows=260,
+                refresh_interval_seconds=86400,
+            )
+            _execute_sql(root, "UPDATE scores SET data_end_date = '2026-08-26' WHERE symbol = '600000'")
+            with patch.object(research, "DATA_DIR", root), patch.object(
+                research, "UNIVERSE_PATH", root / "universe.json"
+            ):
+                rolling_scan.run_rolling_pass("job-1", config=config)
+
+            snapshot = json.loads((root / "rolling_scan.json").read_text(encoding="utf-8"))
+            freshness = snapshot["freshness"]
+            self.assertEqual(freshness["basis_date"], END_DATE)
+            self.assertEqual(freshness["total"], 6)
+            self.assertEqual(freshness["stale_after_trading_days"], 2)
+            self.assertEqual(freshness["stale_count"], 1)
+            layer_keys = {layer["key"] for layer in freshness["layers"]}
+            self.assertEqual(
+                layer_keys,
+                {"current", "lag1", "lag2", "lag3_4", "lag5_plus", "unknown"},
+            )
+            counts = {layer["key"]: layer["count"] for layer in freshness["layers"]}
+            self.assertEqual(sum(counts.values()), 6)
+            self.assertEqual(counts["lag2"], 1)
+            self.assertEqual(freshness["by_asset_type"]["stock"]["lag2"], 1)
+
+    def test_plausibility_gate_excludes_impossible_metrics(self) -> None:
+        from datetime import date as date_type
+
+        settings = copy.deepcopy(rolling_scan.DEFAULT_SETTINGS)
+        today = date_type(2026, 9, 5)
+
+        def _row(symbol, **overrides):
+            row = {
+                "asset_type": "stock",
+                "symbol": symbol,
+                "trend_score": 0.5,
+                "rows": 260,
+                "data_end_date": END_DATE,
+                "average_amount_20d": 5e7,
+                "return_20d": 0.1,
+                "return_60d": 0.2,
+                "return_252d": 0.3,
+                "volatility_60d_annualized": 0.5,
+                "current_drawdown": -0.05,
+            }
+            row.update(overrides)
+            return row
+
+        # 毒分数形态：20 日收益 317 倍，绝不能入池
+        eligible, ineligible = rolling_scan._rank_one_type(
+            [_row("600000", return_20d=317.57)], settings, today, {}
+        )
+        self.assertEqual(eligible, [])
+        self.assertIn("20日收益超出物理合理范围", ineligible["stock:600000"])
+
+        eligible, ineligible = rolling_scan._rank_one_type(
+            [_row("600001", volatility_60d_annualized=6.57)], settings, today, {}
+        )
+        self.assertIn("60日波动率超出物理合理范围", ineligible["stock:600001"])
+
+        eligible, ineligible = rolling_scan._rank_one_type(
+            [_row("600002", return_60d=-9.9)], settings, today, {}
+        )
+        self.assertIn("60日收益超出物理合理范围", ineligible["stock:600002"])
+
+        # 正常数值不受影响
+        eligible, ineligible = rolling_scan._rank_one_type(
+            [_row("600003")], settings, today, {}
+        )
+        self.assertEqual([row["symbol"] for row in eligible], ["600003"])
+        self.assertNotIn("stock:600003", ineligible)
+
+        # 滞后标的被踢出（组合行为）
+        eligible, ineligible = rolling_scan._rank_one_type(
+            [_row("600004")], settings, today, {("stock", "600004"): 3}
+        )
+        self.assertIn("行情落后 3 个交易日", ineligible["stock:600004"])
+
+
 if __name__ == "__main__":
     unittest.main()

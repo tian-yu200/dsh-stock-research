@@ -21,6 +21,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from data_source import fetch_etf_daily, fetch_otc_fund_nav
 from fetch_state import DEFAULT_DB_PATH, FetchState
 from fetch_utils import (
+    BaselineDiscontinuityError,
     RateLimiter,
     atomic_write_frame,
     atomic_write_json,
@@ -303,6 +304,7 @@ def _fetch_one(
     end = target.replace("-", "")
     attempts = max(1, int(retries) + 1)
     last_error: str | None = None
+    discont_backup: pathlib.Path | None = None
     for attempt in range(1, attempts + 1):
         if deadline is not None and time.monotonic() >= deadline:
             last_error = "worker deadline reached before next request"
@@ -315,6 +317,8 @@ def _fetch_one(
                 else fetch_otc_fund_nav(code)
             )
             metadata = _write_success(kind, code, frame, path)
+            if discont_backup is not None:
+                discont_backup.unlink(missing_ok=True)
             state.mark_success(
                 kind,
                 code,
@@ -325,6 +329,15 @@ def _fetch_one(
                 owner=lease_owner,
             )
             return kind, code, True, metadata, None
+        except BaselineDiscontinuityError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if discont_backup is None:
+                # 拼接基准断裂：挪开本地历史，降级为同源全量重取一次
+                discont_backup = path.with_name(path.name + ".discont.bak")
+                os.replace(path, discont_backup)
+                start = next_start_date(None, "20200101")
+                continue
+            break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if isinstance(exc, FundNavValidationError):
@@ -346,6 +359,9 @@ def _fetch_one(
                         break
                 if delay:
                     time.sleep(delay)
+    if discont_backup is not None and discont_backup.exists():
+        # 全量重取没有完成：还原现场，下一波次从头再来
+        os.replace(discont_backup, path)
     state.mark_failure(
         kind,
         code,
