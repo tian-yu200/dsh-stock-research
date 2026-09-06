@@ -87,6 +87,9 @@ research:
   pool_exclude_st: true
   min_listing_age_calendar_days: 90
   min_avg_amount_20d: 10000000.0
+  # 用户规则（2026-09-06）：不配美股港股等境外敞口。按名称关键词剔除
+  # QDII/港股通类 ETF 与基金（标普/纳指/恒生/沪港深/全球/海外等）。
+  pool_exclude_cross_border: true
   technical_lookback_days: 260
   hypothetical_capital: 100000.0
   refresh_modes:

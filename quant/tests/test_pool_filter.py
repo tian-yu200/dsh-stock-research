@@ -15,6 +15,7 @@ def _config(**overrides) -> dict:
         "pool_exclude_st": True,
         "min_listing_age_calendar_days": 90,
         "min_avg_amount_20d": 10_000_000.0,
+        "pool_exclude_cross_border": True,
     }
     research.update(overrides)
     return {"research": research}
@@ -80,6 +81,33 @@ class PoolQualityFilterTests(unittest.TestCase):
         facts = {"301117": _fact("ST佳缘")}
         config = _config(pool_exclude_st=False, min_avg_amount_20d=0.0, min_listing_age_calendar_days=0)
         eligible, exclusions = _pool_quality_filter(signals, facts, config, "2026-09-04")
+        self.assertEqual(len(eligible), 1)
+        self.assertEqual(exclusions, [])
+
+    def test_cross_border_names_are_excluded(self) -> None:
+        signals = [_signal("159502"), _signal("513310"), _signal("513290"), _signal("004320")]
+        facts = {
+            "159502": _fact("标普生物科技ETF嘉实"),
+            "513310": _fact("中韩半导体ETF华泰柏瑞"),
+            "513290": _fact("纳指生物科技ETF汇添富"),
+            "004320": _fact("前海开源沪港深乐享生活"),
+        }
+        eligible, exclusions = _pool_quality_filter(signals, facts, _config(), "2026-09-06")
+        self.assertEqual([s["symbol"] for s in eligible], ["513310"])
+        self.assertEqual(
+            [(e["symbol"], e["reason"]) for e in exclusions],
+            [
+                ("159502", "cross_border"),
+                ("513290", "cross_border"),
+                ("004320", "cross_border"),
+            ],
+        )
+
+    def test_cross_border_filter_disabled_keeps_qdii(self) -> None:
+        signals = [_signal("159502")]
+        facts = {"159502": _fact("标普生物科技ETF嘉实")}
+        config = _config(pool_exclude_cross_border=False)
+        eligible, exclusions = _pool_quality_filter(signals, facts, config, "2026-09-06")
         self.assertEqual(len(eligible), 1)
         self.assertEqual(exclusions, [])
 

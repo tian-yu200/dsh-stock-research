@@ -281,6 +281,13 @@ def _quality_for_depth(
     return tolerated
 
 
+_CROSS_BORDER_NAME_KEYWORDS = (
+    "标普", "纳斯达克", "纳指", "道琼斯", "美国", "美债", "美元",
+    "恒生", "港股", "沪港深", "港通", "中概", "海外", "全球", "环球",
+    "亚太", "日经", "德国", "法国", "欧洲", "新兴市场", "金砖", "REITs",
+)
+
+
 def _pool_quality_filter(
     signals: list[dict[str, Any]],
     facts_by_symbol: Mapping[str, Mapping[str, Any]],
@@ -289,8 +296,9 @@ def _pool_quality_filter(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """宁缺毋滥：在生成买入权重前剔除不合格候选（打分后、取 top-k 前）。
 
-    剔除三类：ST/*ST/退市整理（名称标记）、上市不满 min_listing_age_calendar_days
-    （约 60 个交易日）的次新、20 日均成交额低于 min_avg_amount_20d 的低流动性标的。
+    剔除四类：ST/*ST/退市整理（名称标记）、上市不满 min_listing_age_calendar_days
+    （约 60 个交易日）的次新、20 日均成交额低于 min_avg_amount_20d 的低流动性标的、
+    以及名称含境外市场关键词的跨境标的（QDII/港股通等，用户规则：不配美股港股）。
     缺数据的候选按合格处理（fail-open）：数据层对所有股票始终产出
     name/start_date/liquidity，缺项只出现在测试夹具与极端场景。
     返回 (合格信号, 剔除明细)，剔除明细保持原始排名顺序（前列即最可惜的落榜者）。
@@ -299,6 +307,7 @@ def _pool_quality_filter(
     exclude_st = bool(research_cfg.get("pool_exclude_st", False))
     min_age_days = int(research_cfg.get("min_listing_age_calendar_days", 90) or 0)
     min_avg_amount = float(research_cfg.get("min_avg_amount_20d", 0.0) or 0.0)
+    exclude_cross_border = bool(research_cfg.get("pool_exclude_cross_border", False))
     as_of = pd.Timestamp(as_of_date) if as_of_date else None
     eligible: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
@@ -311,6 +320,9 @@ def _pool_quality_filter(
             upper = name.upper()
             if "ST" in upper or "退" in name:
                 reason = "st_or_delisting"
+        if reason is None and exclude_cross_border and name:
+            if any(keyword in name or keyword.upper() in name.upper() for keyword in _CROSS_BORDER_NAME_KEYWORDS):
+                reason = "cross_border"
         if reason is None and min_age_days > 0 and as_of is not None:
             start_date = fact.get("start_date")
             if start_date:
@@ -827,6 +839,17 @@ def run_research(
                 continue
             analysis = technical_signals[asset_type]
             candidates = [item for item in analysis["signals"] if (item.get("trend_score") or -math.inf) > 0]
+            facts_by_type = {item.get("symbol"): item for item in all_facts if item.get("asset_type") == asset_type}
+            candidates, cross_exclusions = _pool_quality_filter(
+                candidates,
+                facts_by_type,
+                config,
+                str(data_quality.get("data_end_date") or ""),
+            )
+            for exclusion in cross_exclusions[:10]:
+                log_lines.append(
+                    f"[宁缺毋滥] {exclusion['symbol']} {exclusion.get('name', '')} 剔除: {exclusion['reason']}"
+                )
             candidates = candidates[:2]
             category = "etf" if asset_type == "etf" else "otc_fund"
             requested = build_target_weights(
