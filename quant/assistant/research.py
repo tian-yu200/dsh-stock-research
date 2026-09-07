@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .config import config_snapshot, load_config
+from .cross_border import CROSS_BORDER_KEYWORDS, is_cross_border
 from .notifications import add_notification
 from .paths import (
     ASSISTANT_RESULTS_DIR,
@@ -281,11 +282,7 @@ def _quality_for_depth(
     return tolerated
 
 
-_CROSS_BORDER_NAME_KEYWORDS = (
-    "标普", "纳斯达克", "纳指", "道琼斯", "美国", "美债", "美元",
-    "恒生", "港股", "沪港深", "港通", "中概", "海外", "全球", "环球",
-    "亚太", "日经", "德国", "法国", "欧洲", "新兴市场", "金砖", "REITs",
-)
+_CROSS_BORDER_NAME_KEYWORDS = CROSS_BORDER_KEYWORDS  # centralized in assistant.cross_border
 
 
 def _pool_quality_filter(
@@ -321,7 +318,9 @@ def _pool_quality_filter(
             if "ST" in upper or "退" in name:
                 reason = "st_or_delisting"
         if reason is None and exclude_cross_border and name:
-            if any(keyword in name or keyword.upper() in name.upper() for keyword in _CROSS_BORDER_NAME_KEYWORDS):
+            keywords = research_cfg.get("cross_border_keywords") or None
+            fact_type = fact.get("asset_type")
+            if is_cross_border(name, asset_type=fact_type, keywords=keywords):
                 reason = "cross_border"
         if reason is None and min_age_days > 0 and as_of is not None:
             start_date = fact.get("start_date")

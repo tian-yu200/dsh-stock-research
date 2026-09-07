@@ -255,7 +255,7 @@ def fetch_a_stock_daily(symbol: str, start="20200101", end="20991231") -> pd.Dat
 
 
 def fetch_etf_daily(symbol: str, start="20200101", end="20991231") -> pd.DataFrame:
-    """场内ETF: 东财 -> 新浪"""
+    """场内ETF: 东财前复权 -> 腾讯前复权 -> 新浪未复权。"""
     try:
         df = ak.fund_etf_hist_em(
             symbol=symbol, period="daily",
@@ -270,11 +270,23 @@ def fetch_etf_daily(symbol: str, start="20200101", end="20991231") -> pd.DataFra
     except Exception as exc:
         print(f"  [ETF {symbol}] 东财源失败: {type(exc).__name__}")
     prefixed = _market_prefix(symbol) + symbol
+    try:
+        df = ak.stock_zh_a_hist_tx(
+            symbol=prefixed, start_date=start, end_date=end, adjust="qfq",
+        )
+        df = normalize_daily_bars(df, source=f"tencent ETF {symbol}")
+        df.attrs["akshare_interface"] = "stock_zh_a_hist_tx"
+        df.attrs["akshare_source"] = "腾讯"
+        df.attrs["adjustment"] = "qfq"
+        print(f"  [ETF {symbol}] 使用数据源: 腾讯 ({len(df)} 行)")
+        return df
+    except Exception as exc:
+        print(f"  [ETF {symbol}] 腾讯前复权源失败: {type(exc).__name__}")
     df = ak.fund_etf_hist_sina(symbol=prefixed)
     df = normalize_daily_bars(df, source=f"sina ETF {symbol}")
     df.attrs["akshare_interface"] = "fund_etf_hist_sina"
     df.attrs["akshare_source"] = "新浪"
-    df.attrs["adjustment"] = "qfq"
+    df.attrs["adjustment"] = "unadjusted"
     start_date = pd.to_datetime(start, format="%Y%m%d")
     end_date = pd.to_datetime(end, format="%Y%m%d")
     df = df.loc[df["date"].between(start_date, end_date)].reset_index(drop=True)

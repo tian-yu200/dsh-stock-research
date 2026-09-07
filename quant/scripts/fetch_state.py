@@ -19,6 +19,51 @@ from typing import Any, Iterable, Iterator, Mapping
 
 UTC = timezone.utc
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "fetch_state.sqlite3"
+QUANT_ROOT_F = Path(__file__).resolve().parents[1]
+UNIVERSE_PATH_F = QUANT_ROOT_F / "data" / "universe.json"
+
+_CROSS_BORDER_KEYWORDS_F = (
+    "标普", "纳斯达克", "纳指", "道琼斯", "美国", "美股", "美债", "美元",
+    "恒生", "恒指", "港股", "沪港深", "港通", "中概", "海外", "全球", "环球",
+    "亚太", "日经", "东京", "德国", "法国", "欧洲", "新兴", "金砖", "REIT", "QDII",
+    "韩国", "中韩", "越南", "英国",
+)
+
+def _is_cross_border_f(name: str | None, asset_type: str | None = None) -> bool:
+    if asset_type == "stock":
+        return False
+    if not name:
+        return False
+    low = str(name).lower()
+    for kw in _CROSS_BORDER_KEYWORDS_F:
+        if kw.lower() in low:
+            return True
+    return False
+
+def _load_manifest_names_f() -> dict[str, dict[str, str]]:
+    try:
+        import json as _j
+        data = _j.loads(UNIVERSE_PATH_F.read_text(encoding="utf-8"))
+        out = {}
+        for at in ("etf", "otc_fund"):
+            recs = data.get(at) or []
+            d = {}
+            for item in recs:
+                if isinstance(item, dict) and item.get("symbol") and item.get("name"):
+                    d[str(item["symbol"])] = str(item["name"])
+            out[at] = d
+        return out
+    except Exception:
+        return {"etf": {}, "otc_fund": {}}
+
+def _should_filter_progress() -> bool:
+    try:
+        import yaml as _yaml
+        cfg = _yaml.safe_load((QUANT_ROOT_F / "configs" / "assistant.yaml").read_text(encoding="utf-8")) or {}
+        research = (cfg.get("research") or {})
+        return bool(research.get("universe_exclude_cross_border") or research.get("pool_exclude_cross_border"))
+    except Exception:
+        return False
 
 
 def utc_now() -> datetime:
@@ -397,6 +442,19 @@ class FetchState:
                 """,
                 [*parameters, int(limit)],
             ).fetchall()
+            # 2026-09-07 跨境排除：etf/otc_fund 美港QDII 不抢占 fetch 预算
+            if _should_filter_progress() and asset_type in ("etf", "otc_fund"):
+                try:
+                    names_by_type = _load_manifest_names_f()
+                    nms = names_by_type.get(asset_type, {})
+                    filtered = []
+                    for r in rows:
+                        nm = nms.get(str(r["symbol"]), "")
+                        if not _is_cross_border_f(nm, asset_type=asset_type):
+                            filtered.append(r)
+                    rows = filtered
+                except Exception:
+                    pass
             for row in rows:
                 connection.execute(
                     """
@@ -760,6 +818,22 @@ class FetchState:
                         params,
                     ).fetchall()
                 )
+        # 2026-09-07 跨境排除：不计入统计（软排除，stock 永不过滤）
+        if _should_filter_progress():
+            try:
+                names_by_type = _load_manifest_names_f()
+                filtered = []
+                for r in rows:
+                    at = str(r["asset_type"])
+                    if at not in ("etf", "otc_fund"):
+                        filtered.append(r)
+                    else:
+                        nm = names_by_type.get(at, {}).get(str(r["symbol"]), "")
+                        if not _is_cross_border_f(nm, asset_type=at):
+                            filtered.append(r)
+                rows = filtered
+            except Exception:
+                pass
         completed = 0
         inactive = 0
         failed = 0

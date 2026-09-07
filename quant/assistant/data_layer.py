@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import pandas as pd
 
 from . import research
+from .cross_border import is_cross_border
 from .paths import validate_symbol
 
 try:
@@ -110,6 +111,19 @@ def _universe(asset_type: str, symbols: Iterable[str] | None) -> list[str]:
             for path in directory.glob("fund_*.csv")
             if (match := research.SYMBOL_FILE_RE.match(path.stem))
         )
+    # 2026-09-07 跨境排除：源头过滤，美港QDII不计入统计
+    # 复用 pool_exclude_cross_border 开关，stock 始终不过滤（is_cross_border对stock返回False）
+    try:
+        cfg = research.load_config()  # type: ignore[attr-defined]
+    except Exception:
+        cfg = {}
+    research_cfg = (cfg.get("research") or {}) if isinstance(cfg, dict) else {}
+    exclude_universe = bool(research_cfg.get("universe_exclude_cross_border", False) or research_cfg.get("pool_exclude_cross_border", False))
+    if exclude_universe and asset_type != "stock":
+        names = manifest_names(manifest, asset_type)
+        kws = research_cfg.get("cross_border_keywords") or None
+        # 定向请求 fail-open：显式指定的符号不过滤，交由 _pool_quality_filter 决定权重
+        discovered = {s for s in discovered if (s in requested) or not is_cross_border(names.get(s, ""), asset_type=asset_type, keywords=kws)}
     if requested:
         missing = sorted(requested - discovered)
         if missing:
@@ -158,6 +172,8 @@ def _adjustment_check(path: Path, asset_type: str) -> dict[str, Any]:
     )
     metadata = load_asset_metadata(path)
     observed = metadata.get("adjustment")
+    if asset_type == "etf" and metadata.get("interface") == "fund_etf_hist_sina":
+        observed = "unadjusted"
     if observed is None:
         return {
             "status": "assumed",

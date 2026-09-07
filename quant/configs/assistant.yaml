@@ -89,7 +89,10 @@ research:
   min_avg_amount_20d: 10000000.0
   # 用户规则（2026-09-06）：不配美股港股等境外敞口。按名称关键词剔除
   # QDII/港股通类 ETF 与基金（标普/纳指/恒生/沪港深/全球/海外等）。
+  # 2026-09-07 扩展：源头排除，美港QDII在universe/扫描阶段即不计入统计
   pool_exclude_cross_border: true
+  universe_exclude_cross_border: true
+  cross_border_keywords: ["标普","纳斯达克","纳指","道琼斯","美国","美股","美债","美元","恒生","恒指","港股","沪港深","港通","中概","海外","全球","环球","亚太","日经","东京","德国","法国","欧洲","新兴","金砖","REIT","QDII","韩国","中韩","越南","英国"]
   technical_lookback_days: 260
   hypothetical_capital: 100000.0
   refresh_modes:

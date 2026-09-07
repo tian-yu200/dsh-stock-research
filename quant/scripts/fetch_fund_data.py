@@ -146,6 +146,19 @@ def _path(kind: str, code: str) -> pathlib.Path:
 
 def _write_success(kind: str, code: str, frame: Any, path: pathlib.Path) -> dict[str, Any]:
     if kind == "etf":
+        meta_path = path.with_suffix(".meta.json")
+        if path.exists() and meta_path.exists():
+            previous = json.loads(meta_path.read_text(encoding="utf-8"))
+            old_basis = previous.get("adjustment")
+            if previous.get("interface") == "fund_etf_hist_sina":
+                old_basis = "unadjusted"
+            new_basis = frame.attrs.get("adjustment", "qfq")
+            if old_basis and old_basis != new_basis:
+                if new_basis != "qfq":
+                    raise ValueError(f"ETF {code}: refusing unadjusted update of adjusted history")
+                raise BaselineDiscontinuityError(
+                    f"ETF {code}", "adjustment provenance changed; full history required",
+                )
         merged = merge_daily_frames(path, frame, source=f"ETF {code}")
     else:
         merged = merge_otc_frames(path, frame, source=f"OTC fund {code}")

@@ -31,6 +31,7 @@ from typing import Any, Iterator
 import pandas as pd
 
 from . import data_layer, research, signals
+from .cross_border import is_cross_border
 from .paths import atomic_write_json, fixed_path
 
 try:
@@ -121,10 +122,23 @@ def _load_frame(asset_type: str, symbol: str) -> pd.DataFrame:
             frame[name] = pd.to_numeric(raw[columns[name]], errors="coerce")
     return (
         frame.dropna(subset=["date", "close"])
-        .sort_values("date")
+        .loc[lambda value: value["close"].gt(0)]
+        .sort_values("date", kind="stable")
         .drop_duplicates("date", keep="last")
         .reset_index(drop=True)
     )
+
+
+def _file_revision(asset_type: str, symbol: str) -> str:
+    path = data_layer._data_file(asset_type, symbol)
+    revision = []
+    for candidate in (path, path.with_suffix(".meta.json")):
+        try:
+            stat = candidate.stat()
+            revision.append(f"{stat.st_mtime_ns}:{stat.st_size}")
+        except FileNotFoundError:
+            revision.append("missing")
+    return "|".join(revision)
 
 
 def _read_state(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -162,6 +176,79 @@ def _read_state(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
         ]
     finally:
         connection.close()
+    # 2026-09-07 跨境排除：etf/otc_fund 美港QDII不计入统计（复用 pool_exclude_cross_border）
+    try:
+        cfg = research.load_config()  # type: ignore[attr-defined]
+    except Exception:
+        cfg = {}
+    research_cfg = (cfg.get("research") or {}) if isinstance(cfg, dict) else {}
+    exclude_rs = bool(research_cfg.get("universe_exclude_cross_border", False) or research_cfg.get("pool_exclude_cross_border", False))
+    if exclude_rs:
+        from pathlib import Path as _P
+        try:
+            manifest = load_universe_manifest(research.UNIVERSE_PATH)
+            # 按类型取 name 字典
+            import itertools
+            names_by_type = {}
+            for at in ("etf", "otc_fund"):
+                try:
+                    names_by_type[at] = manifest_names(manifest, at)
+                except Exception:
+                    names_by_type[at] = {}
+            kws = research_cfg.get("cross_border_keywords") or None
+            # 过滤 rows
+            filtered_rows = []
+            for r in rows:
+                at = str(r["asset_type"])
+                if at not in ("etf", "otc_fund"):
+                    filtered_rows.append(r)
+                else:
+                    nm = names_by_type.get(at, {}).get(str(r["symbol"]), "")
+                    if not is_cross_border(nm, asset_type=at, keywords=kws):
+                        filtered_rows.append(r)
+            rows = filtered_rows
+            # 重算 totals 排除跨境分母：重查全量 assets 并按 name 过滤（fail-open）
+            try:
+                import sqlite3 as _sql
+                uri2 = f"{research.DATA_DIR / "fetch_state.sqlite3"}"
+                # 使用之前的 path 参数对应的 fetch_state 路径
+                fetch_path = path if "fetch_state" in str(path) else (research.DATA_DIR / "fetch_state.sqlite3")
+                # rolling _read_state的path是fetch_state.sqlite3
+                try:
+                    uri_all = f"{fetch_path.resolve().as_uri()}?mode=ro"
+                    conn2 = _sql.connect(uri_all, uri=True, timeout=30)
+                    conn2.row_factory = _sql.Row
+                    all_rows = conn2.execute("SELECT asset_type, symbol FROM assets").fetchall()
+                    conn2.close()
+                    new_totals = {}
+                    for at in set(str(r["asset_type"]) for r in all_rows):
+                        nms = names_by_type.get(at, {})
+                        cnt_total = 0
+                        for r in all_rows:
+                            if str(r["asset_type"]) != at:
+                                continue
+                            nm = nms.get(str(r["symbol"]), "")
+                            if at in ("etf", "otc_fund") and is_cross_border(nm, asset_type=at, keywords=kws):
+                                continue
+                            cnt_total += 1
+                        cnt_succ = len([r for r in rows if str(r["asset_type"])==at])
+                        new_totals[at] = {"total": cnt_total, "success": cnt_succ}
+                    # 保留 stock 等未过滤类型的 totals 若新计算为空则用原值
+                    for at, val in list(totals.items()):
+                        if at not in new_totals:
+                            new_totals[at] = val
+                    totals = new_totals
+                except Exception:
+                    # 退化：仅修正 success
+                    for at in list(totals.keys()):
+                        if at in ("etf", "otc_fund"):
+                            totals[at]["success"] = len([r for r in rows if str(r["asset_type"])==at])
+            except Exception:
+                pass
+        except Exception:
+            pass
+    for row in rows:
+        row["file_revision"] = _file_revision(str(row["asset_type"]), str(row["symbol"]))
     return rows, totals
 
 
@@ -247,6 +334,8 @@ class RollingScanStore:
             }
             if "source" not in existing_columns:
                 connection.execute("ALTER TABLE scores ADD COLUMN source TEXT")
+            if "file_revision" not in existing_columns:
+                connection.execute("ALTER TABLE scores ADD COLUMN file_revision TEXT")
 
     def scored_end_dates(self) -> dict[tuple[str, str], str | None]:
         with self._connect() as connection:
@@ -261,20 +350,17 @@ class RollingScanStore:
     def scored_fingerprints(
         self,
     ) -> dict[tuple[str, str], dict[str, Any]]:
-        """已打分标的的内容指纹（end_date + rows + source）。
-
-        重写 CSV（如跨源复权基准切换）常常不改变 data_end_date，
-        只有 rows/source 能识别"同末日期、不同内容"的毒分数。
-        """
+        """Scored state plus file revision, including same-date CSV corrections."""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT asset_type, symbol, data_end_date, rows, source FROM scores"
+                "SELECT asset_type, symbol, data_end_date, rows, source, file_revision FROM scores"
             ).fetchall()
         return {
             (str(row["asset_type"]), str(row["symbol"])): {
                 "end_date": row["data_end_date"],
                 "rows": row["rows"],
                 "source": row["source"],
+                "file_revision": row["file_revision"],
             }
             for row in rows
         }
@@ -297,6 +383,7 @@ class RollingScanStore:
             "quality_status",
             "analyzed_at",
             "source",
+            "file_revision",
             *SCORE_FIELDS,
         ]
         statement = """
@@ -518,6 +605,7 @@ def _analyze_one(
         "quality_status": None,
         "analyzed_at": utc_now_iso(),
         "source": row.get("source"),
+        "file_revision": row.get("file_revision"),
         **{field: None for field in SCORE_FIELDS},
     }
     try:
@@ -657,6 +745,9 @@ def _fingerprint_changed(
     不参与比较，避免错误记录每轮 pass 被无意义地重算。
     """
     if fingerprint is None:
+        return True
+    revision = state_row.get("file_revision")
+    if revision is not None and fingerprint.get("file_revision") != revision:
         return True
     if fingerprint.get("end_date") != state_row.get("data_end_date"):
         return True

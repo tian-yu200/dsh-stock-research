@@ -289,6 +289,8 @@ class NormalizeDailyBarsTests(unittest.TestCase):
 
         with patch(
             "data_source.ak.fund_etf_hist_em", side_effect=RuntimeError("offline")
+        ), patch(
+            "data_source.ak.stock_zh_a_hist_tx", side_effect=RuntimeError("offline")
         ), patch("data_source.ak.fund_etf_hist_sina", return_value=fallback):
             result = fetch_etf_daily(
                 "510300", start="20240102", end="20240102"

@@ -101,6 +101,8 @@ DEFAULTS: dict[str, Any] = {
         "min_listing_age_calendar_days": 90,
         "min_avg_amount_20d": 0.0,
         "pool_exclude_cross_border": False,
+        "universe_exclude_cross_border": False,
+        "cross_border_keywords": None,
         "technical_lookback_days": 260,
         "hypothetical_capital": 100000.0,
         "refresh_modes": ["daily", "monthly", "on_demand"],
