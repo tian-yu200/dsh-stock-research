@@ -103,8 +103,26 @@ DEFAULTS: dict[str, Any] = {
         "pool_exclude_cross_border": False,
         "universe_exclude_cross_border": False,
         "cross_border_keywords": None,
+        # 2026-09-10 回撤根治：北交所 ±30% 板天然高波，Top3 等权下
+        # 单票冲击 1/3×30%=10%，与回撤门槛冲突。默认关闭保测试，
+        # 生产在 assistant.yaml 显式开启（pool_exclude_bj=true）。
+        "pool_exclude_bj": False,
         "technical_lookback_days": 260,
         "hypothetical_capital": 100000.0,
+        # 2026-09-11 整改(P1-4)：回测目标组合口径。allocation_slots 复用
+        # portfolio.allocation_budget 的 0.2/n 预算公式；include_cash=True 时
+        # 门槛衡量含现金的目标组合（= 实际发布对象），并另存满仓口径的
+        # model_quality_backtest 供模型质量监控。
+        "backtest_allocation_slots": 3,
+        "backtest_include_cash": True,
+        # 2026-09-11 整改(P1-5)：重叠 cohort 数。持有期固定取
+        # research.stock_label_horizon（20），每 horizon/cohorts 个交易日轮换一个
+        # cohort，任意时点同时有 cohorts 个 cohort 在场，换手降到约 1/cohorts。
+        "backtest_cohorts": 5,
+        # 2026-09-11 整改(P0-2)：信号日横截面样本数的**绝对**下限。
+        # 0 = 关闭，只用相对判据（>= 50% 日中位数）——测试夹具与 under50
+        # 等小规模 provider 因此不受影响；生产在 assistant.yaml 设为 100。
+        "min_signal_scores": 0,
         "refresh_modes": ["daily", "monthly", "on_demand"],
         "transaction_cost_bps": 10.0,
         "default_depth": "standard",
@@ -123,6 +141,10 @@ DEFAULTS: dict[str, Any] = {
         "min_top_bottom_excess_return": 0.00,
         "max_test_drawdown": 0.25,
         "max_excess_test_drawdown": 0.15,
+        # 2026-09-11 整改：拟合质量门槛。标签为截面 z-score（方差≈1），
+        # 1 - train_l2 近似样本内 R²。0.0 = 关闭（保测试夹具的合成数据）；
+        # 生产在 assistant.yaml 显式启用。
+        "min_train_l2_improvement": 0.0,
     },
     "model": {
         "loss": "mse",

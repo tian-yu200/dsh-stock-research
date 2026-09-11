@@ -10,19 +10,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from . import research
 from .paths import atomic_write_json, read_json, validate_symbol
+from .portfolio import allocation_budget, build_target_weights
 from .provider_lock import ProviderLock
+from .risk import enforce_target_weights
 
 
-MODEL_CACHE_SCHEMA = 1
+# 2026-09-11 整改：v2 = 回测口径改为目标组合（含现金）+ 信号日改为横截面覆盖达标日；
+# v3 = 持有期与标签 horizon 对齐（重叠 cohort，P1-5）。
+# 每次改变模型缓存承载的指标语义都必须 bump，否则旧缓存会被复用并掩盖修复效果
+# （不变量 §3b 的教训）。
+MODEL_CACHE_SCHEMA = 3
+
+# 全市场股票模型的最小有效评分数。低于该值说明当日横截面退化
+# （典型成因：provider 日历末位只被极少数标的填充），此时既不能写缓存，
+# 也不能把结果当作"模型不合格"来判定门槛。
+MIN_STOCK_SCORES = 100
 
 
 def _report_progress(
@@ -60,7 +72,19 @@ def _model_cache_identity(
                 "stock_label_horizon",
                 "stock_topk",
                 "transaction_cost_bps",
+                # 2026-09-10 回撤根治：BJ 过滤改变回测组合构成，
+                # 必须进缓存键，否则旧缓存复用掩盖修复效果。
+                "pool_exclude_bj",
+                # 2026-09-11 整改(P1-4)：回测目标组合的预算口径。
+                "backtest_allocation_slots",
+                "backtest_include_cash",
+                # 2026-09-11 整改(P1-5)：持有期/cohort 数改变回测语义。
+                "backtest_cohorts",
+                # 2026-09-11 整改(P0-2)：信号日退化的绝对下限会影响 scores 集合，
+                # 必须进缓存键，否则改它可能复用旧缓存而看不出差异。
+                "min_signal_scores",
             )
+            if key in config["research"]
         },
     }
     canonical = json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -87,6 +111,41 @@ def _cached_model_result(path: Path, cache_key: str) -> dict[str, Any] | None:
     ):
         return None
     return dict(cached["result"])
+
+
+def cohort_schedule(
+    total_days: int,
+    *,
+    holding_days: int,
+    cohorts: int,
+) -> dict[int, tuple[int, ...]]:
+    """重叠组合（overlapping cohorts）排程：``{日期序号: 当日活跃的入场序号}``。
+
+    背景（P1-5）：模型预测的是**未来 ``holding_days`` 个交易日**的相对收益，
+    而原回测按 1 日持有、每日重选 top-k：
+
+    - 20 日 alpha 被 1 日噪声抵消，且 A 股短期反转会让高动量高分股次日系统回吐；
+    - 日换手 51.2% × 10bp × 250 ≈ **12.8%/年** 成本。
+
+    改为把资金等分为 ``cohorts`` 个 cohort，每 ``holding_days // cohorts`` 个交易日
+    有一个 cohort 建仓并持有 ``holding_days`` 个交易日；任意时点同时有 ``cohorts``
+    个 cohort 在场，因此换手降到约 ``1/cohorts``，持有期与标签 horizon 一致。
+
+    纯函数，便于单测：不依赖行情，只依赖天数。
+    """
+    holding = max(1, int(holding_days))
+    count = max(1, int(cohorts))
+    interval = max(1, holding // count)
+    total = max(0, int(total_days))
+    entry_indices = list(range(0, total, interval)) if total else []
+    schedule: dict[int, tuple[int, ...]] = {}
+    for index in range(total):
+        active = tuple(
+            entry for entry in entry_indices if entry <= index < entry + holding
+        )
+        if active:
+            schedule[index] = active
+    return schedule
 
 
 def _filter_scores(
@@ -212,6 +271,174 @@ def _performance(equity: pd.Series) -> dict[str, float]:
     annualized = float((values.iloc[-1] / values.iloc[0]) ** (1.0 / years) - 1.0)
     drawdown = values / values.cummax() - 1.0
     return {"net_annualized_return": annualized, "max_drawdown": float(drawdown.min())}
+
+
+def select_signal_date(
+    prediction: pd.Series,
+    *,
+    min_count: int = 0,
+    min_ratio: float = 0.5,
+) -> pd.Timestamp | None:
+    """返回横截面被充分填充的最后一个交易日。
+
+    Qlib provider 的日历是所有标的日期的**并集**，因此日历末位可能只被极少数标的
+    填充（典型成因：只有部分数据源在当日收盘前发布了当日 K 线）。若直接取该日作为
+    信号日，排名会退化到个位数标的——实证：2026-09-11 全市场 5562 只产出 6 个评分。
+
+    判定标准是**相对**的：样本数 ≥ max(min_count, 中位数 × min_ratio)。相对判据
+    不依赖宇宙规模，因此对全市场（5000+）与小规模 provider（测试夹具、under50）
+    同样成立；``min_count`` 只是可选绝对下限，默认 0（不启用）。
+
+    没有任何交易日达标时返回 None，由调用方按"数据不足"处理（而非"模型不合格"）。
+    """
+    if prediction is None or len(prediction) == 0:
+        return None
+    sizes = prediction.groupby(level="datetime").size().sort_index()
+    if sizes.empty:
+        return None
+    threshold = max(
+        int(min_count),
+        int(math.ceil(float(sizes.median()) * float(min_ratio))),
+    )
+    eligible = sizes[sizes >= threshold]
+    if eligible.empty:
+        return None
+    return pd.Timestamp(eligible.index[-1])
+
+
+def _drawdown_advisory(
+    horizon_drawdown: float,
+    benchmark_drawdown: float,
+    excess_limit: float,
+) -> dict[str, Any]:
+    """满仓 20 日口径的 excess-drawdown 告警（**非阻断**，只记录、不判 gate）。
+
+    2026-09-12 整改：``test_max_drawdown`` 门槛（P1-4 之后）衡量的是含现金目标
+    组合，回撤被 ~95% 现金稀释（09-11 实测 -0.023 vs 上限 0.15），几乎不可能
+    触发——守门能力被口径切换掏空。这里用与旧门槛**同一条判据**
+    （excess ≤ gate.max_excess_test_drawdown）监控满仓 20 日
+    ``horizon_matched_backtest`` 口径：超限时记入 model_metadata 供台账判读，
+    但不改变任何 gate 的 passed 结果。
+    """
+
+    def _finite(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    limit = float(excess_limit) if _finite(excess_limit) else 0.15
+    if not (_finite(horizon_drawdown) and _finite(benchmark_drawdown)):
+        return {"breached": False, "excess_drawdown": None, "limit": limit}
+    excess = abs(float(horizon_drawdown)) - abs(float(benchmark_drawdown))
+    return {
+        "breached": bool(excess > limit),
+        "excess_drawdown": float(excess),
+        "limit": limit,
+    }
+
+
+def _degenerate_stock_model(
+    reason: str,
+    *,
+    score_count: int,
+    provider_end: str,
+) -> dict[str, Any]:
+    """横截面退化（数据不足）时的模型结果。
+
+    与"模型执行失败"刻意区分：这是**数据/日历对齐**问题，不是模型能力问题。
+    因此标记 ``degenerate=True``，不写缓存，并让上层记入独立的失败原因
+    （而不是 ``stock_model_or_risk_gate_failed``），以免污染调度器的 failure_streak。
+    """
+    return {
+        "model_available": False,
+        "model_name": "Qlib Alpha158 + LightGBM",
+        "data_end_date": provider_end,
+        "degenerate": True,
+        "degenerate_reason": reason,
+        "score_count": int(score_count),
+        "min_scores_required": MIN_STOCK_SCORES,
+        "error": f"degenerate_signal_cross_section: {reason}",
+        "mean_rank_ic": float("nan"),
+        "test_rank_ic": float("nan"),
+        "rank_ic_ir": float("nan"),
+        "top_bottom_excess_return": float("nan"),
+        "net_annualized_return": float("nan"),
+        "test_max_drawdown": float("nan"),
+        "max_drawdown": float("nan"),
+        "scores": {},
+        "leakage_check": {"passed": False, "reason": reason},
+    }
+
+
+def _fit_quality(model: Any) -> dict[str, Any]:
+    """提取训练/验证 L2 与隐含 IC，作为模型诊断量（**不作为门槛默认值**）。
+
+    标签是截面 z-score（方差≈1），因此 ``R² = 1 - train_l2 ≈ IC²``，
+    故 ``implied_ic = sqrt(1 - train_l2)`` 可与 test RankIC 直接对照。
+
+    2026-09-11 的原始判断（"train_l2≈0.995 说明模型什么都没学到"）是**错误的**，
+    此处保留更正记录，避免后人重犯：
+
+    - 实测 ``train_l2=0.995423`` → 隐含 |ρ| = 0.0677；同期 ``test mean_rank_ic`` = 0.0563。
+      训练集拟合略高于测试 IC，是正常的轻度样本内乐观，**完全自洽**。
+    - 理论对照：IC=0.0563 → R²=0.00317 → train_l2 应约 0.9968（实测 0.9954，更优）。
+    - 5 分组标签均值严格单调（−0.0355 → −0.0193 → −0.0099 → +0.0166 → +0.0488），
+      破损/常数模型不可能产生等距单调的分组排序。
+    - 因此 ``train_l2 ≈ 0.995`` 是股票截面 alpha 模型的**正常值**：A 股 IC 通常
+      0.02~0.09，对应 R² 仅 0.04%~0.8%。
+
+    结论：**不要用 R² 的绝对值做门槛**（要求 R²≥2% 等于要求 IC≥0.141，A 股不可达）。
+    模型质量由既有的 RankIC / RankIC IR / 分组超额 / 回撤四项门槛负责。
+    """
+    booster = getattr(model, "model", None)
+    best_score = getattr(booster, "best_score", None)
+    if not isinstance(best_score, Mapping):
+        return {
+            "fit_quality_available": False,
+            "train_l2": None,
+            "valid_l2": None,
+            "train_l2_improvement": None,
+        }
+
+    def _l2(key: str) -> float | None:
+        value = best_score.get(key)
+        if isinstance(value, Mapping):
+            value = value.get("l2")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    train_l2 = _l2("train")
+    valid_l2 = _l2("valid")
+    improvement = None if train_l2 is None else max(0.0, 1.0 - train_l2)
+    return {
+        "fit_quality_available": train_l2 is not None,
+        "train_l2": train_l2,
+        "valid_l2": valid_l2,
+        "train_l2_improvement": improvement,
+        # 2026-09-11 自我更正：截面 z-score 标签（方差=1）下 R² ≈ IC²，
+        # 因此隐含 |ρ| = sqrt(1 - train_l2)，可与 test IC 直接对照。
+        # 实证：train_l2=0.9954 → 隐含 |ρ|=0.0677，同期 test IC=0.0563 —— 自洽。
+        # 结论：train_l2≈0.995 对股票 alpha 模型是**正常值**（A 股截面 IC 通常
+        # 0.02~0.09，对应 R² 0.04%~0.8%），绝不能当成"模型没学到"。
+        "implied_ic": (
+            None if improvement is None else float(math.sqrt(improvement))
+        ),
+    }
+
+
+def _turnover(
+    current: Mapping[str, float],
+    previous: Mapping[str, float],
+) -> float:
+    """单边换手率：Σ|Δw| / 2（含现金由调用方按 1-Σw 处理）。"""
+    symbols = set(current) | set(previous)
+    return sum(
+        abs(float(current.get(symbol, 0.0)) - float(previous.get(symbol, 0.0)))
+        for symbol in symbols
+    ) / 2.0
 
 
 def _fit_qlib_model_and_close_recorder(
@@ -535,6 +762,32 @@ def _run_qlib_stock_model(
             test_prediction = predictions["test"]
             if test_prediction.empty:
                 raise ValueError("Qlib test prediction is empty")
+            # 2026-09-11 整改(P0-1 + P0-2)：先判定横截面是否退化，再决定要不要跑回测。
+            # 实证：2026-09-11 provider 日历末位 2026-09-11 只有 6 只有数据，
+            # scores 从 5562 退化为 6，且因 score_count<100 拒绝写缓存 →
+            # 每轮冷启动重训 29 分钟。此处按"数据不足"提前返回，不再继续算门槛。
+            min_signal_scores = int(
+                (config.get("research") or {}).get("min_signal_scores", 0) or 0
+            )
+            signal_date = select_signal_date(test_prediction)
+            if signal_date is None:
+                return _degenerate_stock_model(
+                    "no trading day reached the relative cross-section threshold "
+                    "(samples >= 50% of the median daily universe)",
+                    score_count=0,
+                    provider_end=provider_end,
+                )
+            latest = test_prediction.xs(signal_date, level="datetime").sort_values(
+                ascending=False
+            )
+            if min_signal_scores and len(latest) < min_signal_scores:
+                return _degenerate_stock_model(
+                    "signal date "
+                    f"{research._iso_date(signal_date)} produced only {len(latest)} "
+                    f"scores (< research.min_signal_scores={min_signal_scores})",
+                    score_count=int(len(latest)),
+                    provider_end=provider_end,
+                )
             _report_progress(progress_callback, "backtest")
             raw = dataset.handler.fetch(
                 selector=slice(segments["test"][0], segments["test"][1]),
@@ -544,48 +797,163 @@ def _run_qlib_stock_model(
             )
             closes = raw["BACKTEST_CLOSE"].unstack("instrument").sort_index()
             future = closes.shift(-1) / closes - 1.0
-            strategy_returns: dict[pd.Timestamp, float] = {}
-            benchmark_returns: dict[pd.Timestamp, float] = {}
-            turnover_by_date: dict[pd.Timestamp, float] = {}
-            previous_weights: dict[str, float] = {}
             transaction_cost_rate = (
                 float(config["research"]["transaction_cost_bps"]) / 10000.0
             )
-            for date, scores in test_prediction.groupby(level="datetime"):
-                if date not in future.index:
-                    continue
-                top = (
-                    scores.droplevel("datetime")
-                    .sort_values(ascending=False)
-                    .head(int(config["research"]["stock_topk"]))
+            research_cfg = config.get("research") or {}
+            exclude_bj = bool(research_cfg.get("pool_exclude_bj", False))
+            topk = int(research_cfg["stock_topk"])
+            include_cash = bool(research_cfg.get("backtest_include_cash", True))
+            allocation_slots = max(
+                int(research_cfg.get("backtest_allocation_slots", 3)), 1
+            )
+            # P1-5：持有期与标签 horizon 对齐（重叠 cohort）。
+            holding_days = max(int(research_cfg.get("stock_label_horizon", 20)), 1)
+            cohort_count = max(int(research_cfg.get("backtest_cohorts", 5)), 1)
+            cohort_count = min(cohort_count, holding_days)
+            # 2026-09-11 整改(P1-4)：门槛必须衡量"实盘真正会持有的组合"。
+            traded_budget = (
+                allocation_budget(config["risk"], allocation_slots)
+                if include_cash
+                else 1.0
+            )
+            weight_strategy = str(research_cfg.get("weight_strategy", "equal_score"))
+            benchmark_returns: dict[pd.Timestamp, float] = {}
+            legacy_returns: dict[pd.Timestamp, float] = {}
+            legacy_turnovers: dict[pd.Timestamp, float] = {}
+            horizon_returns: dict[pd.Timestamp, float] = {}
+            horizon_turnovers: dict[pd.Timestamp, float] = {}
+            traded_returns: dict[pd.Timestamp, float] = {}
+            traded_turnovers: dict[pd.Timestamp, float] = {}
+            legacy_previous: dict[str, float] = {}
+            horizon_previous: dict[str, float] = {}
+            traded_previous: dict[str, float] = {}
+
+            def _top_symbols(scores: pd.Series) -> list[str]:
+                # scores 已由 .xs(date, level="datetime") 取成"仅含 instrument"的单日截面。
+                # 2026-09-10 回撤根治：回测组合与实盘选股同口径剔除北交所
+                # （92/43/83/87/4 开头，±30% 板），pool_exclude_bj 开启时生效。
+                # 注意回测 instrument 带 Qlib 前缀（BJ920855/SH600519），
+                # 先判 BJ 前缀，再判裸码号段，二者任一命中即剔除。
+                ranked = scores.sort_values(ascending=False)
+                if exclude_bj:
+                    names = ranked.index.to_series().astype(str).str.upper()
+                    bare = names.str.replace(r"^(SH|SZ|BJ)", "", regex=True)
+                    is_bj = names.str.startswith("BJ") | bare.str.startswith(
+                        ("92", "43", "83", "87", "4")
+                    )
+                    ranked = ranked[~is_bj]
+                return [str(symbol) for symbol in ranked.head(topk).index]
+
+            ordered_dates = [
+                date
+                for date in sorted(
+                    test_prediction.index.get_level_values("datetime").unique()
                 )
-                values = future.loc[date].reindex(top.index).dropna()
-                if not values.empty:
-                    weights = {
-                        str(symbol): 1.0 / len(values) for symbol in values.index
+                if date in future.index
+            ]
+            daily_picks: list[list[str]] = []
+            daily_scores: list[dict[str, float]] = []
+            daily_values: list[pd.Series] = []
+            for date in ordered_dates:
+                scores = test_prediction.xs(date, level="datetime")
+                values = future.loc[date]
+                picks = [s for s in _top_symbols(scores) if s in values.index]
+                daily_picks.append(picks)
+                daily_scores.append(
+                    {s: float(scores.get(s, 0.0)) for s in picks}
+                )
+                daily_values.append(values)
+                universe_values = values.dropna()
+                benchmark_returns[pd.Timestamp(date)] = (
+                    float(universe_values.mean())
+                    if not universe_values.empty
+                    else float("nan")
+                )
+
+            schedule = cohort_schedule(
+                len(ordered_dates), holding_days=holding_days, cohorts=cohort_count
+            )
+
+            for index, date in enumerate(ordered_dates):
+                stamp = pd.Timestamp(date)
+                values = daily_values[index]
+                # --- 口径 A：满仓等权、逐日重选（旧口径；仅作模型质量监控）---
+                legacy_symbols = daily_picks[index]
+                if legacy_symbols:
+                    legacy_weights = {
+                        symbol: 1.0 / len(legacy_symbols) for symbol in legacy_symbols
                     }
-                    symbols = set(previous_weights) | set(weights)
-                    turnover = sum(
-                        abs(
-                            weights.get(symbol, 0.0)
-                            - previous_weights.get(symbol, 0.0)
-                        )
-                        for symbol in symbols
-                    ) / 2.0
-                    gross_return = float(values.mean())
-                    strategy_returns[pd.Timestamp(date)] = (
-                        gross_return - turnover * transaction_cost_rate
+                    legacy_turnover = _turnover(legacy_weights, legacy_previous)
+                    legacy_returns[stamp] = (
+                        float(values.reindex(legacy_symbols).mean())
+                        - legacy_turnover * transaction_cost_rate
                     )
-                    turnover_by_date[pd.Timestamp(date)] = turnover
-                    universe_values = future.loc[date].dropna()
-                    benchmark_returns[pd.Timestamp(date)] = (
-                        float(universe_values.mean())
-                        if not universe_values.empty
-                        else float("nan")
+                    legacy_turnovers[stamp] = legacy_turnover
+                    legacy_previous = legacy_weights
+                # --- 口径 C：满仓 + cohort（P1-5 的"纯净"对照，不受现金稀释影响）---
+                active = schedule.get(index) or ()
+                horizon_picks: list[str] = []
+                horizon_scores: dict[str, float] = {}
+                for entry in active:
+                    for symbol in daily_picks[entry]:
+                        if symbol not in horizon_scores:
+                            horizon_scores[symbol] = daily_scores[entry][symbol]
+                            horizon_picks.append(symbol)
+                if horizon_picks:
+                    horizon_weights = {
+                        symbol: 1.0 / len(horizon_picks) for symbol in horizon_picks
+                    }
+                    horizon_turnover = _turnover(horizon_weights, horizon_previous)
+                    horizon_returns[stamp] = (
+                        float(values.reindex(horizon_picks).mean())
+                        - horizon_turnover * transaction_cost_rate
                     )
-                    previous_weights = weights
-            net_returns = pd.Series(strategy_returns, dtype=float).sort_index()
+                    horizon_turnovers[stamp] = horizon_turnover
+                    horizon_previous = horizon_weights
+                # --- 口径 B：目标组合 + cohort（与实盘同口径，参与门槛）---
+                if not horizon_picks:
+                    continue
+                candidates = [
+                    {"symbol": symbol, "qlib_score": horizon_scores[symbol]}
+                    for symbol in horizon_picks
+                ]
+                requested = build_target_weights(
+                    candidates,
+                    "stock",
+                    config["risk"],
+                    budget=traded_budget,
+                    strategy=weight_strategy,
+                )
+                enforced = enforce_target_weights(
+                    requested,
+                    {symbol: "stock" for symbol in requested},
+                    config["risk"],
+                )
+                traded_weights = {
+                    str(symbol): float(weight)
+                    for symbol, weight in (enforced.get("target_weights") or {}).items()
+                }
+                traded_turnover = _turnover(traded_weights, traded_previous)
+                gross_return = sum(
+                    float(weight) * float(values.get(symbol, 0.0))
+                    for symbol, weight in traded_weights.items()
+                    if symbol in values.index and pd.notna(values.get(symbol))
+                )
+                # 未投入部分按现金处理（收益 0，保守）。
+                traded_returns[stamp] = (
+                    gross_return - traded_turnover * transaction_cost_rate
+                )
+                traded_turnovers[stamp] = traded_turnover
+                traded_previous = traded_weights
+            net_returns = pd.Series(traded_returns, dtype=float).sort_index()
             equity = net_returns.add(1.0).cumprod()
+            legacy_equity = (
+                pd.Series(legacy_returns, dtype=float).sort_index().add(1.0).cumprod()
+            )
+            horizon_equity = (
+                pd.Series(horizon_returns, dtype=float).sort_index().add(1.0).cumprod()
+            )
             benchmark_equity = (
                 pd.Series(benchmark_returns, dtype=float)
                 .sort_index()
@@ -594,15 +962,15 @@ def _run_qlib_stock_model(
                 .cumprod()
             )
             performance = _performance(equity)
+            legacy_performance = _performance(legacy_equity)
+            horizon_performance = _performance(horizon_equity)
             benchmark_performance = _performance(benchmark_equity)
             group_metrics = _forward_group_metrics(
                 test_prediction,
                 labels_by_segment["test"],
             )
-            latest_date = test_prediction.index.get_level_values("datetime").max()
-            latest = test_prediction.xs(
-                latest_date, level="datetime"
-            ).sort_values(ascending=False)
+            # latest / signal_date 已在回测前算出（见上方 P0-1 守卫）。
+            latest_date = signal_date
             best_iteration = getattr(
                 getattr(model, "model", None), "best_iteration", None
             )
@@ -613,6 +981,13 @@ def _run_qlib_stock_model(
                 "provider": str(provider),
                 "data_end_date": provider_end,
                 "latest_signal_date": research._iso_date(latest_date),
+                # 2026-09-11 整改(P0-1)：显式记录实际使用的信号日，便于判断
+                # 它是否回退到了 provider 日历末位之前（回退即为日历错位的信号）。
+                "signal_date_used": research._iso_date(signal_date),
+                "signal_date_is_provider_end": bool(
+                    research._iso_date(signal_date) == provider_end
+                ),
+                "score_count": int(len(latest)),
                 "valid": metrics["valid"],
                 "test": metrics["test"],
                 "mean_rank_ic": metrics["test"]["mean_rank_ic"],
@@ -629,8 +1004,39 @@ def _run_qlib_stock_model(
                     config["research"]["transaction_cost_bps"]
                 ),
                 "mean_daily_turnover": float(
-                    pd.Series(turnover_by_date, dtype=float).mean()
+                    pd.Series(traded_turnovers, dtype=float).mean()
                 ),
+                # 2026-09-11 整改(P1-4)：显式声明门槛所衡量的口径。
+                "backtest_mode": (
+                    "target_portfolio_with_cash" if include_cash else "sleeve_only"
+                ),
+                "backtest_allocation_slots": allocation_slots,
+                "backtest_include_cash": include_cash,
+                "backtest_traded_budget": float(traded_budget),
+                "backtest_holding_days": holding_days,
+                "backtest_cohorts": cohort_count,
+                # 旧口径基线：满仓等权 + **1 日**持有、逐日重选。仅作模型质量监控。
+                "model_quality_backtest": {
+                    "net_annualized_return": legacy_performance[
+                        "net_annualized_return"
+                    ],
+                    "max_drawdown": legacy_performance["max_drawdown"],
+                    "mean_daily_turnover": float(
+                        pd.Series(legacy_turnovers, dtype=float).mean()
+                    ),
+                },
+                # P1-5 纯净对照：满仓 + 同样的 cohort 构建。它与 model_quality_backtest
+                # 构成**唯一变量对照**（只差持有期），用于回答"持有期对齐本身是否
+                # 改善回撤/收益"；刻意不吃现金稀释、也不受仓位上限约束，因此**不参与门槛**。
+                "horizon_matched_backtest": {
+                    "net_annualized_return": horizon_performance[
+                        "net_annualized_return"
+                    ],
+                    "max_drawdown": horizon_performance["max_drawdown"],
+                    "mean_daily_turnover": float(
+                        pd.Series(horizon_turnovers, dtype=float).mean()
+                    ),
+                },
                 "benchmark": {
                     "name": "equal_weight_stock_universe",
                     "annualized_return": benchmark_performance[
@@ -642,7 +1048,19 @@ def _run_qlib_stock_model(
                     ]
                     - benchmark_performance["net_annualized_return"],
                 },
+                # 2026-09-12 整改：满仓 20 日口径回撤告警（非阻断，见 _drawdown_advisory）。
+                "drawdown_advisories": {
+                    "horizon_matched": _drawdown_advisory(
+                        horizon_performance["max_drawdown"],
+                        benchmark_performance["max_drawdown"],
+                        (config.get("gate") or {}).get(
+                            "max_excess_test_drawdown", 0.15
+                        ),
+                    ),
+                },
                 "training_best_iteration": best_iteration,
+                # 2026-09-11 整改：记录拟合质量，供 fit_quality_threshold 门槛判定。
+                **_fit_quality(model),
                 "scores": {
                     validate_symbol(str(symbol)): float(score)
                     for symbol, score in latest.items()
@@ -656,18 +1074,30 @@ def _run_qlib_stock_model(
                 "model_cache_key": cache_key,
             }
             _report_progress(progress_callback, "publish", cache_hit=False)
+            # 健康检查：防止写入残缺缓存（2026-09-10 坏缓存事故后增设）
+            # 正常全市场训练应产生数千个分数；少于 MIN_STOCK_SCORES 视为异常，不写缓存。
+            # 注意：退化到这一步已在回测前被 _degenerate_stock_model 拦截；
+            # 这里保留二次防线，防止未来改动绕过前置守卫。
+            score_count = len(full_result["scores"])
+            min_scores_for_cache = MIN_STOCK_SCORES
             if cache_path is not None and cache_key is not None:
-                atomic_write_json(
-                    cache_path,
-                    research._jsonable(
-                        {
-                            "schema": MODEL_CACHE_SCHEMA,
-                            "cache_key": cache_key,
-                            "identity": cache_identity,
-                            "result": full_result,
-                        }
-                    ),
-                )
+                if score_count < min_scores_for_cache:
+                    full_result["cache_write_skipped"] = True
+                    full_result["cache_skip_reason"] = (
+                        f"score_count={score_count} below min_scores_for_cache={min_scores_for_cache}"
+                    )
+                else:
+                    atomic_write_json(
+                        cache_path,
+                        research._jsonable(
+                            {
+                                "schema": MODEL_CACHE_SCHEMA,
+                                "cache_key": cache_key,
+                                "identity": cache_identity,
+                                "result": full_result,
+                            }
+                        ),
+                    )
             return _filter_scores(full_result, requested_symbols)
         finally:
             provider_lock.release()

@@ -24,6 +24,24 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         drawdown_limit = abs(float(benchmark_drawdown)) + float(gate["max_excess_test_drawdown"])
     else:
         drawdown_limit = float(gate["max_test_drawdown"])
+    # 拟合质量门槛（**默认关闭，且不建议启用绝对值口径**）。
+    #
+    # 2026-09-11 初次引入时把 train_l2≈0.995 误判为"模型没学到"，据此设了 0.02。
+    # 当日复核证明该判断错误：截面 z-score 标签下方差为 1，故 R² ≈ IC²；
+    # 实测 train_l2=0.995423 → 隐含 |ρ|=0.0677，与同期 test IC=0.0563 自洽，
+    # 且 5 分组标签均值严格单调。要求 R² ≥ 2% 等于要求 IC ≥ 0.141，A 股不可达。
+    # 因此生产值已回退为 0.0（关闭）；模型质量由 RankIC / IR / 分组超额 / 回撤负责。
+    #
+    # 保留该分支的用途：0 表示关闭；一旦显式启用，指标缺失时判失败（fail-closed），
+    # 避免"配置写了门槛却因取不到指标而静默放行"。
+    min_fit_improvement = float(gate.get("min_train_l2_improvement", 0.0) or 0.0)
+    train_l2_improvement = metrics.get("train_l2_improvement")
+    fit_quality_ok = (
+        True
+        if min_fit_improvement <= 0.0
+        else bool(_finite(train_l2_improvement))
+        and float(train_l2_improvement) >= min_fit_improvement
+    )
     return {
         "data_quality_and_model_available": bool(metrics.get("model_available", False)),
         "mean_rank_ic_threshold": _finite(rank_ic)
@@ -33,6 +51,7 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         and float(top_bottom_excess) >= float(gate["min_top_bottom_excess_return"]),
         "test_max_drawdown_threshold": _finite(max_drawdown)
         and abs(float(max_drawdown)) <= drawdown_limit,
+        "fit_quality_threshold": fit_quality_ok,
     }
 
 

@@ -1,7 +1,7 @@
 r"""Fixed, auditable paths for the stock assistant.
 
 No caller-provided path is accepted by the research service.  All persistent
-state is resolved below ``D:\dsh-股票\quant``.
+state is resolved below ``<仓库根>/quant``.
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,32 @@ def ensure_directories() -> None:
         LOGS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
+
+
+_LEGACY_QUANT_ROOT_MARKER = "dsh-股票/quant"
+
+
+def relocate_legacy_path(value: str | os.PathLike[str]) -> Path | None:
+    """Map a path persisted under the pre-migration repo root onto this checkout.
+
+    The repository moved from ``D:\\dsh-股票`` to ``D:\\dsh-gupiao``; result
+    snapshots written before the move (e.g. ``current.json``) still carry the
+    old absolute prefix. Only the well-known legacy quant-root marker is
+    remapped, and only onto a location inside the current ``QUANT_ROOT``;
+    anything else returns ``None`` so the fixed-path boundary keeps rejecting
+    genuinely out-of-project references.
+    """
+    text = str(value).replace("\\", "/")
+    index = text.lower().find(_LEGACY_QUANT_ROOT_MARKER)
+    if index < 0:
+        return None
+    suffix = text[index + len(_LEGACY_QUANT_ROOT_MARKER):].lstrip("/")
+    candidate = QUANT_ROOT.joinpath(*suffix.split("/")) if suffix else QUANT_ROOT
+    try:
+        candidate.resolve().relative_to(QUANT_ROOT.resolve())
+    except ValueError:
+        return None
+    return candidate
 
 
 def fixed_path(value: str | os.PathLike[str], *, base: Path = QUANT_ROOT) -> Path:
@@ -98,16 +125,36 @@ def run_directory(run_id: str) -> Path:
 def atomic_write_text(path: Path, text: str) -> None:
     path = fixed_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    # 2026-09-10 状态写入重试：run_research_worker._write_status 与
+    # research._touch_status 并发 os.replace 同一 status.json 时，
+    # Windows 报 PermissionError WinError 5 把运行误标 failed
+    #（summary/model 已生成）。重试不改原子语义与心跳语义。
+    last_error: OSError | None = None
+    for attempt in range(5):
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            try:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            except OSError:
+                pass
+            time.sleep(0.05 * (2 ** attempt))
+        finally:
+            if os.path.exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+    assert last_error is not None
+    raise last_error
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
