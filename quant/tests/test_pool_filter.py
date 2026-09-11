@@ -93,11 +93,12 @@ class PoolQualityFilterTests(unittest.TestCase):
             "004320": _fact("前海开源沪港深乐享生活"),
         }
         eligible, exclusions = _pool_quality_filter(signals, facts, _config(), "2026-09-06")
-        self.assertEqual([s["symbol"] for s in eligible], ["513310"])
+        self.assertEqual([s["symbol"] for s in eligible], [])
         self.assertEqual(
             [(e["symbol"], e["reason"]) for e in exclusions],
             [
                 ("159502", "cross_border"),
+                ("513310", "cross_border"),
                 ("513290", "cross_border"),
                 ("004320", "cross_border"),
             ],
@@ -107,6 +108,41 @@ class PoolQualityFilterTests(unittest.TestCase):
         signals = [_signal("159502")]
         facts = {"159502": _fact("标普生物科技ETF嘉实")}
         config = _config(pool_exclude_cross_border=False)
+        eligible, exclusions = _pool_quality_filter(signals, facts, config, "2026-09-06")
+        self.assertEqual(len(eligible), 1)
+        self.assertEqual(exclusions, [])
+
+    def test_bj_board_excluded_only_for_stocks(self) -> None:
+        # 2026-09-10 回撤根治：北交所 ±30% 板打分后剔除，仅股票生效。
+        signals = [_signal("920855"), _signal("600519"), _signal("159502")]
+        facts = {
+            "920855": dict(_fact("浙江大农"), asset_type="stock"),
+            "600519": dict(_fact("贵州茅台"), asset_type="stock"),
+            "159502": dict(_fact("标普生物科技ETF嘉实"), asset_type="etf"),
+        }
+        config = _config(
+            pool_exclude_st=False,
+            pool_exclude_cross_border=False,
+            min_avg_amount_20d=0.0,
+            min_listing_age_calendar_days=0,
+            pool_exclude_bj=True,
+        )
+        eligible, exclusions = _pool_quality_filter(signals, facts, config, "2026-09-06")
+        self.assertEqual([s["symbol"] for s in eligible], ["600519", "159502"])
+        self.assertEqual(
+            [(e["symbol"], e["reason"]) for e in exclusions],
+            [("920855", "bj_board")],
+        )
+
+    def test_bj_filter_disabled_keeps_bj(self) -> None:
+        signals = [_signal("920855")]
+        facts = {"920855": dict(_fact("浙江大农"), asset_type="stock")}
+        config = _config(
+            pool_exclude_st=False,
+            pool_exclude_cross_border=False,
+            min_avg_amount_20d=0.0,
+            min_listing_age_calendar_days=0,
+        )
         eligible, exclusions = _pool_quality_filter(signals, facts, config, "2026-09-06")
         self.assertEqual(len(eligible), 1)
         self.assertEqual(exclusions, [])

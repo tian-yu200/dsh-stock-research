@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('status', 'start', 'pause', 'resume', 'errors', 'coverage')]
     [string]$Action = 'status',
@@ -7,6 +7,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $projectRoot 'quant\.venv\Scripts\python.exe'
 $entry = Join-Path $projectRoot 'quant\scripts\continuous_research.py'

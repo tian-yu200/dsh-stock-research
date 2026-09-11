@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 A股全市场日线批量下载（无超时限制）
-写入目录：D:\\dsh-股票\\quant\\data\\stocks\\
+写入目录：<仓库根>/quant/data/stocks/
+注意：该脚本绕过 fetch_state 台账与价格守卫，仅作历史诊断用途；
+生产抓取请走 fetch_stock_data.py worker。
 用法：python batch_download_stocks.py
 依赖：pip install akshare pandas
 """
@@ -18,7 +20,7 @@ except ImportError:
     import akshare as ak
 
 # ── 配置 ──────────────────────────────────────────
-OUT = Path(r"D:\dsh-股票\quant\data\stocks")
+OUT = Path(__file__).resolve().parents[1] / "data" / "stocks"
 OUT.mkdir(parents=True, exist_ok=True)
 START_DATE   = "20100101"   # 历史起始日
 FRESH_HOURS  = 12           # 文件 < 此时间则跳过

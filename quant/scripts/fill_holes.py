@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from price_guards import fetch_ths_daily, validate_daily_bars
 ROOT = Path(__file__).resolve().parent.parent
-holefile = sys.argv[1] if len(sys.argv) > 1 else "D:/dsh-股票/quant/logs/codex-runs/holes.json"
+holefile = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "logs" / "codex-runs" / "holes.json")
 holes = json.loads(Path(holefile).read_text(encoding="utf-8"))
 counts, filled_total = {}, 0
 for i, h in enumerate(holes):

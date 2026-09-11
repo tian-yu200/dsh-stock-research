@@ -18,7 +18,11 @@ import pandas as pd
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from data_source import fetch_etf_daily, fetch_otc_fund_nav
+from data_source import (
+    _DETERMINISTIC_EXCEPTIONS,
+    fetch_etf_daily,
+    fetch_otc_fund_nav,
+)
 from fetch_state import DEFAULT_DB_PATH, FetchState
 from fetch_utils import (
     BaselineDiscontinuityError,
@@ -33,6 +37,7 @@ from fetch_utils import (
     install_request_timeout,
     target_date,
 )
+from market_data import DailyBarSchemaError, EmptyDailyBarResponse
 from universe import (
     discover_etf_universe,
     discover_otc_fund_universe,
@@ -317,10 +322,12 @@ def _fetch_one(
     end = target.replace("-", "")
     attempts = max(1, int(retries) + 1)
     last_error: str | None = None
+    failure_class: str | None = None
     discont_backup: pathlib.Path | None = None
     for attempt in range(1, attempts + 1):
         if deadline is not None and time.monotonic() >= deadline:
             last_error = "worker deadline reached before next request"
+            failure_class = "worker_deadline"
             break
         try:
             limiter.wait()
@@ -344,6 +351,7 @@ def _fetch_one(
             return kind, code, True, metadata, None
         except BaselineDiscontinuityError as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            failure_class = getattr(exc, "failure_class", None) or "baseline_discontinuity"
             if discont_backup is None:
                 # 拼接基准断裂：挪开本地历史，降级为同源全量重取一次
                 discont_backup = path.with_name(path.name + ".discont.bak")
@@ -351,8 +359,19 @@ def _fetch_one(
                 start = next_start_date(None, "20200101")
                 continue
             break
+        except (EmptyDailyBarResponse, DailyBarSchemaError) as exc:
+            # 空响应/结构异常属确定性失败：秒级重试不会改变上游载荷形态，
+            # 直接记失败交给下一波次，避免烧掉 wave 预算（与股票通道一致）。
+            last_error = f"{type(exc).__name__}: {exc}"
+            failure_class = getattr(exc, "failure_class", None)
+            if failure_class is None:
+                failure_class = (
+                    "empty_window" if isinstance(exc, EmptyDailyBarResponse) else "schema_conflict"
+                )
+            break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            failure_class = getattr(exc, "failure_class", None)
             if isinstance(exc, FundNavValidationError):
                 state.mark_quarantined(
                     kind,
@@ -361,6 +380,15 @@ def _fetch_one(
                     owner=lease_owner,
                 )
                 return kind, code, False, None, last_error
+            if isinstance(exc, _DETERMINISTIC_EXCEPTIONS) or getattr(
+                exc, "deterministic", False
+            ):
+                # 解析类异常秒级重试无意义：直接记失败，下一波次再确认。
+                if failure_class is None:
+                    failure_class = "deterministic_upstream"
+                break
+            if failure_class is None:
+                failure_class = "upstream_error"
             if attempt < attempts:
                 delay = min(
                     backoff_max,
@@ -381,6 +409,7 @@ def _fetch_one(
         error=last_error or "unknown fetch error",
         backoff_base_seconds=max(1, int(backoff_base)),
         backoff_max_seconds=max(1, int(backoff_max)),
+        failure_class=failure_class or "upstream_error",
         owner=lease_owner,
     )
     return kind, code, False, None, last_error
@@ -529,7 +558,12 @@ def main(argv: list[str] | None = None) -> int:
             due = state.claim_due(
                 kind,
                 symbols=pool,
-                limit=min(batch_size, workers),
+                # 2026-09-09 空转修复：认领批量与抓取并发解耦。
+                # workers 只控制 ThreadPoolExecutor 并发，批量用 batch_size；
+                # 旧 min(batch_size, workers)=3 让 1341 个 ETF 需 447 轮，
+                # 且放大跨境头部全过滤空转概率。claim_due 已预过滤，
+                # 此处取满 batch_size 恢复吞吐。
+                limit=batch_size,
                 target_date=target,
                 lease_seconds=max(30, int(args.lease_seconds)),
                 owner=lease_owner,

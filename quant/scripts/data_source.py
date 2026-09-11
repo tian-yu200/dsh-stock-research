@@ -177,6 +177,13 @@ def _ths(symbol: str, start: str, end: str) -> pd.DataFrame:
 
 _SOURCES = [("东财", _em), ("腾讯", _tx), ("新浪", _sina)]
 
+# 2026-09-10 REBASE 钉住：腾讯复查证实这 5 只仍 serve 新基座
+#（旧基座=本地修复后口径），下一轮抓取命中毒日期会重毒。
+# 抓取侧对它们即使 validate 未报警也强制走同花顺复核，
+# 冲突即修；其余标的保持“报警才复核”，避免全市场 THS 请求风暴。
+# validate_daily_bars 语义未动，无需黄金基线 A/B。
+REBASE_PINNED_STOCKS = frozenset({"600094", "600479", "600052", "601225", "000002"})
+
 
 def _sources_for(symbol: str) -> list[tuple[str, Any]]:
     """920 北交所代码追加同花顺兜底：东财/腾讯当前不可用或解析不了北交所载荷。"""
@@ -215,12 +222,15 @@ def fetch_a_stock_daily(symbol: str, start="20200101", end="20991231") -> pd.Dat
                     from price_guards import ths_crosscheck as _pg_crosscheck
                     from price_guards import ths_patch_recent as _pg_patch
                     _pg_c, _pg_b, _pg_r = _pg_validate(df, source=name, symbol=symbol)
-                    if len(_pg_b) > 0 and len(df) >= 20:
+                    _pg_pinned = str(symbol) in REBASE_PINNED_STOCKS
+                    if (len(_pg_b) > 0 or _pg_pinned) and len(df) >= 20:
                         _pg_chk = _pg_crosscheck(symbol, df)
                         if _pg_chk.get("conflict"):
                             df, _pg_rep = _pg_patch(symbol, df)
                             print("  [" + symbol + "] 同花顺复核修复 " + str(_pg_rep.get("patched", 0)) + " 行 (" + str(_pg_chk.get("detail")) + ")")
                             df.attrs["ths_repaired"] = _pg_rep.get("patched", 0)
+                        elif _pg_pinned:
+                            print("  [" + symbol + "] REBASE钉住复核无分歧，保留 (" + str(_pg_chk.get("detail")) + ")")
                         else:
                             print("  [" + symbol + "] 本地验货报警 " + str(len(_pg_b)) + " 行，复核无分歧，保留待查")
                 except Exception as _pg_exc:
@@ -255,43 +265,70 @@ def fetch_a_stock_daily(symbol: str, start="20200101", end="20991231") -> pd.Dat
 
 
 def fetch_etf_daily(symbol: str, start="20200101", end="20991231") -> pd.DataFrame:
-    """场内ETF: 东财前复权 -> 腾讯前复权 -> 新浪未复权。"""
-    try:
-        df = ak.fund_etf_hist_em(
-            symbol=symbol, period="daily",
-            start_date=start, end_date=end, adjust="qfq",
-        )
-        df = normalize_daily_bars(df, source=f"eastmoney ETF {symbol}")
-        df.attrs["akshare_interface"] = "fund_etf_hist_em"
-        df.attrs["akshare_source"] = "东财"
-        df.attrs["adjustment"] = "qfq"
-        print(f"  [ETF {symbol}] 使用数据源: 东财 ({len(df)} 行)")
-        return df
-    except Exception as exc:
-        print(f"  [ETF {symbol}] 东财源失败: {type(exc).__name__}")
+    """场内ETF: 东财前复权 -> 腾讯前复权 -> 新浪未复权（熔断语义与股票通道一致）。"""
+    # 与股票通道共用源级熔断：同一进程内一源连续 20 次同类型异常后跳过，
+    # 避免 1500+ ETF 逐只重复撞反爬烧掉 wave 预算；顺序不可调换。
+    if _breaker_allows("东财"):
+        try:
+            df = ak.fund_etf_hist_em(
+                symbol=symbol, period="daily",
+                start_date=start, end_date=end, adjust="qfq",
+            )
+            df = normalize_daily_bars(df, source=f"eastmoney ETF {symbol}")
+            df.attrs["akshare_interface"] = "fund_etf_hist_em"
+            df.attrs["akshare_source"] = "东财"
+            df.attrs["adjustment"] = "qfq"
+            _breaker_record_success("东财")
+            print(f"  [ETF {symbol}] 使用数据源: 东财 ({len(df)} 行)")
+            return df
+        except (EmptyDailyBarResponse, DailyBarSchemaError):
+            print(f"  [ETF {symbol}] 东财源空响应/结构异常，降级下一源")
+        except Exception as exc:
+            _breaker_record_failure("东财", exc)
+            print(f"  [ETF {symbol}] 东财源失败: {type(exc).__name__}")
+    else:
+        print(f"  [ETF {symbol}] 东财源熔断跳过")
     prefixed = _market_prefix(symbol) + symbol
+    if _breaker_allows("腾讯"):
+        try:
+            df = ak.stock_zh_a_hist_tx(
+                symbol=prefixed, start_date=start, end_date=end, adjust="qfq",
+            )
+            df = normalize_daily_bars(df, source=f"tencent ETF {symbol}")
+            df.attrs["akshare_interface"] = "stock_zh_a_hist_tx"
+            df.attrs["akshare_source"] = "腾讯"
+            df.attrs["adjustment"] = "qfq"
+            _breaker_record_success("腾讯")
+            print(f"  [ETF {symbol}] 使用数据源: 腾讯 ({len(df)} 行)")
+            return df
+        except (EmptyDailyBarResponse, DailyBarSchemaError):
+            print(f"  [ETF {symbol}] 腾讯源空响应/结构异常，降级下一源")
+        except Exception as exc:
+            _breaker_record_failure("腾讯", exc)
+            print(f"  [ETF {symbol}] 腾讯前复权源失败: {type(exc).__name__}")
+    else:
+        print(f"  [ETF {symbol}] 腾讯源熔断跳过")
+    if not _breaker_allows("新浪"):
+        error = RuntimeError(f"{symbol} ETF 所有数据源已熔断跳过: 东财/腾讯/新浪")
+        error.failure_class = "all_sources_failed"  # type: ignore[attr-defined]
+        raise error
     try:
-        df = ak.stock_zh_a_hist_tx(
-            symbol=prefixed, start_date=start, end_date=end, adjust="qfq",
-        )
-        df = normalize_daily_bars(df, source=f"tencent ETF {symbol}")
-        df.attrs["akshare_interface"] = "stock_zh_a_hist_tx"
-        df.attrs["akshare_source"] = "腾讯"
-        df.attrs["adjustment"] = "qfq"
-        print(f"  [ETF {symbol}] 使用数据源: 腾讯 ({len(df)} 行)")
+        df = ak.fund_etf_hist_sina(symbol=prefixed)
+        df = normalize_daily_bars(df, source=f"sina ETF {symbol}")
+        df.attrs["akshare_interface"] = "fund_etf_hist_sina"
+        df.attrs["akshare_source"] = "新浪"
+        df.attrs["adjustment"] = "unadjusted"
+        start_date = pd.to_datetime(start, format="%Y%m%d")
+        end_date = pd.to_datetime(end, format="%Y%m%d")
+        df = df.loc[df["date"].between(start_date, end_date)].reset_index(drop=True)
+        _breaker_record_success("新浪")
+        print(f"  [ETF {symbol}] 使用数据源: 新浪 ({len(df)} 行)")
         return df
+    except (EmptyDailyBarResponse, DailyBarSchemaError):
+        raise
     except Exception as exc:
-        print(f"  [ETF {symbol}] 腾讯前复权源失败: {type(exc).__name__}")
-    df = ak.fund_etf_hist_sina(symbol=prefixed)
-    df = normalize_daily_bars(df, source=f"sina ETF {symbol}")
-    df.attrs["akshare_interface"] = "fund_etf_hist_sina"
-    df.attrs["akshare_source"] = "新浪"
-    df.attrs["adjustment"] = "unadjusted"
-    start_date = pd.to_datetime(start, format="%Y%m%d")
-    end_date = pd.to_datetime(end, format="%Y%m%d")
-    df = df.loc[df["date"].between(start_date, end_date)].reset_index(drop=True)
-    print(f"  [ETF {symbol}] 使用数据源: 新浪 ({len(df)} 行)")
-    return df
+        _breaker_record_failure("新浪", exc)
+        raise
 
 
 def fetch_otc_fund_nav(symbol: str) -> pd.DataFrame:

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('daily', 'monthly', 'on_demand')]
     [string]$Mode = 'on_demand',
@@ -13,6 +13,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $projectRoot 'quant\.venv\Scripts\python.exe'
 $entry = Join-Path $projectRoot 'quant\scripts\run_assistant_research.py'

@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from price_guards import fetch_ths_daily, validate_daily_bars
-csv = Path("D:/dsh-股票/quant/data/stocks/300256.csv")
+csv = Path(__file__).resolve().parents[1] / "data" / "stocks" / "300256.csv"
 df = pd.read_csv(csv)
 ths = fetch_ths_daily("300256")
 anchor = "2026-08-27"

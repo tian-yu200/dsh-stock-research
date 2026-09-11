@@ -399,6 +399,23 @@ class FetchState:
         now_text = iso_now(current)
         lease_until = iso_now(current + timedelta(seconds=max(1, lease_seconds)))
         selected = self._symbols(symbols or [])
+        # 2026-09-09 空转修复：跨境排除必须在 SQL LIMIT 之前生效。
+        # 旧逻辑先 LIMIT 3 再 Python 过滤，头部连续跨境时每轮返回 []，
+        # 租约不动、头部不变，无限空转。现对 selected 预过滤，
+        # LIMIT 后全是可抓标的；与 progress() 全量读后过滤口径一致。
+        # stock 永不过滤，缺名 fail-open，config 默认 false 保测试。
+        if _should_filter_progress() and asset_type in ("etf", "otc_fund") and selected:
+            try:
+                _names = _load_manifest_names_f().get(asset_type, {})
+                _kept = [
+                    s for s in selected
+                    if not _is_cross_border_f(_names.get(s, ""), asset_type=asset_type)
+                ]
+                selected = _kept
+                if not selected:
+                    return []
+            except Exception:
+                pass
         # A newer target date may bypass a prior success refresh once.
         clauses = [
             "asset_type = ?",
@@ -442,17 +459,15 @@ class FetchState:
                 """,
                 [*parameters, int(limit)],
             ).fetchall()
-            # 2026-09-07 跨境排除：etf/otc_fund 美港QDII 不抢占 fetch 预算
-            if _should_filter_progress() and asset_type in ("etf", "otc_fund"):
+            # selected 预过滤后，此处仅作 symbols=None 路径的兜底；
+            # 生产基金通道恒传 pool，正常情况下为无操作。
+            if not selected and _should_filter_progress() and asset_type in ("etf", "otc_fund"):
                 try:
-                    names_by_type = _load_manifest_names_f()
-                    nms = names_by_type.get(asset_type, {})
-                    filtered = []
-                    for r in rows:
-                        nm = nms.get(str(r["symbol"]), "")
-                        if not _is_cross_border_f(nm, asset_type=asset_type):
-                            filtered.append(r)
-                    rows = filtered
+                    _names_all = _load_manifest_names_f().get(asset_type, {})
+                    rows = [
+                        r for r in rows
+                        if not _is_cross_border_f(_names_all.get(str(r["symbol"]), ""), asset_type=asset_type)
+                    ]
                 except Exception:
                     pass
             for row in rows:

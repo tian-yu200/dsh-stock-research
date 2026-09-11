@@ -2,7 +2,8 @@ param([string]$Tag)
 $ErrorActionPreference = "Continue"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
-$qr = "D:\dsh-股票\quant"
+$qr = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$qr = Join-Path $qr "quant"
 $runDir = Join-Path $qr "logs\codex-runs"
 $out = Join-Path $runDir "$Tag.out.log"
 $exitFile = Join-Path $runDir "$Tag.exitcode"

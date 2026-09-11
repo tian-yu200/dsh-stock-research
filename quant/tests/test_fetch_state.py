@@ -606,6 +606,101 @@ class FetchStateTests(unittest.TestCase):
         self.assertEqual(preserved, ("000001", "pending"))
         self.assertIn("failure_class", columns)
         self.assertIn("failure_details_json", columns)
+
+    def test_claim_due_prefilters_cross_border_before_limit(self) -> None:
+        # 2026-09-09 空转回归：头部 3 个跨境 + limit=3 时旧逻辑返回 []；
+        # 预过滤后应跳过头部认领到第 4 个国内标的，且被过滤行不加租约。
+        import fetch_state as fetch_state_module
+
+        with tempfile.TemporaryDirectory(prefix="fetch-cross-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("etf", ["158000", "158003", "159010", "159011"])
+            names = {
+                "etf": {
+                    "158000": "港股通金融ETF鹏华",
+                    "158003": "港股通医疗ETF嘉实",
+                    "159010": "港股通科技ETF博时",
+                    "159011": "养殖ETF华安",
+                }
+            }
+            with (
+                patch.object(fetch_state_module, "_should_filter_progress", return_value=True),
+                patch.object(fetch_state_module, "_load_manifest_names_f", return_value=names),
+            ):
+                claimed = state.claim_due(
+                    "etf",
+                    symbols=["158000", "158003", "159010", "159011"],
+                    limit=3,
+                    target_date="2026-08-27",
+                    owner="worker-a",
+                )
+            self.assertEqual([item["symbol"] for item in claimed], ["159011"])
+            connection = sqlite3.connect(state.path)
+            try:
+                rows = {
+                    row[0]: (row[1], row[2])
+                    for row in connection.execute(
+                        "SELECT symbol, status, attempt_count FROM assets WHERE asset_type = 'etf'"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+            self.assertEqual(rows["159011"][0], "running")
+            for skipped in ("158000", "158003", "159010"):
+                self.assertEqual(rows[skipped], ("pending", 0))
+
+    def test_claim_due_cross_border_stock_never_filtered_and_missing_name_fail_open(self) -> None:
+        import fetch_state as fetch_state_module
+
+        with tempfile.TemporaryDirectory(prefix="fetch-cross-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("stock", ["600001"])
+            state.register_assets("etf", ["159011"])
+            names = {"etf": {}, "otc_fund": {}}
+            with (
+                patch.object(fetch_state_module, "_should_filter_progress", return_value=True),
+                patch.object(fetch_state_module, "_load_manifest_names_f", return_value=names),
+            ):
+                # stock 永不过滤：名称含亚太也不应被拦（此处直接按 symbol 认领）。
+                stock_claimed = state.claim_due(
+                    "stock",
+                    symbols=["600001"],
+                    limit=1,
+                    target_date="2026-08-27",
+                    owner="worker-a",
+                )
+                # 缺名 fail-open：manifest 无名仍可认领。
+                etf_claimed = state.claim_due(
+                    "etf",
+                    symbols=["159011"],
+                    limit=1,
+                    target_date="2026-08-27",
+                    owner="worker-b",
+                )
+            self.assertEqual([item["symbol"] for item in stock_claimed], ["600001"])
+            self.assertEqual([item["symbol"] for item in etf_claimed], ["159011"])
+
+    def test_claim_due_cross_border_disabled_by_default(self) -> None:
+        import fetch_state as fetch_state_module
+
+        with tempfile.TemporaryDirectory(prefix="fetch-cross-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("etf", ["158000"])
+            names = {"etf": {"158000": "港股通金融ETF鹏华"}}
+            with (
+                patch.object(fetch_state_module, "_should_filter_progress", return_value=False),
+                patch.object(fetch_state_module, "_load_manifest_names_f", return_value=names),
+            ):
+                claimed = state.claim_due(
+                    "etf",
+                    symbols=["158000"],
+                    limit=1,
+                    target_date="2026-08-27",
+                    owner="worker-a",
+                )
+            self.assertEqual([item["symbol"] for item in claimed], ["158000"])
+
+
 class FetchUtilityTests(unittest.TestCase):
     def test_cached_end_date_and_incremental_merge(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fetch-utils-", dir=ROOT / "tests") as directory:

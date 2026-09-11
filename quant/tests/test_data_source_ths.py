@@ -22,6 +22,13 @@ class SourcesForTests(unittest.TestCase):
         self.assertEqual(len(chain), 4)
         self.assertEqual(chain[-1][0], "同花顺")
 
+    def test_rebase_pinned_stocks_match_tencent_recheck(self) -> None:
+        # 2026-09-10 腾讯复查：这 5 只仍 serve 新基座，需抓取侧钉住复核。
+        self.assertEqual(
+            data_source.REBASE_PINNED_STOCKS,
+            frozenset({"600094", "600479", "600052", "601225", "000002"}),
+        )
+
 
 class ThsSourceTests(unittest.TestCase):
     def test_ths_parses_payload_and_filters_window(self) -> None:

@@ -1,0 +1,35 @@
+# 熊市配置 - 基于regime检测结果
+
+# 复制自 configs/assistant.yaml，针对熊市调整
+
+# 1. 更保守的风险参数
+risk:
+  max_stock_exposure: 0.20      # 从0.4降到0.2（熊市减仓）
+  max_etf_exposure: 0.40        # 从0.5降到0.4
+  max_otc_fund_exposure: 0.40   # 基金相对安全，保持
+  max_single_weight: 0.15       # 从0.2降到0.15（分散风险）
+  min_cash_weight: 0.40         # 从0.2升到0.4（持有更多现金）
+  max_daily_turnover: 0.15      # 从0.2降到0.15（减少交易）
+
+# 2. 更严格的选股门槛（熊市只选最强标的）
+research:
+  stock_topk: 2                 # 从3降到2
+  min_avg_amount_20d: 20000000  # 从1000万升到2000万（只选流动性好的）
+  
+# 3. 更高的IC要求
+gate:
+  min_mean_rank_ic: 0.08        # 从0.02升到0.08
+  min_rank_ic_ir: 0.3           # 从0.1升到0.3
+  max_test_drawdown: 0.20       # 从0.25降到0.20（更低回撤容忍）
+
+# 4. 宁缺毋滥过滤器全开
+research:
+  pool_exclude_st: true
+  pool_exclude_cross_border: true
+  pool_exclude_bj: true         # 熊市北交所波动太大
+  min_listing_age_calendar_days: 180  # 从90升到180（只要老股票）
+
+# 使用方法:
+# 1. 备份原配置: cp configs/assistant.yaml configs/assistant_backup.yaml
+# 2. 测试熊市配置: python scripts/continuous_research.py --config configs/assistant_bear.yaml
+# 3. 对比IC变化

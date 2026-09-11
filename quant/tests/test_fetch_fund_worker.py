@@ -139,7 +139,9 @@ class FundWorkerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(state.claim_limits)
-        self.assertLessEqual(max(state.claim_limits), 3)
+        # 2026-09-09 空转修复：认领批量与抓取并发解耦，批量用 batch_size(200)，
+        # workers(3) 只控制 ThreadPoolExecutor 并发；旧 min(batch,workers)<=3 断言已失效。
+        self.assertEqual(max(state.claim_limits), 200)
         self.assertEqual(set(state.claim_kinds), {"otc_fund"})
 
     def test_fetch_one_does_not_retry_after_deadline(self) -> None:

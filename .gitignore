@@ -12,8 +12,13 @@ quant/mlruns/
 mlruns/
 *.sqlite3
 
-# 测试残留产物
+# 测试残留产物（pytest tmp 目录：测试名-8位随机后缀，可随时删除重建）
 quant/tests/continuous-*/
+quant/tests/*-????????/
+
+# WorkBuddy 会话工作区（只入库 reports/ 下的报告）
+.workbuddy/*
+!.workbuddy/reports/
 
 # DSH 运行时与凭据（含 .credentials.yaml，禁止入库）
 .dsh/
