@@ -24,6 +24,7 @@ import pandas as pd
 from .config import config_snapshot, load_config
 from .cross_border import CROSS_BORDER_KEYWORDS, is_cross_border
 from .notifications import add_notification
+from .regime_detector import RegimeAwareModelManager, get_benchmark_returns
 from .paths import (
     ASSISTANT_RESULTS_DIR,
     DATA_DIR,
@@ -302,6 +303,7 @@ def _pool_quality_filter(
     """
     research_cfg = config.get("research") or {}
     exclude_st = bool(research_cfg.get("pool_exclude_st", False))
+    exclude_bj = bool(research_cfg.get("pool_exclude_bj", False))
     min_age_days = int(research_cfg.get("min_listing_age_calendar_days", 90) or 0)
     min_avg_amount = float(research_cfg.get("min_avg_amount_20d", 0.0) or 0.0)
     exclude_cross_border = bool(research_cfg.get("pool_exclude_cross_border", False))
@@ -313,6 +315,15 @@ def _pool_quality_filter(
         fact = facts_by_symbol.get(symbol) or {}
         name = str(fact.get("name") or "")
         reason = None
+        # 2026-09-10 回撤根治：北交所（92/43/83/87/4 开头）±30% 板
+        # 在打分后、取 top-k 前剔除；仅对股票生效（ETF/场外不动），
+        # 缺号/缺类型 fail-open。
+        if exclude_bj and reason is None and symbol:
+            fact_type = (fact.get("asset_type") or "") if isinstance(fact, dict) else ""
+            if fact_type in ("", "stock"):
+                prefix = str(symbol).strip().upper()
+                if prefix.startswith(("92", "43", "83", "87", "4")):
+                    reason = "bj_board"
         if exclude_st and name:
             upper = name.upper()
             if "ST" in upper or "退" in name:
@@ -444,6 +455,43 @@ def run_research(
     log_lines = [f"started {started.isoformat()}", f"mode={mode}", f"asset_types={asset_types}"]
     status_path = run_dir / "status.json"
     _sweep_stale_runs(config, log_lines)
+    
+    # === Regime检测：在熊市时自动调整风险参数 ===
+    current_regime = 'unknown'  # 默认值
+    regime_manager = None       # 2026-09-11 整改(P2-9)：供发布阶段回写训练状态
+    try:
+        benchmark_returns = get_benchmark_returns(str(DATA_DIR))
+        regime_manager = RegimeAwareModelManager(state_file=str(DATA_DIR / "model_regime_state.json"))
+        regime_check = regime_manager.check_should_retrain(
+            benchmark_returns,
+            current_date=started.strftime('%Y-%m-%d')
+        )
+        
+        current_regime = regime_check['current_regime']
+        log_lines.append(f"market_regime={current_regime}")
+        
+        # 熊市自动降低风险
+        if 'bear' in current_regime:
+            log_lines.append("bear_market_detected: adjusting_risk_params")
+            # 动态调整config（不修改文件，只影响本次运行）
+            config = dict(config)  # 浅拷贝
+            config['risk'] = dict(config.get('risk', {}))
+            config['risk']['min_cash_weight'] = max(config['risk'].get('min_cash_weight', 0.2), 0.4)
+            config['risk']['max_stock_exposure'] = min(config['risk'].get('max_stock_exposure', 0.4), 0.2)
+            config['risk']['max_daily_turnover'] = min(config['risk'].get('max_daily_turnover', 0.2), 0.15)
+            log_lines.append(f"risk_adjusted: cash≥40%, stock≤20%, turnover≤15%")
+        
+        # 2026-09-11 整改(P2-9)：这里只作为"建议"记录，不做额外动作。
+        # 模型缓存键已包含 provider_end，provider 每次重建都会自然触发一次重训；
+        # 原先该分支恒为 True（save_state 从未被调用，last_trained_regime 永远为 None），
+        # 且只写日志、无任何行为，容易误导为"已有 regime 感知重训"。
+        if regime_check['should_retrain']:
+            log_lines.append(f"retrain_recommended(advisory): {regime_check['reason']}")
+            
+    except Exception as e:
+        log_lines.append(f"regime_detection_failed: {e}")
+        # 失败不影响正常流程，继续使用原配置
+    
     refresh: dict[str, Any] = {"attempted": False, "passed": True, "results": []}
     all_facts: list[dict[str, Any]] = []
     technical_signals: dict[str, Any] = {}
@@ -780,7 +828,16 @@ def run_research(
                     log_lines.append(
                         f"[宁缺毋滥] 共剔除 {len(pool_exclusions)} 个候选（ST/退市整理/次新/低流动性）"
                     )
+                # 2026-09-11 整改(P1-8)：移除 LowTurnoverTopkStrategy 的"假接入"。
+                # 原接入每次运行都新建实例，current_position/entry_prices 恒为空：
+                # 持仓惯性分支永不执行；止损分支未传 current_prices 且只是 continue 空操作；
+                # 返回的权重被丢弃（只取 keys() 重排），实质只施加了一个 regime 相关的
+                # |score| 阈值过滤。而回测路径（qlib_model.py）并不经过该策略，
+                # 造成实盘选股口径与回测不一致。此处恢复"按得分取 top-k"的文档化契约。
+                # 低换手/持仓惯性若要真正生效，必须持久化持仓与成本价状态，并同时
+                # 接入回测（见《量化系统评估报告-20260911》P1-8）。
                 ranked = eligible_signals[: int(config["research"]["stock_topk"])]
+
                 min_score = float(config["research"].get("min_qlib_score_for_weights", 0.0))
                 screened = []
                 for signal in ranked:
@@ -940,17 +997,113 @@ def run_research(
         if not data_quality["passed"]:
             failure_reasons.append("data_quality_or_refresh_failed")
         if "stock" in analyzed_types and not rule_gates.get("stock", {}).get("passed", False):
-            failure_reasons.append("stock_model_or_risk_gate_failed")
+            # 2026-09-11 整改(P0-2)：横截面退化（数据不足）与"模型不合格"必须区分，
+            # 否则日历/数据对齐问题会被记成模型能力问题，污染调度器 failure_streak。
+            _stock_metrics_out = rule_gates.get("stock", {}).get("model_metrics") or {}
+            if _stock_metrics_out.get("degenerate"):
+                failure_reasons.append("stock_signal_cross_section_degenerate")
+                log_lines.append(
+                    "degenerate_signals: "
+                    + str(_stock_metrics_out.get("degenerate_reason"))
+                )
+            else:
+                failure_reasons.append("stock_model_or_risk_gate_failed")
         if not portfolio_risk["passed"]:
             failure_reasons.append("portfolio_risk_gate_failed")
         for asset_type in ("etf", "otc_fund"):
             if asset_type in analyzed_types and not rule_gates.get(asset_type, {}).get("passed", False):
                 failure_reasons.append(f"{asset_type}_quality_or_risk_gate_failed")
-        run_status = "failed" if failure_reasons else "success"
+        # 2026-09-11 整改(P0-3)：**分类别发布**——类别内一票否决，类别间独立发布。
+        # 原先 `published` 只看"有没有任何 failure_reasons"，于是股票门槛一失败，
+        # 已通过的 ETF/基金结论会被一并丢弃，界面只能看到陈旧快照，且无从察觉。
+        # 现在：只要还有类别就绪就落盘 current.json，被拦类别显式归零并标注原因。
+        ready_asset_types = [
+            asset_type
+            for asset_type in analyzed_types
+            if rule_gates.get(asset_type, {}).get("passed", False)
+        ]
+        blocked_asset_types = [
+            asset_type for asset_type in analyzed_types
+            if asset_type not in ready_asset_types
+        ]
+        publication = {
+            "state": (
+                "blocked"
+                if not ready_asset_types
+                else ("full" if not blocked_asset_types else "partial")
+            ),
+            "published": bool(ready_asset_types),
+            "ready_asset_types": ready_asset_types,
+            "blocked_asset_types": blocked_asset_types,
+            "blocked_reasons": {
+                asset_type: [
+                    name
+                    for name, ok in (rule_gates.get(asset_type, {}).get("checks") or {}).items()
+                    if not ok
+                ]
+                for asset_type in blocked_asset_types
+            },
+        }
+        decision_support["publication"] = publication
+        log_lines.append(
+            "publication_readiness: ready=%s blocked=%s" % (
+                ready_asset_types or "[]",
+                blocked_asset_types or "[]",
+            )
+        )
+        # 被拦类别：权重必须归零，并从总权重表里剔除其标的。
+        # 安全性质：绝不能把"未发布类别"的权重当成新结论（宁可空仓）。
+        # 若该类别已在自身门槛路径里归零并给了更具体的原因（如个股的
+        # `cash_or_observe` + "个股模型或风险门槛未通过…"），保留它，不要用泛化文案覆盖。
+        if blocked_asset_types:
+            for asset_type in blocked_asset_types:
+                decision = decision_support["asset_paths"].get(asset_type)
+                if not isinstance(decision, dict):
+                    continue
+                leaked = decision.get("target_weights") or {}
+                for symbol in leaked:
+                    decision_support["target_weights"].pop(symbol, None)
+                decision["target_weights"] = {}
+                decision["cash_weight"] = 1.0
+                if leaked:
+                    decision["status"] = "blocked"
+                    decision["action"] = "不发布"
+                    decision["reason"] = (
+                        "该资产类别未通过质量/风险门槛，本轮不发布其目标权重。"
+                    )
+            log_lines.append(
+                "publication partial: blocked types withheld: %s" % (blocked_asset_types,)
+            )
+
+        if not ready_asset_types:
+            run_status = "failed"
+        elif blocked_asset_types:
+            run_status = "partial"
+        else:
+            run_status = "success"
+        decision_support["publication_blocked"] = not ready_asset_types
         if failure_reasons:
-            decision_support["publication_blocked"] = True
             decision_support["failure_reasons"] = failure_reasons
+        if run_status == "failed":
             log_lines.append(f"publication blocked: {failure_reasons}")
+        if run_status != "failed" and regime_manager is not None:
+            # 2026-09-11 整改(P2-9)：把 regime 训练状态真正落盘。原先 save_state
+            # 在生产代码中从未被调用，导致 should_retrain 永远读不到上次状态
+            # （last_trained_regime 恒为 None），regime 感知重训形同虚设。
+            # 必须在 _write_run_files 之前执行，日志才能随本轮一起落盘。
+            try:
+                _ic_raw = (model_metadata.get("stock_model") or {}).get("mean_rank_ic")
+                _ic = float(_ic_raw) if isinstance(_ic_raw, (int, float)) else None
+                regime_manager.save_state(
+                    regime=current_regime,
+                    date=_now().isoformat(),
+                    ic=_ic,
+                )
+                log_lines.append(f"regime_state_saved: {current_regime}")
+            except Exception as exc:
+                log_lines.append(
+                    f"regime_state_save_failed: {type(exc).__name__}: {exc}"
+                )
 
         _close_stage()
         manifest = {
@@ -972,6 +1125,7 @@ def run_research(
             "data_end_date": data_quality.get("data_end_date"),
             "retry_count": int(config["fetch"]["retries"]),
             "failure_reasons": failure_reasons,
+            "publication": publication,
             "stage_timings": _jsonable(stage_timings),
             "config_snapshot": config_snapshot(config),
         }
@@ -1002,10 +1156,12 @@ def run_research(
         }
         if not reuse_run_dir:
             atomic_write_json(status_path, status)
-        if run_status == "success":
+        # 2026-09-11 整改(P0-3)：只要还有类别就绪就落盘（含 partial）。
+        # 被拦类别的权重已在上面归零标注，因此 current.json 里不会混入未发布的旧结论。
+        if ready_asset_types:
             current = {
                 "run_id": run_id,
-                "status": "success",
+                "status": run_status,
                 "updated_at": manifest["finished_at"],
                 "data_end_date": data_quality.get("data_end_date"),
                 "result_path": str(run_dir),
@@ -1014,13 +1170,24 @@ def run_research(
                 "rule_gates": _jsonable(rule_gates),
             }
             atomic_write_json(ASSISTANT_RESULTS_DIR / "current.json", current)
-            notification = add_notification(
-                "research_success",
-                "股票/基金研究完成",
-                f"运行 {run_id} 已完成，数据截止 {data_quality.get('data_end_date') or 'unknown'}。",
-                run_id=run_id,
-                paths=result_paths,
-            )
+            if blocked_asset_types:
+                notification = add_notification(
+                    "research_partial",
+                    "股票/基金研究部分发布",
+                    f"运行 {run_id} 部分发布：已就绪 {ready_asset_types}；"
+                    f"未通过门槛、本轮不发布 {blocked_asset_types}"
+                    f"（数据截止 {data_quality.get('data_end_date') or 'unknown'}）。",
+                    run_id=run_id,
+                    paths=result_paths,
+                )
+            else:
+                notification = add_notification(
+                    "research_success",
+                    "股票/基金研究完成",
+                    f"运行 {run_id} 已完成，数据截止 {data_quality.get('data_end_date') or 'unknown'}。",
+                    run_id=run_id,
+                    paths=result_paths,
+                )
         else:
             notification = add_notification(
                 "research_failure",

@@ -106,7 +106,8 @@ FUND_SIGNAL_KEYS = set(_SIGNAL_BASE_KEYS)
 STOCK_CHECK_KEYS = {
     "data_quality_and_model_available", "mean_rank_ic_threshold",
     "rank_ic_ir_threshold", "top_bottom_excess_return_threshold",
-    "test_max_drawdown_threshold", "data_quality_passed", "freshness_passed",
+    "test_max_drawdown_threshold", "fit_quality_threshold",
+    "data_quality_passed", "freshness_passed",
     "refresh_passed", "leakage_check_passed", "full_universe_screen_passed",
     "positive_signal_passed", "risk_constraints_passed",
 }
@@ -311,9 +312,15 @@ class ResearchSnapshotTests(unittest.TestCase):
             {
                 "allocation_basis", "hypothetical_capital", "broker_connected",
                 "auto_order", "asset_paths", "target_weights", "cash_weight",
-                "portfolio_gate",
+                "portfolio_gate", "publication",
+                # 2026-09-11 P0-3：分类别发布后 publication_blocked 恒存在
+                # （全量发布时为 False），使调用方无需区分"键缺失"与"未阻断"。
+                "publication_blocked",
             },
         )
+        self.assertFalse(decision_support["publication_blocked"])
+        self.assertEqual(decision_support["publication"]["state"], "full")
+        self.assertTrue(decision_support["publication"]["published"])
         self.assertEqual(decision_support["allocation_basis"], "基于假设资金/配置的目标权重")
         self.assertEqual(decision_support["hypothetical_capital"], 100000.0)
         self.assertFalse(decision_support["broker_connected"])
@@ -440,8 +447,8 @@ class ResearchSnapshotTests(unittest.TestCase):
                 "run_id", "status", "started_at", "finished_at", "mode", "depth",
                 "asset_scope", "asset_types", "analyzed_types",
                 "requested_symbols", "data_sources", "data_end_date",
-                "retry_count", "failure_reasons", "config_snapshot", "paths",
-                "stage_timings",
+                "retry_count", "failure_reasons", "publication", "config_snapshot",
+                "paths", "stage_timings",
             },
         )
         self.assertEqual(manifest["status"], "success")
@@ -676,8 +683,16 @@ class ResearchSnapshotTests(unittest.TestCase):
                 f"started {FIXED_NOW_ISO}",
                 "mode=on_demand",
                 "asset_types=('stock', 'etf', 'otc_fund')",
+                # 2026-09-11 整改同步：regime 检测块（16:56 加入 research.py）
+                # 会在 asset_types 之后写 market_regime / retrain_recommended，
+                # 成功发布时再追加 regime_state_saved。旧夹具缺少这三行。
+                "market_regime=bull_low_vol",
+                "retrain_recommended(advisory): 首次训练",
                 "analyzed_types=('stock', 'etf', 'otc_fund')",
                 "data refresh skipped by configuration or DSH_STOCK_SKIP_FETCH=1",
+                # 2026-09-11 整改(P0-3 第一步)：显式暴露各类别的发布就绪度。
+                "publication_readiness: ready=['stock', 'etf', 'otc_fund'] blocked=[]",
+                "regime_state_saved: bull_low_vol",
             ],
         )
 
@@ -735,9 +750,9 @@ class ResearchSnapshotTests(unittest.TestCase):
         self.assertEqual(run_status["finished_at"], FIXED_NOW_ISO)
         self._assert_same_path(run_status["result_path"], run_dir)
 
-    # ---------- 用例 2：个股门槛失败阻断发布并保留 current.json ----------
+    # ---------- 用例 2：P0-3 分类别发布——个股门槛失败，ETF/基金结论仍落盘 ----------
 
-    def test_failed_stock_gate_blocks_publication_and_preserves_current(self) -> None:
+    def test_failed_stock_gate_still_publishes_ready_asset_types(self) -> None:
         sentinel = {
             "run_id": "sentinel-success",
             "status": "success",
@@ -760,7 +775,8 @@ class ResearchSnapshotTests(unittest.TestCase):
         model.assert_called_once_with(self.config)
         run_dir = self._run_dir()
 
-        self.assertEqual(result["status"], "failed")
+        # P0-3：个股被拦但 ETF/基金就绪 → 三态状态为 partial，不再是整体 failed。
+        self.assertEqual(result["status"], "partial")
         self.assertEqual(result["failure_reasons"], ["stock_model_or_risk_gate_failed"])
         self.assertEqual(
             self.heartbeats,
@@ -796,11 +812,21 @@ class ResearchSnapshotTests(unittest.TestCase):
                 "allocation_basis", "hypothetical_capital", "broker_connected",
                 "auto_order", "asset_paths", "target_weights", "cash_weight",
                 "portfolio_gate", "publication_blocked", "failure_reasons",
+                "publication",
             },
         )
-        self.assertTrue(decision_support["publication_blocked"])
+        # P0-3：仍有类别就绪 → 不算被阻断；失败原因完整保留以便追踪。
+        self.assertFalse(decision_support["publication_blocked"])
         self.assertEqual(
             decision_support["failure_reasons"], ["stock_model_or_risk_gate_failed"]
+        )
+        publication = decision_support["publication"]
+        self.assertEqual(publication["state"], "partial")
+        self.assertTrue(publication["published"])
+        self.assertEqual(publication["ready_asset_types"], ["etf", "otc_fund"])
+        self.assertEqual(publication["blocked_asset_types"], ["stock"])
+        self.assertEqual(
+            publication["blocked_reasons"]["stock"], ["mean_rank_ic_threshold"]
         )
         asset_paths = decision_support["asset_paths"]
         self.assertEqual(
@@ -832,26 +858,59 @@ class ResearchSnapshotTests(unittest.TestCase):
         self.assertEqual(result["decision_support"], decision_support)
 
         status = self._read_json(run_dir / "status.json")
-        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["status"], "partial")
         self.assertEqual(status["failure_reasons"], ["stock_model_or_risk_gate_failed"])
         self.assertEqual(status["finished_at"], FIXED_NOW_ISO)
         manifest = self._read_json(run_dir / "manifest.json")
-        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["status"], "partial")
         self.assertEqual(manifest["failure_reasons"], ["stock_model_or_risk_gate_failed"])
         self.assertEqual(set(manifest["paths"]), RUN_FILE_KEYS)
 
+        # P0-3 的核心：就绪类别的结论要真的落盘，不再被"全有全无"挡在门外。
         current = self._read_json(self.results_dir / "current.json")
-        self.assertEqual(current, sentinel)
+        self.assertNotEqual(current, sentinel)
+        self.assertEqual(current["run_id"], RUN_ID)
+        self.assertEqual(current["status"], "partial")
+        published = current["decision_support"]
+        self.assertNotIn("OLD", published["target_weights"])
+        self.assertAlmostEqual(
+            published["target_weights"]["510300"], path_weight, places=12
+        )
+        self.assertAlmostEqual(
+            published["target_weights"]["110020"], path_weight, places=12
+        )
+        # 被拦类别（stock）在落盘快照里必须零权重。
+        self.assertEqual(published["asset_paths"]["stock"]["target_weights"], {})
+        self.assertEqual(published["publication"]["blocked_asset_types"], ["stock"])
 
         notifications_page = research.list_notifications()
         self.assertEqual(notifications_page["count"], 1)
         record = notifications_page["notifications"][0]
-        self.assertEqual(record["kind"], "research_failure")
+        self.assertEqual(record["kind"], "research_partial")
         self.assertEqual(record["run_id"], RUN_ID)
         self.assertEqual(record["notification_id"], result["notification_id"])
 
         run_status = research.get_run_status(RUN_ID)
-        self.assertEqual(run_status["status"], "failed")
+        self.assertEqual(run_status["status"], "partial")
+
+        # P0-3：被拦类别经只读 API 查询时必须是 blocked 且**不带权重**——
+        # 否则界面会把未发布类别的陈旧结论当成新结论，正是本项要修的故障。
+        blocked_view = research.get_current_snapshot("stock", None)
+        self.assertEqual(blocked_view["status"], "blocked")
+        self.assertNotIn("decision_support", blocked_view)
+        self.assertEqual(
+            blocked_view["publication"]["blocked_asset_types"], ["stock"]
+        )
+        # 已就绪类别照常返回结论与信号。
+        ready_view = research.get_current_snapshot("etf", "SH510300")
+        self.assertEqual(ready_view["status"], "partial")
+        self.assertEqual(ready_view["publication"]["state"], "partial")
+        self.assertEqual(len(ready_view["signals"]), 1)
+        self.assertAlmostEqual(
+            ready_view["decision_support"]["target_weights"]["510300"],
+            path_weight,
+            places=12,
+        )
 
 
     # ---------- 用例 3：定向研究即使模型通过也不产生权重（海选原则） ----------

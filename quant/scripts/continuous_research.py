@@ -626,7 +626,13 @@ def _ensure_job(
         if current_status == "paused":
             return job, progress, "analysis_retry_exhausted"
         if current_status == "failed":
-            if progress["pending"] == 0:
+            # 2026-09-10 防空转：确定性门槛失败也计 analysis_retry。
+            # 旧逻辑仅 pending==0 才计数，pending≠0(场外计时器锁)时
+            # 门槛必败+退出1+10分钟重跑无限闭环。必须读结构化
+            # worker_json.failure_reasons，不能子串匹配 last_error
+            #（job台账有stderr误报，不变量§7）。
+            gate_failed = _structured_gate_failure(job)
+            if gate_failed or progress["pending"] == 0:
                 attempts = int(control["analysis_attempts"].get(job["job_id"], 0))
                 if attempts >= MAX_ANALYSIS_RETRIES:
                     state.update_job(
@@ -893,6 +899,123 @@ def _log_progress(
     )
 
 
+def _structured_gate_failure(job: dict[str, Any] | None) -> bool:
+    """结构化判定确定性门槛失败（免stderr误报）。
+
+    只认 worker_json.failure_reasons 中的 gate/model/回撤 token，
+    不碰 job.last_error（不变量§7：台账会把git CRLF/qlib提示/
+    LightGBM日志误判为失败文本）。
+    """
+    if not isinstance(job, dict):
+        return False
+    try:
+        metadata = json.loads(str(job.get("metadata_json") or "{}"))
+    except (ValueError, TypeError):
+        metadata = {}
+    reasons: list[str] = []
+    if isinstance(metadata, dict):
+        raw = metadata.get("failure_reasons")
+        if isinstance(raw, list):
+            reasons = [str(item) for item in raw]
+        elif raw:
+            reasons = [str(raw)]
+    try:
+        status_path = run_directory(str(job.get("job_id", ""))) / "status.json"
+    except (ValueError, FileNotFoundError):
+        status_path = None
+    if status_path is not None:
+        try:
+            worker_status = _read_json(status_path, {})
+            raw = (worker_status or {}).get("failure_reasons")
+            if isinstance(raw, list):
+                reasons.extend(str(item) for item in raw)
+            elif raw:
+                reasons.append(str(raw))
+        except (OSError, ValueError):
+            pass
+    joined = " ".join(reasons).lower()
+    return any(
+        token in joined
+        for token in ("gate", "model", "drawdown", "回撤", "门槛", "risk")
+    )
+
+
+def _round_published(job_id: str, *, since: datetime) -> bool:
+    """本轮是否真的发布成功——以产物为准，不看退出码/台账文本。
+
+    2026-09-11 整改(P0-4)：实测 job `20260911T065625Z-d6d4eede` 已成功发布
+    （`manifest.json` status=success、`current.json` 已更新、`publication.state=full`），
+    但 worker 因内层子进程退出码异常而自报 failed、退出码 1，于是本轮被记成失败，
+    `failure_streak` 累到 3，`_auto_pause_on_streak` 在 22:05:49 把整个调度器停摆。
+    《研究管线不变量》§7 明确：判断运行成败以 manifest.json / current.json 为准。
+
+    `since` 是本轮起始时刻，用于排除"复用 run 目录时上一次 pass 留下的旧成功产物"。
+    """
+    try:
+        manifest = _read_json(run_directory(job_id) / "manifest.json", {})
+    except Exception:
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    if str(manifest.get("run_id") or "") != str(job_id):
+        return False
+    publication = manifest.get("publication")
+    if not isinstance(publication, dict) or not publication.get("published"):
+        return False
+    try:
+        finished_at = datetime.fromisoformat(str(manifest.get("finished_at")))
+    except (TypeError, ValueError):
+        return False
+    reference = since
+    if finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=ZoneInfo("UTC"))
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=ZoneInfo("UTC"))
+    # 5 秒容差：manifest 由子进程写入，与本进程取时存在微小偏差。
+    return finished_at >= reference - timedelta(seconds=5)
+
+
+def _auto_pause_on_streak(
+    control: dict[str, Any],
+    *,
+    streak: int,
+    job_id: str | None,
+    logger: logging.Logger,
+) -> bool:
+    """连败熔断：failure_streak边沿≥3时写全局paused.json。
+
+    只在边沿触发一次（复用last_alert_failure_streak语义），
+    resume会清streak，给3轮验证窗口。回滚 = 删paused.json。
+    """
+    if streak < 3:
+        return False
+    if int(control.get("last_alert_failure_streak", 0) or 0) >= 3:
+        return False
+    try:
+        _write_json(
+            PAUSE_PATH,
+            {
+                "reason": (
+                    "automatic pause: continuous research failed for "
+                    f"{streak} consecutive rounds; "
+                    f"job_id={job_id or 'unknown'}"
+                ),
+                "job_id": job_id,
+                "failure_streak": streak,
+                "paused_at": _now().isoformat(),
+            },
+        )
+    except OSError as exc:
+        logger.error("auto pause write failed: %s", exc)
+        return False
+    logger.error(
+        "automatic pause on failure streak job_id=%s streak=%s",
+        job_id,
+        streak,
+    )
+    return True
+
+
 def _record_failure(
     control: dict[str, Any],
     *,
@@ -922,6 +1045,10 @@ def _record_failure(
             f"continuous research failed for {streak} consecutive rounds; "
             f"job_id={job_id or 'unknown'}",
         )
+        # 2026-09-10 防空转B：边沿≥3自动写全局paused.json，
+        # 停全局烧预算；resume清streak后给3轮验证窗口。
+        # 注意先熔断后记last_alert，否则内层边沿检查会误判已触发。
+        _auto_pause_on_streak(control, streak=streak, job_id=job_id, logger=logger)
         control["last_alert_failure_streak"] = streak
     elif streak < 3:
         control["last_alert_failure_streak"] = 0
@@ -1232,11 +1359,28 @@ def run_once(
             token in str(last_error or "").lower()
             for token in ("data_quality", "quality", "gate", "qlib", "model")
         )
+        # 2026-09-11 整改(P0-4)：worker 退出码非 0 **不等于**本轮失败。
+        # 以产物为准（不变量 §7）：本轮已成功发布就不计入 failure_streak，
+        # 否则成功轮会把连败计数器推向阈值，触发 _auto_pause_on_streak 停摆整个调度器。
+        # 注意：熔断守卫本身（_auto_pause_on_streak）是刻意的「防空转B」设计，保留不动。
+        round_published = _round_published(job_id, since=started)
+        if round_published and (
+            outcome.timed_out or outcome.returncode not in (0, None)
+        ):
+            logger.warning(
+                "worker exited abnormally (returncode=%s) but job %s already published; "
+                "not counted as a failed round",
+                outcome.returncode,
+                job_id,
+            )
         round_failed = bool(
-            outcome.timed_out
-            or outcome.returncode not in (0, None)
-            or str(job.get("status")) == "failed"
-            or data_quality_failure
+            not round_published
+            and (
+                outcome.timed_out
+                or outcome.returncode not in (0, None)
+                or str(job.get("status")) == "failed"
+                or data_quality_failure
+            )
         )
         failure_streak = _record_failure(
             control,
@@ -1501,6 +1645,15 @@ def pause(reason: str = "paused by operator") -> dict[str, Any]:
 
 def resume() -> dict[str, Any]:
     PAUSE_PATH.unlink(missing_ok=True)
+    # 2026-09-10 防空转B：resume清streak/last_alert，给3轮验证窗口，
+    # 否则失败1轮立刻再暂停，无验证机会。
+    try:
+        control = _load_control()
+        control["failure_streak"] = 0
+        control["last_alert_failure_streak"] = 0
+        _save_control(control)
+    except (OSError, ValueError):
+        pass
     value = {
         "status": "resumed",
         "resumed_at": _now().isoformat(),

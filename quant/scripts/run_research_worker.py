@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,6 +25,11 @@ from assistant.research import _jsonable
 from assistant.rolling_scan import run_rolling_pass
 from fetch_state import FetchState
 from fetch_targets import asset_target_dates
+
+# 2026-09-11 整改(P0-4)：内层研究子进程的 stdout/stderr 原先只落在
+# `_run_bounded_command` 的临时文件里（with 块退出即删）。误判发生时无法定死真因，
+# 只能靠猜，所以这里给它们一个持久化落点。
+RESEARCH_WORKER_LOG_DIR = QUANT_ROOT / "logs" / "continuous_research" / "workers"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -593,6 +598,86 @@ def _last_json_object(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def _persist_inner_research_output(job_id: str, completed: dict[str, Any]) -> str | None:
+    """把内层研究子进程的输出落盘，返回 stdout 路径（失败返回 None）。
+
+    P0-4 定位时缺的正是这份证据：`_run_bounded_command` 把子进程输出写进临时文件，
+    退出即删，于是"内层为何返回 {0,1} 之外的退出码"无法判定，只能猜。
+    """
+    try:
+        RESEARCH_WORKER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = RESEARCH_WORKER_LOG_DIR / f"{job_id}.research.stdout.log"
+        err_path = RESEARCH_WORKER_LOG_DIR / f"{job_id}.research.stderr.log"
+        header = (
+            "# inner research child"
+            f" pid={completed.get('child_pid')}"
+            f" returncode={completed.get('returncode')!r}"
+            f" timed_out={completed.get('timed_out')}"
+            f" timeout_seconds={completed.get('timeout_seconds')}\n"
+        )
+        out_path.write_text(
+            header + str(completed.get("stdout") or ""), encoding="utf-8"
+        )
+        err_path.write_text(
+            header + str(completed.get("stderr") or ""), encoding="utf-8"
+        )
+        return str(out_path)
+    except OSError:
+        return None
+
+
+def _published_research_result(
+    job_id: str,
+    *,
+    invoked_at: datetime,
+) -> dict[str, Any] | None:
+    """以产物为准判断内层研究是否其实已经成功；否则返回 None。
+
+    背景（2026-09-11 P0-4）：`_run_research_process` 原先只看内层子进程的原始退出码
+    和 stdout 是否能解析出 JSON。实测 job `20260911T065625Z-d6d4eede` 已成功发布
+    （`manifest.json` status=success、`current.json` 已更新、`publication.state=full`），
+    内层却返回了 {0,1} 之外的退出码，于是整轮被记成失败，`failure_streak` 累到 3，
+    `_auto_pause_on_streak` 在 22:05:49 把调度器整体停摆。
+
+    《研究管线不变量》§7 明确：判断运行成败以 manifest.json / current.json 为准，
+    不要以退出码/台账文本为准。`invoked_at` 用于排除"同一个 run 目录里上一次 pass
+    留下的旧成功产物"被误当成本轮成功。
+    """
+    try:
+        run_dir = run_directory(job_id)
+    except Exception:
+        return None
+    manifest = read_json(run_dir / "manifest.json", {})
+    if not isinstance(manifest, dict):
+        return None
+    if str(manifest.get("run_id") or "") != str(job_id):
+        return None
+    if str(manifest.get("status") or "") not in {"success", "partial"}:
+        return None
+    finished_raw = manifest.get("finished_at")
+    try:
+        finished_at = datetime.fromisoformat(str(finished_raw))
+    except (TypeError, ValueError):
+        return None
+    if finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=timezone.utc)
+    # 5 秒容差：manifest 的 finished_at 由子进程写入，与本进程取时存在微小偏差。
+    if finished_at < invoked_at - timedelta(seconds=5):
+        return None
+    return {
+        "run_id": str(job_id),
+        # 2026-09-11 P0-3 之后 manifest 可能是 "partial"（分类别发布）；
+        # 对 worker 而言与 "success" 同为"已发布"，不构成失败。
+        "status": "success",
+        "publication_state": manifest.get("status"),
+        "failure_reasons": manifest.get("failure_reasons") or [],
+        "data_end_date": manifest.get("data_end_date"),
+        "result_path": str(run_dir),
+        # 供排查：本轮是从产物"救回"的成功，内层退出码与此字段一并留在状态里。
+        "recovered_from_artifacts": True,
+    }
+
+
 def _run_research_process(
     job_id: str,
     *,
@@ -600,6 +685,8 @@ def _run_research_process(
     timeout_seconds: float,
     heartbeat: Callable[[], None] | None = None,
  ) -> dict[str, Any]:
+    # P0-4：记录发起时刻，用于把"本轮产物"与同一 run 目录里上一次 pass 的旧产物区分开。
+    invoked_at = datetime.now(timezone.utc)
     completed = _run_bounded_command(
         [
             sys.executable,
@@ -619,10 +706,22 @@ def _run_research_process(
             "(fetch.targeted_time_budget_seconds for targeted jobs)"
         )
     result = _last_json_object(completed["stdout"])
-    if completed["returncode"] not in {0, 1} or result is None:
-        detail = completed["stderr"][-1000:] or completed["stdout"][-1000:]
-        raise RuntimeError(f"research process failed: {detail}")
-    return result
+    if completed["returncode"] in {0, 1} and result is not None:
+        return result
+    # 2026-09-11 整改(P0-4)：退出码/输出异常**不等于**研究失败。
+    # 判失败前先核对产物（不变量 §7）：内层已成功发布就不该让整轮背上失败。
+    inner_log = _persist_inner_research_output(job_id, completed)
+    published = _published_research_result(job_id, invoked_at=invoked_at)
+    if published is not None:
+        published["inner_returncode"] = completed["returncode"]
+        published["inner_log"] = inner_log
+        return published
+    detail = completed["stderr"][-1000:] or completed["stdout"][-1000:]
+    raise RuntimeError(
+        "research process failed: "
+        f"inner_returncode={completed['returncode']!r} "
+        f"inner_log={inner_log or 'unavailable'}; {detail}"
+    )
 
 
 def _remaining_stage_timeout(
@@ -1192,7 +1291,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         status_value["result_run_id"] = result_run_id
         status_value["result_path"] = research_result.get("result_path", str(run_dir))
-        research_succeeded = research_result.get("status") == "success"
+        # 2026-09-11 P0-3：分类别发布后 research 的 status 可能是 "partial"
+        # （部分类别未过门槛但已发布就绪类别），对 worker 而言同样算成功。
+        research_succeeded = research_result.get("status") in {"success", "partial"}
         has_incomplete_data = any(
             int(progress.get(key, 0)) > 0 for key in ("pending", "failed", "stale")
         )

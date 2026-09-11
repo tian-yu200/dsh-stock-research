@@ -17,6 +17,7 @@ from .notifications import acknowledge, list_records
 from .paths import (
     fixed_path,
     read_json,
+    relocate_legacy_path,
     run_directory,
     validate_notification_id,
     validate_run_id,
@@ -104,6 +105,30 @@ def get_current_snapshot(asset_type: str | None = None, symbol: str | None = Non
             if normalized_symbol and signal.get("symbol") != normalized_symbol:
                 continue
             selected.append({"asset_type": category, **signal})
+    # 2026-09-11 整改(P0-3)：分类别发布后，**被拦类别不得把权重当结论返回**。
+    # 它的信号可以照常透明可查（不变量 §10），但没有通过门槛、本轮未发布目标权重，
+    # 所以这里显式给出 blocked 状态且不带 decision_support——避免界面把未发布类别
+    # 的陈旧权重当成新结论，那正是 P0-3 要修的故障。
+    publication = (current.get("decision_support") or {}).get("publication")
+    blocked_types = set(
+        (publication or {}).get("blocked_asset_types") or []
+        if isinstance(publication, dict)
+        else []
+    )
+    if normalized_type and normalized_type in blocked_types:
+        return attach(
+            {
+                "status": "blocked",
+                "run_id": current.get("run_id"),
+                "data_end_date": current.get("data_end_date"),
+                "requested_asset_type": normalized_type,
+                "requested_symbol": normalized_symbol,
+                "publication": publication,
+                "reason": "该资产类别本轮未通过质量/风险门槛，未发布目标权重。",
+                "result_path": research._fixed_reference(current.get("result_path")),
+                "signals": selected,
+            }
+        )
     if not selected:
         return attach(
             {
@@ -131,6 +156,9 @@ def get_current_snapshot(asset_type: str | None = None, symbol: str | None = Non
             "result_path": research._fixed_reference(current.get("result_path")),
             "requested_asset_type": normalized_type,
             "requested_symbol": normalized_symbol,
+            # 2026-09-11 P0-3：带上 publication，界面才能区分"本轮全量发布"与
+            # "部分类别未发布"，而不是把 partial 的运行误读成全量结论。
+            "publication": publication,
             "decision_support": asset_decision or {},
             "signals": selected,
         }
@@ -372,10 +400,22 @@ def ack_notification(notification_id: str) -> dict[str, Any]:
 
 
 def _fixed_reference(value: Any) -> str | None:
-    """Validate a persisted path before returning it through the API."""
+    """Validate a persisted path before returning it through the API.
+
+    Snapshots written before the repo moved from ``D:\\dsh-股票`` to
+    ``D:\\dsh-gupiao`` are transparently remapped onto this checkout; paths
+    that fit neither root still raise, preserving the fixed-path boundary.
+    """
     if value is None:
         return None
-    return str(fixed_path(str(value)))
+    text = str(value)
+    try:
+        return str(fixed_path(text))
+    except ValueError:
+        relocated = relocate_legacy_path(text)
+        if relocated is None:
+            raise
+        return str(fixed_path(relocated))
 
 
 def _sanitize_result_record(value: Any) -> Any:

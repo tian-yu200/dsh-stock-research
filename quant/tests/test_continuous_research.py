@@ -522,6 +522,192 @@ class ContinuousResearchTests(unittest.TestCase):
             self.assertEqual(result["failed"], 1)
             self.assertEqual(result["failure_streak"], 0)
 
+    def test_gate_failure_counts_retry_even_with_pending(self) -> None:
+        # 2026-09-10 防空转A：failed + pending≠0 + 结构化gate 仍计次。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-gate-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(state, environment["run_root"], status="failed")
+                run_dir = environment["run_root"] / JOB_ID
+                (run_dir / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": JOB_ID,
+                            "status": "failed",
+                            "failure_reasons": ["stock_model_or_risk_gate_failed"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state.register_assets("stock", ["000001"])
+                control: dict = {"analysis_attempts": {}}
+                job = state.get_job(JOB_ID)
+                assert job is not None
+                progress = {"pending": 5, "total": 10}
+                _, _, action = continuous._ensure_job(
+                    state,
+                    TARGET_DATE,
+                    "daily",
+                    environment["config"],
+                    control,
+                    continuous._logger(),
+                    job,
+                )
+                self.assertIsNone(action)
+                self.assertEqual(control["analysis_attempts"][JOB_ID], 1)
+
+    def test_gate_failure_pauses_after_three_retries_with_pending(self) -> None:
+        # 2026-09-10 防空转A：满3次后 paused，不再起 worker。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-gate-pause-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(state, environment["run_root"], status="failed")
+                run_dir = environment["run_root"] / JOB_ID
+                (run_dir / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": JOB_ID,
+                            "status": "failed",
+                            "failure_reasons": ["test_max_drawdown_threshold"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state.register_assets("stock", ["000001"])
+                control: dict = {"analysis_attempts": {JOB_ID: 3}}
+                job = state.get_job(JOB_ID)
+                assert job is not None
+                with patch.object(
+                    continuous.state if hasattr(continuous, "state") else continuous,
+                    "_job_progress",
+                    return_value={"pending": 5, "total": 10},
+                    create=True,
+                ):
+                    pass
+                # 直接走 _ensure_job 的计数分支：pending≠0 但 gate 命中。
+                job2, _, action = continuous._ensure_job(
+                    state,
+                    TARGET_DATE,
+                    "daily",
+                    environment["config"],
+                    control,
+                    continuous._logger(),
+                    job,
+                )
+                self.assertEqual(action, "analysis_retry_exhausted")
+                self.assertEqual((job2 or {}).get("status"), "paused")
+
+    def test_pure_fetch_failure_still_requeues_without_counting(self) -> None:
+        # 2026-09-10 防空转A：纯抓取失败（无结构化gate）不计数，仍 requeue。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-fetch-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(state, environment["run_root"], status="failed")
+                state.register_assets("stock", ["000001"])
+                control: dict = {"analysis_attempts": {}}
+                job = state.get_job(JOB_ID)
+                assert job is not None
+                _, _, action = continuous._ensure_job(
+                    state,
+                    TARGET_DATE,
+                    "daily",
+                    environment["config"],
+                    control,
+                    continuous._logger(),
+                    job,
+                )
+                self.assertIsNone(action)
+                self.assertNotIn(JOB_ID, control["analysis_attempts"])
+
+    def test_streak_auto_pause_writes_paused_file_once(self) -> None:
+        # 2026-09-10 防空转B：streak 2→3 边沿写 paused.json 且只一次。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-autopause-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                self._environment(stack, root, state)
+                logger = continuous._logger()
+                control = continuous._load_control()
+                control["failure_streak"] = 2
+                control["last_alert_failure_streak"] = 0
+                streak = continuous._record_failure(
+                    control,
+                    failed=True,
+                    job_id=JOB_ID,
+                    target_date=TARGET_DATE,
+                    coverage=0.9,
+                    logger=logger,
+                )
+                self.assertEqual(streak, 3)
+                paused = continuous._read_json(continuous.PAUSE_PATH, {})
+                self.assertEqual(paused.get("job_id"), JOB_ID)
+                self.assertIn("automatic pause", paused.get("reason", ""))
+                before = (continuous.PAUSE_PATH).stat().st_mtime_ns
+                streak2 = continuous._record_failure(
+                    control,
+                    failed=True,
+                    job_id=JOB_ID,
+                    target_date=TARGET_DATE,
+                    coverage=0.9,
+                    logger=logger,
+                )
+                self.assertEqual(streak2, 4)
+                after = (continuous.PAUSE_PATH).stat().st_mtime_ns
+                self.assertEqual(before, after)
+
+    def test_resume_clears_streak_for_fresh_window(self) -> None:
+        # 2026-09-10 防空转B：resume 清 streak，给 3 轮验证窗口。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-resume-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                self._environment(stack, root, state)
+                control = continuous._load_control()
+                control["failure_streak"] = 3
+                control["last_alert_failure_streak"] = 3
+                continuous._save_control(control)
+                continuous.resume()
+                fresh = continuous._load_control()
+                self.assertEqual(fresh.get("failure_streak"), 0)
+                self.assertEqual(fresh.get("last_alert_failure_streak"), 0)
+                self.assertFalse(continuous.PAUSE_PATH.is_file())
+
+    def test_structured_gate_failure_fail_open_on_bad_job_id(self) -> None:
+        # 2026-09-10 轻量验证补回归：非法 job_id 不抛异常，按非门槛处理。
+        self.assertFalse(
+            continuous._structured_gate_failure({"job_id": "x", "metadata_json": "{}"})
+        )
+        self.assertTrue(
+            continuous._structured_gate_failure(
+                {
+                    "job_id": "x",
+                    "metadata_json": '{"failure_reasons":["stock_model_or_risk_gate_failed"]}',
+                }
+            )
+        )
+        self.assertFalse(continuous._structured_gate_failure(None))
+
     def test_three_consecutive_failures_write_high_priority_alert(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="continuous-alert-",
@@ -558,6 +744,127 @@ class ContinuousResearchTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertIn("3 consecutive rounds", alert_text)
             self.assertIn(JOB_ID, alert_text)
+
+    def test_published_round_with_abnormal_worker_exit_is_not_a_failure(self) -> None:
+        # 2026-09-11 P0-4：worker 退出码非 0，但本轮产物已发布（manifest success +
+        # publication.published）→ 不计入 failure_streak，不许写 paused.json。
+        # 实测事故：job 20260911T065625Z-d6d4eede 已成功发布，却被记为失败，
+        # failure_streak 累到 3 触发 _auto_pause_on_streak，22:05 起调度器停摆。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-p04-published-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(state, environment["run_root"])
+                run_dir = environment["run_root"] / JOB_ID
+
+                def publish_then_exit_one(job_id: str, _logger: object):
+                    self.assertTrue(state.claim_job(job_id))
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "run_id": job_id,
+                                "status": "success",
+                                "failure_reasons": [],
+                                "finished_at": continuous._now().isoformat(),
+                                "publication": {"published": True, "state": "full"},
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    return continuous.WorkerOutcome(
+                        pid=321,
+                        returncode=1,
+                        timed_out=False,
+                        duration_seconds=1.0,
+                        error="worker exited with code 1",
+                        started_at=str(state.get_job(job_id)["started_at"]),
+                    )
+
+                continuous.run_once(worker_runner=publish_then_exit_one)
+                control = continuous._load_control()
+                self.assertEqual(control.get("failure_streak"), 0)
+                self.assertFalse(continuous.PAUSE_PATH.is_file())
+
+    def test_round_published_rejects_stale_or_unpublished_artifacts(self) -> None:
+        # 2026-09-11 P0-4：只有"本轮产出且已发布"的产物才算成功；
+        # 复用 run 目录时上一次 pass 留下的旧产物、以及未发布的产物都必须被拒。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-p04-stale-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                run_dir = environment["run_root"] / JOB_ID
+                run_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = run_dir / "manifest.json"
+                since = continuous._now()
+
+                def write(**overrides: object) -> None:
+                    payload = {
+                        "run_id": JOB_ID,
+                        "status": "success",
+                        "finished_at": continuous._now().isoformat(),
+                        "publication": {"published": True, "state": "full"},
+                    }
+                    payload.update(overrides)
+                    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                write()
+                self.assertTrue(continuous._round_published(JOB_ID, since=since))
+
+                # 旧产物（finished_at 早于本轮起始）→ 拒。
+                write(finished_at="2026-09-11T10:00:00+08:00")
+                self.assertFalse(continuous._round_published(JOB_ID, since=since))
+
+                # publication.published 为假 → 拒。
+                write(publication={"published": False, "state": "blocked"})
+                self.assertFalse(continuous._round_published(JOB_ID, since=since))
+
+                # run_id 不匹配 → 拒。
+                write(run_id="other-round")
+                self.assertFalse(continuous._round_published(JOB_ID, since=since))
+
+                # 无 manifest → 拒。
+                manifest_path.unlink()
+                self.assertFalse(continuous._round_published(JOB_ID, since=since))
+
+    def test_abnormal_exit_without_artifacts_still_counts_failure(self) -> None:
+        # 2026-09-11 P0-4 反向保护：真的没产出时，熔断照常累加——
+        # 修的是误判，不是削弱 _auto_pause_on_streak（2026-09-10 防空转B）。
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-p04-noartifact-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(state, environment["run_root"])
+                run_dir = environment["run_root"] / JOB_ID
+
+                def exit_one_without_artifacts(job_id: str, _logger: object):
+                    self.assertTrue(state.claim_job(job_id))
+                    self.assertFalse((run_dir / "manifest.json").is_file())
+                    return continuous.WorkerOutcome(
+                        pid=321,
+                        returncode=1,
+                        timed_out=False,
+                        duration_seconds=1.0,
+                        error="worker exited with code 1",
+                        started_at=str(state.get_job(job_id)["started_at"]),
+                    )
+
+                continuous.run_once(worker_runner=exit_one_without_artifacts)
+                control = continuous._load_control()
+                self.assertEqual(control.get("failure_streak"), 1)
+                self.assertFalse(continuous._round_published(JOB_ID, since=continuous._now()))
 
     def test_asset_type_filter_preserves_lowercase_schema_values(self) -> None:
         with tempfile.TemporaryDirectory(
