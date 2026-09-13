@@ -44,9 +44,11 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description 'DSH 全市场扫描监护：只读巡检 latest_status/manifest/rule_gates；瞬时暂停调用调度器 resume() 恢复；确定性门槛失败只记录不修；manifest+current.json 双 success 即写 done 旗并自注销，任务结束。' `
+    -Description 'DSH 全市场扫描监护：只读巡检 latest_status/manifest/rule_gates；无在跑作业时保持被动(idle，非交易日的 paused 不触发 resume)；瞬时暂停调用调度器 resume() 恢复；确定性门槛失败只记录不修；manifest 与 current.json 同为已发布态(success/partial)且 done 旗 job_id 匹配当前作业时才写旗并自注销。done 旗为全局单文件，跨轮残留不生效。' `
     -Force | Out-Null
 
 Write-Output "已注册任务: $taskPath$taskName"
 Write-Output "首次触发时间: $($firstRun.ToString('o'))，之后每 5 分钟巡检。"
-Write-Output "结束条件: manifest.json 与 current.json 同 run_id 双 success（结果已发布）。"
+Write-Output "结束条件: manifest.json 与 current.json 同 run_id 且同为已发布态（success/partial）。"
+Write-Output "注意: done 旗（guardian-done.json）按 job_id 比对，上一轮残留不会让本轮监护空转；重新注册前无需手动删除，但仍建议清理。"
+Write-Output "无在跑作业时监护保持 idle，不会调用 resume()。"
