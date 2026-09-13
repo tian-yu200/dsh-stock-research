@@ -10,9 +10,15 @@ Design notes (must-respect invariants, see quant/docs/研究管线不变量.md):
 - The only allowed auto-fix is resuming a TRANSIENT pause via the scheduler's
   own resume() (clears streak, gives a 3-round window). Deterministic
   gate/model/drawdown failures stay paused for a human decision.
-- Completion = run manifest status success AND current.json status success with
-  the same run_id (results actually published). Then write the done flag,
-  best-effort unregister the scheduled task, and exit with code 10.
+- Completion = run manifest status PUBLISHED (success OR partial, per P0-3
+  category-wise publication) AND current.json status published with the same
+  run_id. Then write the done flag (carrying job_id), best-effort unregister the
+  scheduled task, and exit with code 10. The done flag is a single GLOBAL file, so
+  it is honored only when its job_id matches the current job; a stale flag left by
+  a previous round must never short-circuit a freshly registered guardian.
+- No active job -> stay passive (idle) and never auto-fix. The scheduler reports
+  status "paused" on non-trading days too, so treating that as a transient pause
+  would call resume() every 5 minutes all night and pile up diagnosis artifacts.
 """
 from __future__ import annotations
 
@@ -163,13 +169,6 @@ def _append_log(record: dict[str, Any]) -> None:
 
 def tick() -> tuple[dict[str, Any], int]:
     GUARDIAN_DIR.mkdir(parents=True, exist_ok=True)
-    if DONE_FLAG.is_file():
-        summary = {
-            "guardian_status": "completed",
-            "done": True,
-            "detail": "done flag already written by an earlier tick",
-        }
-        return summary, EXIT_COMPLETED
 
     latest = _read_json(LATEST_STATUS_PATH, {})
     control = _read_json(CONTROL_PATH, {})
@@ -181,6 +180,46 @@ def tick() -> tuple[dict[str, Any], int]:
     pause_record = _read_json(PAUSE_PATH, {})
 
     job_id = str(latest.get("job_id") or latest.get("run_id") or "")
+
+    # 2026-09-13：DONE_FLAG 是**全局单文件**、跨轮次持久（不按 job_id 隔离），
+    # 必须比对 job_id 才可采信。否则上一轮残留的 done flag 会让重新注册的监护
+    # 每次 tick 都短路返回 completed：既不巡检 paused.json、也不 resume 瞬时暂停，
+    # 表现为“任务在、日志正常、但监护静默失效”——比没有监护更危险。
+    if DONE_FLAG.is_file():
+        done_record = _read_json(DONE_FLAG, {})
+        done_job = (
+            str(done_record.get("job_id") or "") if isinstance(done_record, dict) else ""
+        )
+        if done_job and job_id and done_job == job_id:
+            summary = {
+                "guardian_status": "completed",
+                "done": True,
+                "job_id": job_id,
+                "detail": "done flag matches the current job; already published",
+            }
+            return summary, EXIT_COMPLETED
+
+    # 2026-09-13：无在跑作业时监护必须保持被动。非交易日 latest.status 同样是
+    # "paused"，若无脑走 anomaly 分支会判定 paused-transient → 每 5 分钟调用一次
+    # resume() 并写一个 diagnosis 产物（整夜 12 次/小时 × 10 小时 = 120 个文件）。
+    if not job_id:
+        summary = {
+            "guardian_status": "idle",
+            "done": False,
+            "job_id": None,
+            "scheduler_status": str(latest.get("status") or "unknown"),
+            "phase": str(latest.get("phase") or "unknown"),
+            "detail": "no active job; guardian stays passive",
+        }
+        try:
+            LATEST_GUARDIAN_PATH.write_text(
+                json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        _append_log(summary)
+        return summary, 0
+
     run_dir = _run_dir(job_id) if job_id else None
     manifest = _read_json(run_dir / "manifest.json", {}) if run_dir else {}
     worker_status = _read_json(run_dir / "status.json", {}) if run_dir else {}
