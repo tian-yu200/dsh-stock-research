@@ -50,6 +50,12 @@ EXIT_COMPLETED = 10
 
 DETERMINISTIC_TOKENS = ("gate", "model", "drawdown", "回撤", "门槛", "risk")
 
+# 2026-09-13：P0-3 分类别发布后，manifest/current 的 status 是三态
+# success / partial / failed，其中 partial = 至少一个资产类别已发布
+# （被拦类别权重归零并标注）。监护判"本轮是否已发布"必须认 partial，
+# 否则 partial 轮永远不算 completed → 不写 DONE_FLAG、不自我注销计划任务。
+PUBLISHED_RUN_STATUSES = ("success", "partial")
+
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -94,6 +100,9 @@ def _compact_manifest(manifest: Any) -> dict[str, Any]:
         "finished_at": manifest.get("finished_at"),
         "data_end_date": manifest.get("data_end_date"),
         "failure_reasons": manifest.get("failure_reasons"),
+        # 2026-09-13 P0-3：带上分类别发布状态，诊断产物才能看出
+        # "已发布但被拦类别"与"整体失败"的区别。
+        "publication": manifest.get("publication"),
         "error_tail": str(error)[-500:] if error else None,
     }
 
@@ -193,11 +202,14 @@ def tick() -> tuple[dict[str, Any], int]:
         else {}
     )
 
-    # ---- completion: manifest success + current.json published for same run ----
+    # ---- completion: manifest published + current.json published for same run ----
+    # 2026-09-13 P0-3：认 partial（= 至少一类资产已发布）。只认 success 会让
+    # partial 轮永远落进 anomaly 分支，监护语义与发布契约脱节。
+    publication_block = manifest_compact.get("publication")
     completed = (
         bool(job_id)
-        and manifest_compact.get("status") == "success"
-        and current_compact.get("status") == "success"
+        and manifest_compact.get("status") in PUBLISHED_RUN_STATUSES
+        and current_compact.get("status") in PUBLISHED_RUN_STATUSES
         and current_compact.get("run_id") == job_id
     )
     if completed:
@@ -207,6 +219,11 @@ def tick() -> tuple[dict[str, Any], int]:
             "manifest_finished_at": manifest_compact.get("finished_at"),
             "current_updated_at": current_compact.get("updated_at"),
             "data_end_date": current_compact.get("data_end_date"),
+            "publication_state": (
+                publication_block.get("state")
+                if isinstance(publication_block, dict)
+                else None
+            ),
             "completed_at": datetime.now(TIMEZONE).isoformat(),
         }
         try:

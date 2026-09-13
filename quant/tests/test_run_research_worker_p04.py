@@ -62,6 +62,31 @@ class PublishedResearchResultTests(unittest.TestCase):
             self.assertTrue(result["recovered_from_artifacts"])
             self.assertEqual(result["result_path"], str(run_root / JOB_ID))
 
+    def test_partial_manifest_is_recovered(self) -> None:
+        # 2026-09-13 P0-3 × P0-4 交汇路径：分类别发布后 manifest.status 可能是
+        # "partial"（股票门槛失败但 ETF/基金已发布），对 worker 而言与 success
+        # 同为"已发布"，不得因内层退出码异常而记整轮失败。
+        with tempfile.TemporaryDirectory(prefix="p04-worker-", dir=ROOT / "tests") as directory:
+            run_root = pathlib.Path(directory)
+            invoked_at = datetime.now(timezone.utc)
+            self._write_manifest(
+                run_root / JOB_ID,
+                status="partial",
+                failure_reasons=["stock_model_or_risk_gate_failed"],
+                publication={
+                    "state": "partial",
+                    "published": True,
+                    "ready_asset_types": ["etf", "otc_fund"],
+                    "blocked_asset_types": ["stock"],
+                },
+            )
+            result = self._invoke(run_root, invoked_at=invoked_at)
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["publication_state"], "partial")
+            self.assertTrue(result["recovered_from_artifacts"])
+
     def test_stale_manifest_from_previous_pass_is_rejected(self) -> None:
         # run 目录会被同一 job_id 的后续 pass 复用：上一次 pass 的成功产物
         # 不能当作本轮成功。

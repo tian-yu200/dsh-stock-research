@@ -750,45 +750,62 @@ class ContinuousResearchTests(unittest.TestCase):
         # publication.published）→ 不计入 failure_streak，不许写 paused.json。
         # 实测事故：job 20260911T065625Z-d6d4eede 已成功发布，却被记为失败，
         # failure_streak 累到 3 触发 _auto_pause_on_streak，22:05 起调度器停摆。
-        with tempfile.TemporaryDirectory(
-            prefix="continuous-p04-published-",
-            dir=ROOT / "tests",
-        ) as directory:
-            root = pathlib.Path(directory)
-            state = FetchState(root / "state.sqlite3")
-            with ExitStack() as stack:
-                environment = self._environment(stack, root, state)
-                self._create_job(state, environment["run_root"])
-                run_dir = environment["run_root"] / JOB_ID
+        # 2026-09-13：补 partial 一档——P0-3 分类别发布后"已发布"包含
+        # status=partial / publication.state=partial（就绪类别已落盘、被拦类别归零），
+        # _round_published 只看 publication.published，两档都不得计入连败。
+        for manifest_status, publication_state in (
+            ("success", "full"),
+            ("partial", "partial"),
+        ):
+            with self.subTest(manifest_status=manifest_status):
+                with tempfile.TemporaryDirectory(
+                    prefix="continuous-p04-published-",
+                    dir=ROOT / "tests",
+                ) as directory:
+                    root = pathlib.Path(directory)
+                    state = FetchState(root / "state.sqlite3")
+                    with ExitStack() as stack:
+                        environment = self._environment(stack, root, state)
+                        self._create_job(state, environment["run_root"])
+                        run_dir = environment["run_root"] / JOB_ID
 
-                def publish_then_exit_one(job_id: str, _logger: object):
-                    self.assertTrue(state.claim_job(job_id))
-                    run_dir.mkdir(parents=True, exist_ok=True)
-                    (run_dir / "manifest.json").write_text(
-                        json.dumps(
-                            {
-                                "run_id": job_id,
-                                "status": "success",
-                                "failure_reasons": [],
-                                "finished_at": continuous._now().isoformat(),
-                                "publication": {"published": True, "state": "full"},
-                            }
-                        ),
-                        encoding="utf-8",
-                    )
-                    return continuous.WorkerOutcome(
-                        pid=321,
-                        returncode=1,
-                        timed_out=False,
-                        duration_seconds=1.0,
-                        error="worker exited with code 1",
-                        started_at=str(state.get_job(job_id)["started_at"]),
-                    )
+                        def publish_then_exit_one(
+                            job_id: str,
+                            _logger: object,
+                            *,
+                            _status: str = manifest_status,
+                            _state: str = publication_state,
+                        ):
+                            self.assertTrue(state.claim_job(job_id))
+                            run_dir.mkdir(parents=True, exist_ok=True)
+                            (run_dir / "manifest.json").write_text(
+                                json.dumps(
+                                    {
+                                        "run_id": job_id,
+                                        "status": _status,
+                                        "failure_reasons": [],
+                                        "finished_at": continuous._now().isoformat(),
+                                        "publication": {
+                                            "published": True,
+                                            "state": _state,
+                                        },
+                                    }
+                                ),
+                                encoding="utf-8",
+                            )
+                            return continuous.WorkerOutcome(
+                                pid=321,
+                                returncode=1,
+                                timed_out=False,
+                                duration_seconds=1.0,
+                                error="worker exited with code 1",
+                                started_at=str(state.get_job(job_id)["started_at"]),
+                            )
 
-                continuous.run_once(worker_runner=publish_then_exit_one)
-                control = continuous._load_control()
-                self.assertEqual(control.get("failure_streak"), 0)
-                self.assertFalse(continuous.PAUSE_PATH.is_file())
+                        continuous.run_once(worker_runner=publish_then_exit_one)
+                        control = continuous._load_control()
+                        self.assertEqual(control.get("failure_streak"), 0)
+                        self.assertFalse(continuous.PAUSE_PATH.is_file())
 
     def test_round_published_rejects_stale_or_unpublished_artifacts(self) -> None:
         # 2026-09-11 P0-4：只有"本轮产出且已发布"的产物才算成功；

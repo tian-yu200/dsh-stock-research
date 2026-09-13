@@ -95,7 +95,9 @@ def check_runs() -> None:
             except Exception:
                 pass
             status = man.get("status")
-            if status == "success":
+            # 2026-09-13 P0-3：status 是三态 success/partial/failed，
+            # partial 同样是"已发布"（就绪类别已落盘、被拦类别归零标注）。
+            if status in {"success", "partial"}:
                 successful.append((man.get("finished_at"), run.name))
             print("  %-15s %-9s %-8s %-8s %7s %6s %8s %8s %6s %7s %s" % (
                 run.name[:15], str(man.get("mode"))[:9], str(man.get("depth"))[:8], str(status)[:8],
@@ -106,11 +108,11 @@ def check_runs() -> None:
     print()
     ok = sorted(x for x in successful if x[0])
     if ok:
-        print("  最后一次 status=success 的运行：")
+        print("  最后一次已发布的运行（status=success/partial）：")
         print("    finished_at = %s" % ok[-1][0])
         print("    run_id      = %s" % ok[-1][1])
     else:
-        print("  未发现任何 status=success 的运行。")
+        print("  未发现任何 status=success/partial 的运行。")
 
 
 def check_scores_detail() -> None:
