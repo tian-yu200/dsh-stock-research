@@ -19,6 +19,17 @@ fetch:
   # 长期压在 93.5% 左右，任务空转无法进入发布；死代码已三源逐一确认，
   # 数据实质成功率 97.9%，93% 门槛仍保留约束力。
   min_universe_coverage: 0.93
+  # 2026-09-15 整改：**收尾门**，与上面的 min_universe_coverage（放行门）语义不同：
+  #   放行门 = 数据够不够发布；收尾门 = 这一天能不能算收尾、轮到下一交易日。
+  # 本文件上面的注释已记录过同类事实：QDII/货币基金净值滞后 + 退市死代码把覆盖率
+  # 长期压在 ~97.9%，永远到不了 100%。所以收尾门必须留容差——否则 pending == 0
+  # 永远不成立，target_date 永不推进、新交易日永远排不上队（2026-09-15 实测卡死约 3 小时）。
+  # 代码侧默认 1.0（严格等价 pending == 0），此处显式放宽到 0.975。
+  completion_coverage_floor: 0.975
+  # 是否允许带 failed 标的收尾（代码侧默认 false）。被豁免的清单会写进
+  # job 的 metadata_json，不做无声赦免。当前 failed=6 全部是 NAV 列格式异常的
+  # otc_fund（确定性失败），新作业仍会重抓，放行不会丢数据。
+  completion_allow_failed: true
   target_lag_trading_days:
     stock: 0
     etf: 1

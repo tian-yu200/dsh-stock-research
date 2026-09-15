@@ -481,6 +481,114 @@ class ContinuousResearchTests(unittest.TestCase):
             self.assertEqual(result["action"], "target_completed")
             worker.assert_not_called()
 
+    def test_coverage_floor_closes_target_and_writes_terminal_job_state(self) -> None:
+        """2026-09-15 收尾门：判据看 progress 的 coverage（不再看 job.status），
+        且**必须同时写 DB 终态**——否则下一 tick 的 _find_resumable_job 会捡回
+        仍是 running 的旧作业，target_date 一步不动（死循环从忙等变闲等）。
+        """
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-covfloor-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                # 把收尾门降到 0.5，让"3 个资产里 2 个达标"(≈0.667) 即可收尾，
+                # 使本用例聚焦判据逻辑而不绑死具体阈值。
+                environment["config"]["fetch"]["completion_coverage_floor"] = 0.5
+                environment["config"]["fetch"]["completion_allow_failed"] = True
+                self._create_job(
+                    state,
+                    environment["run_root"],
+                    status="running",
+                    complete=False,
+                )
+                # stock / etf 达标，otc_fund 仍滞后 → coverage = 2/3、pending = 1
+                # 用 mark_success 而非再调 register_assets：后者是 INSERT-or-keep
+                # 语义（docstring: "without overwriting progress for existing
+                # assets"），对已存在资产不会更新 data_end_date，等于白写。
+                for asset_type, symbol in (("stock", "000001"), ("etf", "510300")):
+                    state.mark_success(
+                        asset_type,
+                        symbol,
+                        data_end_date=TARGET_DATE,
+                        source="test",
+                        rows=1,
+                        refresh_interval_seconds=3600,
+                    )
+                worker = Mock(
+                    side_effect=AssertionError(
+                        "coverage floor met; must not start a worker"
+                    )
+                )
+                result = continuous.run_once(worker_runner=worker)
+                job_after = state.get_job(JOB_ID)
+            worker.assert_not_called()
+            self.assertEqual(result["action"], "target_completed")
+            self.assertEqual(result["status"], "completed")
+            self.assertIsNotNone(job_after)
+            assert job_after is not None
+            # 终态：completed 不在 RESUMABLE_JOB_STATUSES 里
+            self.assertEqual(job_after["status"], "completed")
+            # 豁免留痕进 metadata；且整包替换不得擦掉原有 target_date
+            metadata = job_after.get("metadata") or {}
+            self.assertEqual(metadata.get("target_date"), TARGET_DATE)
+            self.assertEqual(metadata.get("asset_scope"), "all")
+            completion = metadata.get("completion") or {}
+            self.assertEqual(
+                completion.get("reason"), "closure by completion_coverage_floor"
+            )
+            self.assertEqual(completion.get("exempted_pending"), 1)
+
+    def test_coverage_floor_is_strict_by_default(self) -> None:
+        """DEFAULTS 下 floor=1.0 / allow_failed=False：97.9% 覆盖率不得收尾
+        （等价于原来的 pending == 0，合成夹具与 under50 路径行为不变）。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-covstrict-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                fetch_cfg = environment["config"]["fetch"]
+                self.assertEqual(fetch_cfg["completion_coverage_floor"], 1.0)
+                self.assertFalse(fetch_cfg["completion_allow_failed"])
+                self._create_job(
+                    state,
+                    environment["run_root"],
+                    status="running",
+                    complete=False,
+                )
+                for asset_type, symbol in (("stock", "000001"), ("etf", "510300")):
+                    state.mark_success(
+                        asset_type,
+                        symbol,
+                        data_end_date=TARGET_DATE,
+                        source="test",
+                        rows=1,
+                        refresh_interval_seconds=3600,
+                    )
+
+                def finish(job_id: str, _logger: object):
+                    state.update_job(job_id, status="queued")
+                    return continuous.WorkerOutcome(
+                        pid=401,
+                        returncode=0,
+                        timed_out=False,
+                        duration_seconds=1.0,
+                    )
+
+                result = continuous.run_once(worker_runner=finish)
+                job_after = state.get_job(JOB_ID)
+            # coverage = 2/3 未达严格门 → 不得收尾，必须继续跑 worker
+            # （用 .get：继续跑 worker 的路径不带 action 键，只有 target_completed 分支带）
+            self.assertNotEqual(result.get("action"), "target_completed")
+            self.assertIsNotNone(job_after)
+            assert job_after is not None
+            self.assertNotEqual(job_after["status"], "completed")
+
     def test_failed_asset_keeps_round_partial_instead_of_stopping_market(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="continuous-partial-",

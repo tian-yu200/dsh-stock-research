@@ -652,10 +652,33 @@ def _ensure_job(
                 last_error=job.get("last_error"),
             )
             job = state.get_job(str(job["job_id"])) or job
+        # 2026-09-15 整改：原判据要求 job.status ∈ {complete,completed,success}
+        # 且 progress["pending"] == 0。两个合取项在实践中**同时不可达**（不是字面
+        # 死循环，worker 在 run_research_worker 里三量全零时确实会自写 complete）：
+        #   ① DB 的 job.status 常年是 running —— worker 启动即写回 running，每轮
+        #      结束才短暂落 partial，而调度 tick（约 10 分钟）几乎总撞上飞行中的
+        #      worker，于是判据永远读不到完成态；
+        #   ② pending 极少归零：QDII/货币基金净值滞后 + 退市死代码把覆盖率长期压在
+        #      ~97.9%（见 assistant.yaml 中 min_universe_coverage 的注释），具体到
+        #      2026-09-15 是 pending=604/coverage=0.9794，3 小时零净进展。
+        # 于是 target_date 永不推进、新交易日永远排不上队。
+        # 改为基于 progress（_job_progress 每次现场重算，独立于 DB 状态）的覆盖率，
+        # 用 completion_coverage_floor 控制；默认 1.0 ⟺ 原 pending == 0，行为不变。
+        # ⚠️ 本判据放宽必须与下面 target_completed 分支的 DB 终态写入**成对出现**：
+        # 只放行判据而不写终态，下一 tick 会捡回仍是 running 的旧作业，死循环从
+        # "忙等"变成"闲等"，target_date 一步不动。
+        completion_floor = float(
+            config.get("fetch", {}).get("completion_coverage_floor", 1.0)
+        )
+        allow_failed = bool(
+            config.get("fetch", {}).get("completion_allow_failed", False)
+        )
+        coverage_now = float(progress.get("coverage") or 0.0)
+        failed_now = int(progress.get("failed") or 0)
         if (
-            str(job.get("status")) in {"complete", "completed", "success"}
-            and progress["total"] > 0
-            and progress["pending"] == 0
+            progress["total"] > 0
+            and coverage_now >= completion_floor
+            and (failed_now == 0 or allow_failed)
         ):
             return job, progress, "target_completed"
         return job, _job_progress(state, job, config), None
@@ -1282,6 +1305,39 @@ def run_once(
             _log_progress(logger, status)
             return status
         if action == "target_completed":
+            # 2026-09-15 整改（与 _ensure_job 的收尾判据是同一改动的两半）：
+            # 必须把 DB 行置成非 resumable 终态。RESUMABLE_JOB_STATUSES =
+            # {"queued","partial","running"} 不含 completed，置成 completed 后下一
+            # tick 的 _find_resumable_job 会跳过它，从而走到 calendar 分支、用当日
+            # 日期建新作业。缺了这一步，判据放行只会让 target_date 原地不动。
+            #   · coverage/failed/pending 只能从 progress 现场取：_ensure_job 内的
+            #     同名局部变量不在此作用域。
+            #   · finished_at 传 ISO 字符串：库内时间列均为 ISO 文本（update_job_if
+            #     的 CAS 是字符串比对），而 _now() 返回 tz-aware datetime。
+            #   · 豁免清单进 metadata，不进 last_error —— 该字段非空在全 repo 惯例
+            #     里表示失败。注意 update_job 的 metadata= 是**整包替换**，必须先读
+            #     出旧 metadata 再 update，否则会擦掉 target_date / asset_types /
+            #     asset_scope / symbols（_job_target、_job_asset_types 都依赖它们）。
+            _completion_coverage = float(progress.get("coverage") or 0.0)
+            _completion_metadata = dict(_job_metadata(job))
+            _completion_metadata["completion"] = {
+                "completed_at": _now().isoformat(),
+                "target_date": _job_target(job),
+                "coverage": round(_completion_coverage, 6),
+                "exempted_failed": int(progress.get("failed") or 0),
+                "exempted_pending": int(progress.get("pending") or 0),
+                "reason": "closure by completion_coverage_floor",
+            }
+            state.update_job(
+                str(job["job_id"]),
+                status="completed",
+                finished_at=_now().isoformat(),
+                coverage=_completion_coverage,
+                # 显式清空：该行可能残留此前的 recovery 文本（如 "orphaned running
+                # job recovered ..."）。门控只看结构化字段、不受影响，此处是为报表干净。
+                last_error=None,
+                metadata=_completion_metadata,
+            )
             status = _public_status(
                 status="completed",
                 phase="idle",

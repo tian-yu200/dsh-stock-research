@@ -47,6 +47,14 @@ DEFAULTS: dict[str, Any] = {
         "retry_delay_seconds": 3,
         "max_data_age_days": 5,
         "min_universe_coverage": 0.95,
+        # 2026-09-15 整改：**收尾门**，与上面的 min_universe_coverage（放行门）
+        # 语义不同，勿混用。放行门决定"数据够不够发布"；收尾门决定"这一天能不能
+        # 算收尾、轮到下一交易日"。默认 1.0 等价于原来的 pending == 0（合成夹具与
+        # under50 路径行为不变）；生产在 assistant.yaml 显式放宽。
+        "completion_coverage_floor": 1.0,
+        # 是否允许带 failed 标的收尾（默认关闭=严格）。开启后被豁免的标的清单
+        # 会写进 job 的 metadata_json，不做无声赦免。
+        "completion_allow_failed": False,
         "target_lag_trading_days": {
             "stock": 0,
             "etf": 1,
