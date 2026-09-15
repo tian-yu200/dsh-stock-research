@@ -655,6 +655,43 @@ class AssistantStateMachineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid notification_id"):
             research.ack_notification("../notifications.json")
 
+    def test_add_notification_dedupes_by_kind_and_run(self) -> None:
+        """2026-09-15：同 (kind, run_id) 只保留一条——调度器在同一 job 上反复
+        resume + 重跑研究时，同一条"运行 X 已完成"不再堆成几十份。"""
+        run_id = "20260825T100000Z-99999999"
+        first = notifications.add_notification(
+            "research_success", "完成", "第一次", run_id=run_id
+        )
+        second = notifications.add_notification(
+            "research_success", "完成", "第二次（更新）", run_id=run_id
+        )
+        # 不新增记录，但正文与时间戳被刷新为最新
+        self.assertEqual(second["notification_id"], first["notification_id"])
+        self.assertEqual(second["message"], "第二次（更新）")
+        self.assertEqual(
+            len(research.list_notifications(limit=100)["notifications"]), 1
+        )
+        # 不同 kind 各自保留（同 run 的 partial 与 success 是两条独立通知）
+        notifications.add_notification(
+            "research_partial", "部分发布", "另一条", run_id=run_id
+        )
+        self.assertEqual(
+            len(research.list_notifications(limit=100)["notifications"]), 2
+        )
+        # 已确认的那条不被复活（不去打扰已成历史的通知）
+        notifications.acknowledge(second["notification_id"])
+        notifications.add_notification(
+            "research_success", "完成", "第三次", run_id=run_id
+        )
+        unread = research.list_notifications(unread_only=True, limit=100)
+        self.assertEqual(unread["count"], 1)  # 只剩 partial 那条未确认
+        # 无 run_id 的通知不参与去重，保持纯追加
+        notifications.add_notification("daily_report", "日报", "A")
+        notifications.add_notification("daily_report", "日报", "B")
+        self.assertEqual(
+            len(research.list_notifications(limit=100)["notifications"]), 4
+        )
+
     def test_notification_queries_are_bounded_and_filterable(self) -> None:
         first_run = "20260825T100000Z-77777777"
         second_run = "20260825T100000Z-88888888"
@@ -664,6 +701,9 @@ class AssistantStateMachineTests(unittest.TestCase):
                 f"通知 {index}",
                 "测试分页",
                 run_id=first_run if index % 2 == 0 else second_run,
+                # 本用例测的是 list_notifications 的分页/按 run_id 过滤，需要同
+                # run_id 的多条记录，故显式关掉 2026-09-15 引入的 (kind, run_id) 去重。
+                dedupe=False,
             )
             for index in range(12)
         ]

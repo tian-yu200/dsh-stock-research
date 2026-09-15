@@ -25,10 +25,39 @@ def add_notification(
     *,
     run_id: str | None = None,
     paths: dict[str, str] | None = None,
+    dedupe: bool = True,
 ) -> dict[str, Any]:
+    """把一条通知追加进收件箱。
+
+    2026-09-15 整改：按 (kind, run_id) 去重。调度器会在同一个 job 上反复
+    resume + 重跑研究，每次发布都调本函数，于是同一条"运行 X 已完成"在
+    notifications.json 里堆成几十份（2026-09-15 实测 133 条未确认、内容高度重复）。
+    规则：
+      · 命中同 (kind, run_id) 且**用户尚未确认** → 就地刷新时间戳/正文/路径，
+        不新增记录（条数不涨，内容保持最新）；
+      · 命中且**用户已确认** → 直接返回，不打扰、不复活已成历史的那条；
+      · run_id 为空、或显式 dedupe=False → 保持原先的纯追加行为。
+    """
+    records = _load()
+    now = datetime.now(timezone.utc)
+    if dedupe and run_id:
+        for existing in reversed(records):
+            if existing.get("kind") == kind and existing.get("run_id") == run_id:
+                if existing.get("acknowledged"):
+                    return existing
+                existing.update(
+                    {
+                        "created_at": now.isoformat(),
+                        "title": title,
+                        "message": message,
+                        "paths": paths or {},
+                    }
+                )
+                _save(records)
+                return existing
     record = {
-        "notification_id": f"n-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}",
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "notification_id": f"n-{now:%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}",
+        "created_at": now.isoformat(),
         "kind": kind,
         "title": title,
         "message": message,
@@ -36,7 +65,6 @@ def add_notification(
         "paths": paths or {},
         "acknowledged": False,
     }
-    records = _load()
     records.append(record)
     _save(records)
     return record
