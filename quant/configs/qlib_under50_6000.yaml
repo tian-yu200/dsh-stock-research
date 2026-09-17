@@ -16,6 +16,7 @@ dataset:
 
 model:
   loss: mse
+  seed: 42
   learning_rate: 0.03
   num_leaves: 15
   max_depth: 5

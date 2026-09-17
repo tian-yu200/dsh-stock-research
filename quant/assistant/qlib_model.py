@@ -688,9 +688,11 @@ def train_lgbm(
     from qlib.contrib.model.gbdt import LGBModel
     from qlib.workflow import R
 
-    random.seed(42)
-    np.random.seed(42)
-    model_config = {**model_config, "seed": 42}
+    seed = model_config.get("seed", 42)
+    # 统一全局随机源；LightGBM 自身由 seed/model_config 中的 seed 控制。
+    random.seed(seed)
+    np.random.seed(seed)
+    model_config = {**model_config, "seed": seed}
     model = LGBModel(**model_config)
     if verbose_eval is None:
         _fit_qlib_model_and_close_recorder(model, dataset, R)
