@@ -156,7 +156,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "model": {
         "loss": "mse",
-        "learning_rate": 0.03,
+        "learning_rate": 0.01,  # 2026-09-17: 从0.03降至0.01，缓解best_iteration=9早停
         "num_leaves": 15,
         "max_depth": 5,
         "colsample_bytree": 0.8,
