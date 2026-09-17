@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pandas as pd
 import qlib.data
 
@@ -347,3 +348,156 @@ class LabelLeakageCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class MultiWindowStabilityTests(unittest.TestCase):
+    """多窗口滚动一致性检查：以注入替身控制各窗口 IC，验证判定边界。"""
+
+    @staticmethod
+    def _dataset() -> Mock:
+        dataset = Mock()
+        dataset.segments = {"train": ["2020-01-01", "2022-01-01"], "test": ["2023-01-01", "2024-01-01"]}
+        return dataset
+
+    @staticmethod
+    def _prediction_with_ic(rank_ic: float, days: int = 4, symbols: int = 4) -> tuple[pd.Series, pd.Series]:
+        """构造 rank IC 近似等于 rank_ic 的分数/标签对。
+
+        用完美单调的标签，再按给定 rank_ic 在分数上施加单调扰动；
+        这里更简单地直接构造 Spearman 可精确计算的整数序列。
+        """
+        index = pd.MultiIndex.from_product(
+            [pd.to_datetime([f"2024-01-{d:02d}" for d in range(1, days + 1)]), [f"00000{i}" for i in range(symbols)]],
+            names=["datetime", "instrument"],
+        )
+        labels = pd.Series([0.0, 1.0, 2.0, 3.0] * days, index=index)
+        if rank_ic >= 1.0:
+            scores = [0.0, 1.0, 2.0, 3.0] * days
+        elif rank_ic <= -1.0:
+            scores = [3.0, 2.0, 1.0, 0.0] * days
+        else:
+            # 与标签部分同序：两两同序，其余反向，得到稳定的中间相关系数。
+            scores = [0.0, 1.0, 3.0, 2.0] * days
+        return pd.Series(scores, index=index), labels
+
+    def test_multi_window_stability_marks_stable_when_ics_agree(self) -> None:
+        """各窗口 IC 完全一致 → 标准差 0 → 判定稳定。"""
+        dataset = self._dataset()
+        prediction, labels = self._prediction_with_ic(0.8)
+        windows = [("2020-01-01", "2021-01-01"), ("2021-01-01", "2022-01-01"), ("2022-01-01", "2023-01-01")]
+        with patch.object(qlib_model, "train_lgbm", return_value=Mock()), patch.object(
+            qlib_model, "segment_prediction", return_value=(prediction, labels)
+        ):
+            result = qlib_model.multi_window_stability_check(dataset, {"seed": 42}, windows)
+
+        self.assertTrue(result["stable"])
+        self.assertEqual(result["windows_used"], 3)
+        self.assertEqual(result["threshold"], 0.02)
+        self.assertAlmostEqual(result["ic_std"], 0.0, places=9)
+        self.assertIn("within threshold", result["reason"])
+
+    def test_multi_window_stability_marks_unstable_when_ics_diverge(self) -> None:
+        """窗口间 IC 差异大 → 标准差超阈值 → 判定不稳定。"""
+        dataset = self._dataset()
+        strong, labels = self._prediction_with_ic(1.0)
+        weak, _ = self._prediction_with_ic(-1.0)
+        windows = [("2020-01-01", "2021-01-01"), ("2021-01-01", "2022-01-01")]
+        with patch.object(qlib_model, "train_lgbm", return_value=Mock()), patch.object(
+            qlib_model, "segment_prediction", side_effect=[(strong, labels), (weak, labels)]
+        ):
+            result = qlib_model.multi_window_stability_check(dataset, {"seed": 42}, windows)
+
+        self.assertFalse(result["stable"])
+        self.assertGreater(result["ic_std"], 0.02)
+        self.assertIn("exceeds threshold", result["reason"])
+
+    def test_multi_window_stability_insufficient_windows_is_not_stable(self) -> None:
+        """窗口不足时不得因标准差为 0 而误判稳定。"""
+        dataset = self._dataset()
+        prediction, labels = self._prediction_with_ic(0.5)
+        with patch.object(qlib_model, "train_lgbm", return_value=Mock()), patch.object(
+            qlib_model, "segment_prediction", return_value=(prediction, labels)
+        ):
+            result = qlib_model.multi_window_stability_check(
+                dataset, {"seed": 42}, [("2020-01-01", "2021-01-01")]
+            )
+
+        self.assertFalse(result["stable"])
+        self.assertEqual(result["windows_used"], 1)
+        self.assertTrue(np.isnan(result["ic_std"]))
+        self.assertIn("insufficient usable windows", result["reason"])
+
+    def test_multi_window_stability_isolates_window_failure(self) -> None:
+        """单个窗口抛错时不中断，整体仍给出结论且记录该窗口的错误。"""
+        dataset = self._dataset()
+        prediction, labels = self._prediction_with_ic(0.6)
+        windows = [("2020-01-01", "2021-01-01"), ("2021-01-01", "2022-01-01")]
+        with patch.object(qlib_model, "train_lgbm", return_value=Mock()), patch.object(
+            qlib_model,
+            "segment_prediction",
+            side_effect=[RuntimeError("boom"), (prediction, labels)],
+        ):
+            result = qlib_model.multi_window_stability_check(dataset, {"seed": 42}, windows)
+
+        self.assertEqual(result["windows_requested"], 2)
+        self.assertEqual(result["windows_used"], 1)
+        self.assertIsNone(result["details"][0]["ic"])
+        self.assertIn("RuntimeError: boom", result["details"][0]["error"])
+
+    def test_window_dataset_rewrites_train_segment(self) -> None:
+        """窗口裁剪只改 train 段，不动 test 段，也不改原对象。"""
+        dataset = self._dataset()
+        original = dict(dataset.segments)
+        windowed = qlib_model._window_dataset(
+            dataset, start_time="2019-01-01", end_time="2021-06-30"
+        )
+
+        self.assertEqual(windowed.segments["train"], ["2019-01-01", "2021-06-30"])
+        self.assertEqual(windowed.segments["test"], original["test"])
+        self.assertEqual(dataset.segments, original)
+
+    def test_run_qlib_stock_model_reports_stability_disabled_by_default(self) -> None:
+        """未配置 stability_windows 时不额外训练，结果为显式 disabled。"""
+        config = copy.deepcopy(DEFAULTS)
+        config["research"].pop("stability_windows", None)
+
+        # 数据集替身必须提供真实 DataFrame 的 backtest 帧：_run_qlib_stock_model
+        # 会执行 raw["BACKTEST_CLOSE"].unstack("instrument")，裸 Mock 会在下标处
+        # 抛 TypeError。此处对齐既有 _run_qlib_stock_model 测试的构造方式。
+        dates = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+        instruments = ["000001", "000002"]
+        backtest_index = pd.MultiIndex.from_product(
+            [dates, instruments],
+            names=["datetime", "instrument"],
+        )
+        close_frame = pd.DataFrame(
+            {"BACKTEST_CLOSE": [10.0, 20.0, 11.0, 18.0, 12.0, 19.0]},
+            index=backtest_index,
+        )
+        handler = Mock()
+        handler.fetch.return_value = close_frame
+        dataset = Mock(handler=handler)
+        dataset.segments = {
+            "train": ["2020-01-01", "2022-01-01"],
+            "valid": ["2022-01-01", "2023-01-01"],
+            "test": ["2024-01-02", "2024-01-04"],
+        }
+        config["dataset"]["segments"]["test"] = ["2024-01-02", "2024-01-04"]
+
+        prediction, labels = self._prediction_with_ic(0.5)
+        model = Mock()
+        model.model.best_iteration = 5
+        data_provider = Mock()
+        data_provider.calendar.return_value = dates
+        with patch.object(qlib_model, "multi_window_stability_check") as stability_mock, patch.object(
+            qlib_model, "init_qlib"
+        ), patch.object(qlib_model, "build_dataset", return_value=dataset), patch.object(
+            qlib_model, "train_lgbm", return_value=model
+        ), patch.object(
+            qlib_model, "segment_prediction", return_value=(prediction, labels)
+        ), patch.object(qlib.data.D, "_provider", data_provider):
+            result = qlib_model._run_qlib_stock_model(config)
+
+        stability_mock.assert_not_called()
+        self.assertIn("stability", result)
+        self.assertIsNone(result["stability"]["stable"])
+        self.assertIn("disabled", result["stability"]["reason"])

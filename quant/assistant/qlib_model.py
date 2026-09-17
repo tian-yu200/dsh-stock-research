@@ -718,6 +718,114 @@ def segment_prediction(dataset: Any, model: Any, segment: str) -> tuple[pd.Serie
     return prediction, labels
 
 
+def multi_window_stability_check(
+    dataset: Any,
+    model_config: Mapping[str, Any],
+    windows: Sequence[Any],
+    *,
+    segment: str = "test",
+    threshold: float = 0.02,
+    min_windows: int = 2,
+) -> dict[str, Any]:
+    """多窗口滚动一致性检查：用多个训练窗口分别训练，收集各窗口 IC 并判别稳定性。
+
+    背景：单窗口训练得到的 IC 只是一个点估计，无法区分"稳定的弱 alpha"与
+    "某个窗口的偶然拟合"。此处用 ``windows`` 指定的多个训练窗口分别训练同构模型，
+    在 ``segment`` 上评估 rank IC，再以 ``IC 的标准差``衡量跨窗口一致性。
+
+    ``windows`` 中每个元素是 ``(start_time, end_time)`` 形式的时间范围（由
+    :func:`_window_dataset` 负责切分为对应数据集）。判定规则：
+
+    - ``std <= threshold`` → 稳定；否则不稳定；
+    - ``len(windows) < min_windows`` → 样本不足以判定，``stable`` 为 ``False``
+      且 ``reason`` 标明原因（避免用 1 个窗口"算出"标准差为 0 而误判稳定）。
+
+    纯函数式设计：只依赖传入的 ``dataset``/``model_config``，不做任何缓存或写盘，
+    便于单测直接注入替身。
+    """
+    window_list = [tuple(window) for window in windows]
+    ics: list[float] = []
+    details: list[dict[str, Any]] = []
+    for index, (start_time, end_time) in enumerate(window_list):
+        try:
+            window_dataset = _window_dataset(
+                dataset, start_time=start_time, end_time=end_time
+            )
+            model = train_lgbm(window_dataset, model_config)
+            prediction, labels = segment_prediction(window_dataset, model, segment)
+            metrics = _prediction_metrics(prediction, labels)
+        except Exception as exc:  # 单个窗口失败不应吞掉整轮稳定性结论。
+            details.append(
+                {
+                    "index": index,
+                    "start_time": str(start_time),
+                    "end_time": str(end_time),
+                    "ic": None,
+                    "observations": 0,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        ic = metrics.get("mean_rank_ic")
+        ic_value = float(ic) if ic is not None and not pd.isna(ic) else None
+        if ic_value is not None:
+            ics.append(ic_value)
+        details.append(
+            {
+                "index": index,
+                "start_time": str(start_time),
+                "end_time": str(end_time),
+                "ic": ic_value,
+                "observations": int(metrics.get("observations", 0)),
+            }
+        )
+
+    window_ic_mean = float(np.mean(ics)) if ics else float("nan")
+    # ddof=1：跨窗口 IC 视为抽样，用样本标准差；窗口不足 2 个时为 NaN。
+    window_ic_std = float(np.std(ics, ddof=1)) if len(ics) > 1 else float("nan")
+    usable_windows = len(ics)
+    if usable_windows < max(int(min_windows), 2):
+        stable = False
+        reason = (
+            f"insufficient usable windows: {usable_windows} "
+            f"(< min_windows={max(int(min_windows), 2)})"
+        )
+    elif not np.isnan(window_ic_std) and window_ic_std > float(threshold):
+        stable = False
+        reason = (
+            f"window IC std {window_ic_std:.6f} exceeds threshold {float(threshold):.6f}"
+        )
+    else:
+        stable = True
+        reason = "window IC std within threshold"
+    return {
+        "stable": stable,
+        "reason": reason,
+        "threshold": float(threshold),
+        "windows_requested": len(window_list),
+        "windows_used": usable_windows,
+        "ic_mean": window_ic_mean,
+        "ic_std": window_ic_std,
+        "ics": ics,
+        "details": details,
+    }
+
+
+def _window_dataset(dataset: Any, *, start_time: Any, end_time: Any) -> Any:
+    """把已有数据集裁剪到给定训练窗口。
+
+    Qlib 的 ``DatasetH`` 通过 ``segments`` 描述时间范围，因此这里重写 ``train``
+    段；非 Qlib 替身（单测）只需提供可变的 ``segments`` 属性即可。
+    """
+    import copy as _copy
+
+    windowed = _copy.copy(dataset)
+    segments = dict(getattr(dataset, "segments", {}) or {})
+    segments["train"] = [start_time, end_time]
+    windowed.segments = segments
+    return windowed
+
+
 def _run_qlib_stock_model(
     config: Mapping[str, Any],
     *,
@@ -835,6 +943,35 @@ def _run_qlib_stock_model(
             test_prediction = predictions["test"]
             if test_prediction.empty:
                 raise ValueError("Qlib test prediction is empty")
+            # 多窗口滚动一致性检查（可选）：默认关闭，避免在既有训练成本上
+            # 再叠加 N 次全量训练。开启方式：research.stability_windows 给出
+            # [(start, end), ...] 窗口列表。
+            stability_cfg = config.get("research") or {}
+            stability_windows = stability_cfg.get("stability_windows") or []
+            if stability_windows:
+                _report_progress(progress_callback, "stability_check")
+                stability = multi_window_stability_check(
+                    dataset,
+                    config["model"],
+                    stability_windows,
+                    threshold=float(
+                        stability_cfg.get("stability_ic_std_threshold", 0.02)
+                    ),
+                )
+            else:
+                stability = {
+                    "stable": None,
+                    "reason": "stability check disabled (research.stability_windows empty)",
+                    "threshold": float(
+                        stability_cfg.get("stability_ic_std_threshold", 0.02)
+                    ),
+                    "windows_requested": 0,
+                    "windows_used": 0,
+                    "ic_mean": float("nan"),
+                    "ic_std": float("nan"),
+                    "ics": [],
+                    "details": [],
+                }
             # 2026-09-11 整改(P0-1 + P0-2)：先判定横截面是否退化，再决定要不要跑回测。
             # 实证：2026-09-11 provider 日历末位 2026-09-11 只有 6 只有数据，
             # scores 从 5562 退化为 6，且因 score_count<100 拒绝写缓存 →
@@ -1066,6 +1203,11 @@ def _run_qlib_stock_model(
                 "mean_rank_ic": metrics["test"]["mean_rank_ic"],
                 "test_rank_ic": metrics["test"]["mean_rank_ic"],
                 "rank_ic_ir": metrics["test"]["rank_ic_ir"],
+                # 多窗口滚动一致性：跨窗口 IC 均值/标准差与稳定性判定。
+                "stability": stability,
+                "stability_stable": stability["stable"],
+                "stability_ic_mean": stability["ic_mean"],
+                "stability_ic_std": stability["ic_std"],
                 "top_bottom_excess_return": group_metrics[
                     "top_bottom_excess_return"
                 ],
