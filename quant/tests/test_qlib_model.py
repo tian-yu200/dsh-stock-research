@@ -259,5 +259,91 @@ class QlibModelCacheTests(unittest.TestCase):
         self.assertLess(events.index("publish"), events.index("lock_released"))
 
 
+class LabelLeakageCheckTests(unittest.TestCase):
+    """测试 _check_label_leakage 标签窗口泄漏检查。"""
+
+    def test_no_leakage_when_label_window_before_valid_start(self) -> None:
+        """正常情况：标签窗口完全在 valid 段之前。"""
+        calendar = pd.to_datetime(
+            [
+                "2022-12-26",
+                "2022-12-27",
+                "2022-12-28",
+                "2022-12-29",
+                "2022-12-30",
+                "2023-01-03",
+                "2023-01-04",
+            ]
+        )
+        result = qlib_model._check_label_leakage(
+            calendar=calendar,
+            fit_end_time="2022-12-28",
+            label_horizon=2,
+            valid_start="2023-01-03",
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["label_horizon_days"], 2)
+        self.assertIsNone(result["reason"])
+
+    def test_leakage_when_label_window_crosses_into_valid(self) -> None:
+        """泄漏情况：标签窗口跨越进入 valid 段。"""
+        # 构造足够长的日历，确保 fit_end + 20 个交易日能覆盖
+        calendar = pd.date_range("2022-12-01", "2023-02-01", freq="B")  # 工作日
+        result = qlib_model._check_label_leakage(
+            calendar=calendar,
+            fit_end_time="2022-12-28",
+            label_horizon=20,
+            valid_start="2023-01-03",
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["label_horizon_days"], 20)
+        self.assertIn("label window crosses into valid segment", result["reason"])
+
+    def test_leakage_when_label_window_exactly_at_valid_start(self) -> None:
+        """边界情况：标签窗口末尾恰好是 valid_start。"""
+        calendar = pd.to_datetime(
+            [
+                "2022-12-28",
+                "2022-12-29",
+                "2022-12-30",
+                "2023-01-03",
+            ]
+        )
+        result = qlib_model._check_label_leakage(
+            calendar=calendar,
+            fit_end_time="2022-12-28",
+            label_horizon=3,
+            valid_start="2023-01-03",
+        )
+        # fit_end_time=2022-12-28 (loc=0) + 3个交易日 = loc=3 = 2023-01-03
+        # 2023-01-03 >= valid_start，应判定为泄漏
+        self.assertFalse(result["passed"])
+        self.assertIn("label window crosses into valid segment", result["reason"])
+
+    def test_fail_closed_when_calendar_lookup_fails(self) -> None:
+        """异常情况：日历查找失败时 fail-closed。"""
+        calendar = pd.to_datetime(["2022-12-28", "2022-12-29"])
+        result = qlib_model._check_label_leakage(
+            calendar=calendar,
+            fit_end_time="2023-01-03",  # 不在日历中
+            label_horizon=20,
+            valid_start="2023-01-10",
+        )
+        self.assertFalse(result["passed"])
+        self.assertIn("leakage check failed", result["reason"])
+
+    def test_fail_when_label_window_exceeds_calendar(self) -> None:
+        """标签窗口超出日历末尾。"""
+        calendar = pd.to_datetime(["2022-12-28", "2022-12-29", "2022-12-30"])
+        result = qlib_model._check_label_leakage(
+            calendar=calendar,
+            fit_end_time="2022-12-28",
+            label_horizon=100,
+            valid_start="2023-01-03",
+        )
+        self.assertFalse(result["passed"])
+        self.assertIn("exceeds calendar length", result["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

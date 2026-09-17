@@ -34,7 +34,7 @@ if str(QUANT_ROOT) not in sys.path:
 from assistant.config import load_config
 from assistant.paths import atomic_write_json, read_json, run_directory
 from assistant.research import run_research
-from fetch_state import FetchState, parse_iso, iso_now
+from fetch_state import FetchState, parse_iso, iso_now, process_alive
 from fetch_targets import asset_target_dates
 from trading_calendar import resolve_trading_day
 
@@ -162,13 +162,14 @@ def _high_alert(logger: logging.Logger, message: str) -> None:
 
 
 def _process_exists(pid: int | None) -> bool:
-    if not pid or pid <= 0:
-        return False
-    try:
-        os.kill(int(pid), 0)
-    except (OSError, ProcessLookupError, PermissionError):
-        return False
-    return True
+    # 2026-09-16 修复：原实现用 os.kill(pid, 0) 判活。Windows 上 os.kill 映射到
+    # TerminateProcess，对**非本进程创建**的存活进程抛 OSError(winerror=87)，
+    # 于是"抛异常即判死"。实测 64692（在跑的调度器）与 70048（在跑的 worker）
+    # 都被判 dead ⇒ ①SchedulerLock 误判锁过期、去 unlink 仍被占用的锁文件 →
+    # PermissionError → postclose 退出码 2（2026-09-16 17:30 计划任务实测）；
+    # ②_requeue_dead_worker 会误把在跑作业改成 queued。
+    # 统一走 fetch_state.process_alive（OpenProcess + GetExitCodeProcess）。
+    return process_alive(pid)
 
 def _worker_status(job_id: str) -> dict[str, Any]:
     try:
@@ -272,7 +273,16 @@ class SchedulerLock:
                     or (pid > 0 and not _process_exists(pid))
                 )
                 if stale:
-                    LOCK_PATH.unlink(missing_ok=True)
+                    # 2026-09-16：unlink 可能因锁文件仍被持有者打开而抛
+                    # PermissionError（Windows 不允许删除已打开的文件）。
+                    # 这不是"锁不可恢复"——持有者还活着，正确语义是让出。
+                    # 原实现把异常抛穿到 main()，让整个 CLI 以退出码 2 结束
+                    # （2026-09-16 17:30 postclose 计划任务实测），而判活修复前
+                    # stale 几乎恒为真，等于每次并发调用都崩。
+                    try:
+                        LOCK_PATH.unlink(missing_ok=True)
+                    except OSError:
+                        return False
                     continue
                 return False
             record = {

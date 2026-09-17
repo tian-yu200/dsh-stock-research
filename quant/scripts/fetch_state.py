@@ -66,6 +66,60 @@ def _should_filter_progress() -> bool:
         return False
 
 
+def process_alive(pid: int | None) -> bool:
+    """Return True when ``pid`` refers to a live process.
+
+    ``os.kill(pid, 0)`` is **not** a liveness probe on Windows: it maps to
+    ``TerminateProcess`` and raises ``OSError(winerror=87, errno=22)`` for live
+    processes the caller did not spawn, so any "exception means dead" check
+    reports unrelated live workers as dead.  Windows therefore asks the kernel
+    directly (``OpenProcess`` + ``GetExitCodeProcess``); access denied means the
+    process exists but belongs to someone else, which counts as alive.
+    """
+    try:
+        value = int(pid) if pid is not None else 0
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(value, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    access_denied = 5
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(process_query_limited_information, False, value)
+    if not handle:
+        return ctypes.get_last_error() == access_denied
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -510,9 +564,7 @@ class FetchState:
                 match = re.search(r"-(\d+)$", str(row["lease_owner"]))
                 if not match:
                     continue
-                try:
-                    os.kill(int(match.group(1)), 0)
-                except (OSError, ProcessLookupError):
+                if not process_alive(int(match.group(1))):
                     orphaned.append((row["asset_type"], row["symbol"]))
             if not orphaned:
                 return 0

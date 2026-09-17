@@ -148,10 +148,77 @@ def cohort_schedule(
     return schedule
 
 
+def _check_label_leakage(
+    calendar: pd.DatetimeIndex,
+    fit_end_time: str,
+    label_horizon: int,
+    valid_start: str,
+) -> dict[str, Any]:
+    """
+    检查标签窗口是否跨越 fit_end_time 进入 valid 段，防止数据泄漏。
+    
+    训练集最后一天是 fit_end_time，其标签需要未来 label_horizon 个交易日的价格。
+    若 fit_end_time + label_horizon 个交易日 > valid_start，则训练集末尾样本的标签
+    使用了 valid 期的价格，构成泄漏。
+    
+    Args:
+        calendar: 交易日历（qlib provider 的 D.calendar(freq="day")）
+        fit_end_time: 训练集结束日期（YYYY-MM-DD 字符串）
+        label_horizon: 标签前瞻天数（交易日）
+        valid_start: valid 段起始日期（YYYY-MM-DD 字符串）
+    
+    Returns:
+        {"passed": bool, "label_horizon_days": int, "reason": str | None}
+    """
+    try:
+        fit_end_ts = pd.Timestamp(fit_end_time)
+        valid_start_ts = pd.Timestamp(valid_start)
+        
+        # 找到 fit_end_time 在日历中的位置
+        fit_end_loc = calendar.get_loc(fit_end_ts)
+        
+        # 往后推 label_horizon 个交易日
+        label_window_end_loc = fit_end_loc + label_horizon
+        if label_window_end_loc >= len(calendar):
+            # 标签窗口超出日历末尾，无法判定（理论上不应发生）
+            return {
+                "passed": False,
+                "label_horizon_days": label_horizon,
+                "reason": f"label window (fit_end + {label_horizon} days) exceeds calendar length",
+            }
+        
+        label_window_end_ts = calendar[label_window_end_loc]
+        
+        # 检查标签窗口是否进入 valid 段
+        if label_window_end_ts >= valid_start_ts:
+            return {
+                "passed": False,
+                "label_horizon_days": label_horizon,
+                "reason": (
+                    f"label window crosses into valid segment: "
+                    f"fit_end={fit_end_time}, label_window_end={label_window_end_ts.date().isoformat()}, "
+                    f"valid_start={valid_start}"
+                ),
+            }
+        
+        return {
+            "passed": True,
+            "label_horizon_days": label_horizon,
+            "reason": None,
+        }
+    except Exception as exc:
+        # 日历查找失败等异常情况，fail-closed
+        return {
+            "passed": False,
+            "label_horizon_days": label_horizon,
+            "reason": f"leakage check failed: {type(exc).__name__}: {exc}",
+        }
+
+
 def _filter_scores(
     result: Mapping[str, Any],
     requested_symbols: list[str] | None,
- ) -> dict[str, Any]:
+) -> dict[str, Any]:
     filtered = dict(result)
     scores = result.get("scores", {})
     if not isinstance(scores, Mapping):
@@ -1065,10 +1132,12 @@ def _run_qlib_stock_model(
                     validate_symbol(str(symbol)): float(score)
                     for symbol, score in latest.items()
                 },
-                "leakage_check": {
-                    "passed": True,
-                    "label_horizon_days": label_horizon,
-                },
+                "leakage_check": _check_label_leakage(
+                    calendar=calendar,
+                    fit_end_time=dataset_config["fit_end_time"],
+                    label_horizon=label_horizon,
+                    valid_start=dataset_config["segments"]["valid"][0],
+                ),
                 "cache_hit": False,
                 "cache_miss_reason": cache_miss_reason,
                 "model_cache_key": cache_key,

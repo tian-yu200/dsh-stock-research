@@ -4,6 +4,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -457,6 +458,57 @@ class ContinuousResearchTests(unittest.TestCase):
                     lock.release()
             self.assertEqual(result["status"], "running")
             self.assertEqual(result["skipped"], "scheduler_lock_held")
+
+    def test_lock_held_by_live_process_is_not_stolen(self) -> None:
+        """锁文件存在且记录的是**存活** PID 时，不得判过期、不得删除。
+
+        修复前 _process_exists 在 Windows 恒返回 False（os.kill(pid,0) 对非本进程
+        创建的存活进程抛 winerror=87），stale 恒为真 → 去 unlink 仍被持有者打开的
+        锁文件 → PermissionError 抛穿到 main()，整个 CLI 以退出码 2 结束
+        （2026-09-16 17:30 postclose 计划任务实测）。
+        """
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-lock-live-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                self._environment(stack, root, state)
+                lock = continuous.SchedulerLock(stale_seconds=60)
+                self.assertTrue(lock.acquire("first-run"))
+                try:
+                    # 锁记录的是本进程这个存活 PID：必须让出而不是删锁。
+                    second = continuous.SchedulerLock(stale_seconds=60)
+                    self.assertFalse(second.acquire("second-run"))
+                    self.assertTrue(continuous.LOCK_PATH.is_file())
+                finally:
+                    lock.release()
+
+    def test_lock_with_dead_pid_is_recovered_without_raising(self) -> None:
+        """锁记录的 PID 已死时应正常回收，且不得抛异常。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-lock-stale-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                self._environment(stack, root, state)
+                continuous.LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+                continuous.LOCK_PATH.write_text(
+                    json.dumps(
+                        {
+                            "run_id": "dead-holder",
+                            "pid": 999_999_999,
+                            "created_at": "2026-09-16T00:00:00+08:00",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                lock = continuous.SchedulerLock(stale_seconds=60)
+                self.assertTrue(lock.acquire("recovered-run"))
+                lock.release()
 
     def test_completed_target_does_not_start_another_worker(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -1206,6 +1258,19 @@ class PostCloseTests(unittest.TestCase):
             self.assertEqual(value["trading_date"], "2026-09-04")
             self.assertEqual(value["total_forced"], 1)
             run_once_mock.assert_not_called()
+
+    def test_live_pid_is_reported_alive_by_process_probe(self) -> None:
+        """2026-09-16 修复：os.kill(pid, 0) 在 Windows 上**不是**判活探针。
+
+        它映射到 TerminateProcess，对非本进程创建的存活进程抛
+        OSError(winerror=87)，于是"抛异常即判死"。实测在跑的调度器与 worker
+        都被判 dead，导致锁被误判过期（postclose 退出码 2）与在跑作业被误 requeue。
+        回归判据：对当前进程自身的 PID 必须返回 True；对不存在的 PID 返回 False。
+        """
+        self.assertTrue(continuous._process_exists(os.getpid()))
+        self.assertFalse(continuous._process_exists(999_999_999))
+        self.assertFalse(continuous._process_exists(0))
+        self.assertFalse(continuous._process_exists(None))
 
 
 if __name__ == "__main__":
