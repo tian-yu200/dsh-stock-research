@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import random
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -687,6 +688,9 @@ def train_lgbm(
     from qlib.contrib.model.gbdt import LGBModel
     from qlib.workflow import R
 
+    random.seed(42)
+    np.random.seed(42)
+    model_config = {**model_config, "seed": 42}
     model = LGBModel(**model_config)
     if verbose_eval is None:
         _fit_qlib_model_and_close_recorder(model, dataset, R)
