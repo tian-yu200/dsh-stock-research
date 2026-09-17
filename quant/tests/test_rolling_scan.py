@@ -21,7 +21,26 @@ from fetch_state import FetchState
 import run_research_worker as worker
 
 
-END_DATE = "2026-08-28"
+# Fixture data must stay inside the rolling scan's staleness window
+# (stale_after_days), otherwise every symbol is rejected as 数据过期 and the
+# pool never leaves "accumulating". A fixed calendar date goes stale on its
+# own, so derive it from today instead.
+END_DATE = (pd.Timestamp.today().normalize() - pd.Timedelta(1, "D")).strftime("%Y-%m-%d")
+
+
+def _trading_days_before(end_date: str, days: int) -> str:
+    """Return the business day ``days`` before *end_date* (weekends only).
+
+    Tests that exercise the staleness layers need dates offset by a known
+    number of trading days from the fixture end. Deriving them here keeps them
+    in step with END_DATE instead of drifting with the calendar.
+    """
+    stamp = pd.Timestamp(end_date)
+    offset = pd.tseries.offsets.BDay(days)
+    return (stamp - offset).strftime("%Y-%m-%d")
+
+
+
 SYMBOL_DRIFTS = {
     "600000": 0.010,
     "600001": 0.008,
@@ -493,19 +512,22 @@ class RollingScanTests(unittest.TestCase):
 
             # 600000 停在 2 个交易日前、600001 停在 1 个交易日前：
             # 台账与得分库同步改写，不触发重算，只在排名时按滞后剔除。
+            # 日期相对 END_DATE 推算，避免写死后随日历漂移。
+            lag2_date = _trading_days_before(END_DATE, 2)
+            lag1_date = _trading_days_before(END_DATE, 1)
             state = FetchState(root / "fetch_state.sqlite3")
             state.mark_success(
                 "stock", "600000",
-                data_end_date="2026-08-26", source="test", rows=260,
+                data_end_date=lag2_date, source="test", rows=260,
                 refresh_interval_seconds=86400,
             )
             state.mark_success(
                 "stock", "600001",
-                data_end_date="2026-08-27", source="test", rows=260,
+                data_end_date=lag1_date, source="test", rows=260,
                 refresh_interval_seconds=86400,
             )
-            _execute_sql(root, "UPDATE scores SET data_end_date = '2026-08-26' WHERE symbol = '600000'")
-            _execute_sql(root, "UPDATE scores SET data_end_date = '2026-08-27' WHERE symbol = '600001'")
+            _execute_sql(root, f"UPDATE scores SET data_end_date = '{lag2_date}' WHERE symbol = '600000'")
+            _execute_sql(root, f"UPDATE scores SET data_end_date = '{lag1_date}' WHERE symbol = '600001'")
             with patch.object(research, "DATA_DIR", root), patch.object(
                 research, "UNIVERSE_PATH", root / "universe.json"
             ):
@@ -534,13 +556,14 @@ class RollingScanTests(unittest.TestCase):
             ):
                 rolling_scan.run_rolling_pass("job-1", config=config)
             # 让 600000 的得分与台账一致地停在 2 个交易日前（不触发重算）
+            lag2_date = _trading_days_before(END_DATE, 2)
             state = FetchState(root / "fetch_state.sqlite3")
             state.mark_success(
                 "stock", "600000",
-                data_end_date="2026-08-26", source="test", rows=260,
+                data_end_date=lag2_date, source="test", rows=260,
                 refresh_interval_seconds=86400,
             )
-            _execute_sql(root, "UPDATE scores SET data_end_date = '2026-08-26' WHERE symbol = '600000'")
+            _execute_sql(root, f"UPDATE scores SET data_end_date = '{lag2_date}' WHERE symbol = '600000'")
             with patch.object(research, "DATA_DIR", root), patch.object(
                 research, "UNIVERSE_PATH", root / "universe.json"
             ):
