@@ -163,6 +163,10 @@ gate:
   #   现恢复 0.15，使生产值与 config.DEFAULTS 重新一致，并由
   #   tests/test_gate_policy.py 断言锁定；后续任何调整必须先改测试与本节记录。
   max_excess_test_drawdown: 0.15
+  # 多窗口 IC 标准差上限；超此值说明模型跨窗口不稳定，阻断发布。
+  # 仅当 research.stability_windows 已配置（即稳定性检查启用）时生效；
+  # 未启用时 stability_stable=None，该项不阻断。
+  max_ic_std: 0.02
   # 拟合质量门槛：**已回退为关闭**（决策记录 + 自我更正）。
   #
   # 2026-09-11 18:40 初次引入时，我把训练日志 train_l2=0.995423 判读为

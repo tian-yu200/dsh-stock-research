@@ -52,7 +52,29 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         "test_max_drawdown_threshold": _finite(max_drawdown)
         and abs(float(max_drawdown)) <= drawdown_limit,
         "fit_quality_threshold": fit_quality_ok,
+        "stability_ic_std_threshold": _stability_ic_std_check(metrics, gate),
     }
+
+
+def _stability_ic_std_check(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> bool:
+    """多窗口滚动一致性门槛：跨窗口 IC 标准差超限即判不稳定。
+
+    - ``stability_stable`` 为 ``None`` 表示稳定性检查未启用（未配置
+      ``research.stability_windows``），此时**不阻断**，与既有可选门槛
+      （如默认关闭的 fit_quality）保持一致的语义。
+    - 已启用但取不到有效 ``stability_ic_std`` 时判失败（fail-closed），
+      避免"配置了门槛却因缺指标而静默放行"。
+    """
+    stable = metrics.get("stability_stable")
+    if stable is None:
+        return True
+    ic_std = metrics.get("stability_ic_std")
+    max_ic_std = float(gate.get("max_ic_std", 0.02))
+    if not _finite(ic_std):
+        return False
+    if not stable:
+        return False
+    return float(ic_std) <= max_ic_std
 
 
 def enforce_target_weights(

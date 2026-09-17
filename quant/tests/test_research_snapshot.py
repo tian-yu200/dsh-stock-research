@@ -107,6 +107,7 @@ STOCK_CHECK_KEYS = {
     "data_quality_and_model_available", "mean_rank_ic_threshold",
     "rank_ic_ir_threshold", "top_bottom_excess_return_threshold",
     "test_max_drawdown_threshold", "fit_quality_threshold",
+    "stability_ic_std_threshold",
     "data_quality_passed", "freshness_passed",
     "refresh_passed", "leakage_check_passed", "full_universe_screen_passed",
     "positive_signal_passed", "risk_constraints_passed",

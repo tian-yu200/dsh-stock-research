@@ -149,6 +149,9 @@ DEFAULTS: dict[str, Any] = {
         "min_top_bottom_excess_return": 0.00,
         "max_test_drawdown": 0.25,
         "max_excess_test_drawdown": 0.15,
+        # 多窗口滚动一致性门槛：跨窗口 IC 标准差上限。仅在稳定性检查启用
+        # （research.stability_windows 非空）时生效；未启用时不阻断发布。
+        "max_ic_std": 0.02,
         # 2026-09-11 整改：拟合质量门槛。标签为截面 z-score（方差≈1），
         # 1 - train_l2 近似样本内 R²。0.0 = 关闭（保测试夹具的合成数据）；
         # 生产在 assistant.yaml 显式启用。

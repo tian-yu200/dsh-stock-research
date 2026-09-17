@@ -42,6 +42,7 @@ GATE_KEYS_MUST_MATCH = (
     "min_top_bottom_excess_return",
     "max_test_drawdown",
     "max_excess_test_drawdown",
+    "max_ic_std",
 )
 
 # 注意：`min_train_l2_improvement` **不属于**上面任何一类——2026-09-11 复核后
@@ -409,3 +410,63 @@ def test_drawdown_advisory_is_advisory_only_never_blocks():
     nan_case = _drawdown_advisory(float("nan"), -0.212, 0.15)
     assert nan_case["breached"] is False
     assert nan_case["excess_drawdown"] is None
+
+
+def test_stability_gate_blocks_when_ic_std_exceeds_threshold():
+    """跨窗口 IC 标准差超阈值 → 判不稳定，阻断发布。"""
+    gate = {**DEFAULTS["gate"], "max_ic_std": 0.02}
+    metrics = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+        "stability_stable": False,
+        "stability_ic_std": 0.05,
+    }
+    assert model_gate_checks(metrics, gate)["stability_ic_std_threshold"] is False
+
+
+def test_stability_gate_accepts_when_ic_std_within_threshold():
+    """跨窗口 IC 标准差在阈值内 → 判稳定，放行。"""
+    gate = {**DEFAULTS["gate"], "max_ic_std": 0.02}
+    metrics = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+        "stability_stable": True,
+        "stability_ic_std": 0.01,
+    }
+    assert model_gate_checks(metrics, gate)["stability_ic_std_threshold"] is True
+
+
+def test_stability_gate_does_not_block_when_check_disabled():
+    """稳定性检查未启用（stable=None）→ 该项不阻断，与可选门槛语义一致。"""
+    gate = {**DEFAULTS["gate"], "max_ic_std": 0.02}
+    metrics = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+        "stability_stable": None,
+        "stability_ic_std": float("nan"),
+    }
+    assert model_gate_checks(metrics, gate)["stability_ic_std_threshold"] is True
+
+
+def test_stability_gate_is_fail_closed_when_metric_missing():
+    """已启用但取不到有效 ic_std → 判失败，不得静默放行。"""
+    gate = {**DEFAULTS["gate"], "max_ic_std": 0.02}
+    metrics = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+        "stability_stable": True,
+        "stability_ic_std": None,
+    }
+    assert model_gate_checks(metrics, gate)["stability_ic_std_threshold"] is False
