@@ -31,3 +31,6 @@ codex-conversation-export-*
 # 系统/编辑器
 Thumbs.db
 .DS_Store
+
+# Hermes 编排上下文（本地脚手架，不属于项目代码）
+.hermes.md
