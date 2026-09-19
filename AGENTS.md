@@ -15,6 +15,49 @@ When working in this repository, treat any command that may run longer than 30 s
 
 This rule exists because prior sessions repeatedly combined 47-60 KB tool results, recursive/full-file reads, foreground long-running tests or market fetches, and response-stream interruption. Codex logs recorded repeated stream retries and an interrupted task that did not exit gracefully; Windows event logs showed no Codex crash and there was no evidence of OOM, so avoid asserting memory exhaustion without new evidence.
 
+## Sandbox Limits (read before running anything)
+
+Codex runs in a restricted Windows sandbox (account `codexsandboxoffline`, not
+elevated) and cannot use the Windows Store Python that this project's venv is
+built on. Concretely:
+
+- `quant\.venv\pyvenv.cfg` has `home = C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0`
+- That path is a Windows Store **App Execution Alias** — a reparse point
+  (`ReparsePoint` attribute, `LinkType`/`Target` empty), not a classic symlink.
+  Its real target is the versioned package dir
+  `C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\python3.12.exe`.
+- What the sandbox blocks is the whole Store install/alias area, not a single
+  file: listing either `C:\Program Files\WindowsApps` or
+  `C:\Users\<user>\AppData\Local\Microsoft\WindowsApps` returns `Access is denied`,
+  and `Test-Path` on the alias `home` above also returns `Access is denied`.
+  As a result `quant\.venv\Scripts\python.exe` fails with `No Python at '...'`.
+
+**The venv is not broken.** The launcher file exists
+(`Test-Path quant\.venv\Scripts\python.exe` = True); the same interpreter runs
+fine from a normal shell, from `tasks\*.ps1`, and from opencode (full suite:
+325 passed). Do not propose reinstalling or rebuilding the venv — that wastes a
+cycle and changes nothing. (Note: "not broken" is reported, not verifiable from
+inside the Codex sandbox — verifying it is exactly what the sandbox prevents.)
+
+**What to do instead:**
+
+- **Do not attempt to run `quant\.venv\Scripts\python.exe`.** This is not a
+  launcher problem: `py.exe` itself runs, and `py.exe --list` enumerates the
+  installed interpreters (Store 3.12, Store 3.11, Astral CPython 3.11.16). But
+  launching *this project's venv* through any launcher still fails, because the
+  venv's `base`/`home` points into the blocked Store area.
+- **Do not run `pytest`** or any command that needs the project's Python.
+- **Report it and hand off.** State plainly that the task needs Python and is
+  therefore opencode's job. That is a normal, expected outcome — not a failure.
+- Tasks that stay with Codex: reading and writing files, `rg`/`Select-String`
+  searches, PowerShell that does not invoke the project's Python, and bounded
+  status checks of JSON/SQLite aggregates.
+
+One more Codex-specific limit: a turn that chains many tool calls in a row can
+trip `HTTP 400 reasoning_content_missing` upstream and kill the turn. Keep
+turns short — one or two steps — and expect multi-step exploration to be handed
+to opencode.
+
 ## Interactive Boundary Rule
 
 The interactive Codex execution stream is a control plane only. Keep it short and detachable:
