@@ -172,6 +172,10 @@ def _check_label_leakage(
         {"passed": bool, "label_horizon_days": int, "reason": str | None}
     """
     try:
+        # D.calendar(freq="day") 返回 numpy.ndarray，没有 get_loc；
+        # 统一转成 DatetimeIndex 后再做精确查找（保持 KeyError 时 fail-closed 语义）。
+        if not isinstance(calendar, pd.DatetimeIndex):
+            calendar = pd.DatetimeIndex(calendar)
         fit_end_ts = pd.Timestamp(fit_end_time)
         valid_start_ts = pd.Timestamp(valid_start)
         
