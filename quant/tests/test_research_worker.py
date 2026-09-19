@@ -24,6 +24,23 @@ import run_research_worker as worker
 import run_assistant_research as queued_cli
 
 
+def _sandbox_rolling_scan(config: dict[str, Any], root: pathlib.Path) -> None:
+    """Redirect the rolling-scan sidecar at the test sandbox.
+
+    worker.main() runs a rolling pass after every fetch wave using
+    config["rolling_scan"] paths; DEFAULTS points those at the production
+    snapshot/DB, so any test reaching _run_rolling_scan without this override
+    rewrites production files (2026-09-19 incident: production
+    rolling_scan.json job_id replaced by a fixture ID).
+    Mirrors tests/test_rolling_scan.py::_config.
+    """
+    config["rolling_scan"] = {
+        **copy.deepcopy(DEFAULTS["rolling_scan"]),
+        "state_db": str(root / "rolling_scan.sqlite3"),
+        "snapshot_path": str(root / "rolling_scan.json"),
+    }
+
+
 class ResearchWorkerTests(unittest.TestCase):
     def test_parses_bounded_qlib_build_summary(self) -> None:
         summary = worker._qlib_build_summary(
@@ -265,6 +282,7 @@ class ResearchWorkerTests(unittest.TestCase):
             config = copy.deepcopy(DEFAULTS)
             config["fetch"]["state_db"] = str(state.path)
             config["fetch"]["max_data_age_days"] = 0
+            _sandbox_rolling_scan(config, root)
 
             def timed_out_fetch(*args, **kwargs):
                 self.assertEqual(kwargs["target_date"], "2026-08-26")
@@ -337,6 +355,7 @@ class ResearchWorkerTests(unittest.TestCase):
             config = copy.deepcopy(DEFAULTS)
             config["fetch"]["state_db"] = str(state.path)
             config["fetch"]["max_data_age_days"] = 0
+            _sandbox_rolling_scan(config, root)
 
             def timed_out_without_progress(*args, **kwargs):
                 return {
@@ -468,6 +487,7 @@ class ResearchWorkerTests(unittest.TestCase):
             config["fetch"]["state_db"] = str(state.path)
             config["fetch"]["min_universe_coverage"] = 0.5
             config["fetch"]["max_data_age_days"] = 5
+            _sandbox_rolling_scan(config, root)
 
             fetch_result = {
                 "asset_type": "etf",
@@ -549,6 +569,7 @@ class ResearchWorkerTests(unittest.TestCase):
             config = copy.deepcopy(DEFAULTS)
             config["fetch"]["state_db"] = str(state.path)
             config["fetch"]["max_data_age_days"] = 5
+            _sandbox_rolling_scan(config, root)
             research_result = {
                 "run_id": job_id,
                 "status": "success",
