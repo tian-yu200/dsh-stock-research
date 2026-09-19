@@ -83,6 +83,19 @@ rolling_scan:
   max_symbols_per_pass: 800
   score_table_limit: 500
 
+# 离线稳定性检查（独立脚本 quant/scripts/stability_check.py 专用，不进日常管线）。
+# 日常 _run_qlib_stock_model 只读 research.stability_windows（当前未配置=关闭），
+# 此节与那条路径完全隔离；加窗/改阈值不触发模型缓存失效（缓存键白名单见 qlib_model）。
+stability_check:
+  # expanding 训练窗口：每窗 >=1 年且间隔 >=6 个月，末窗与主训练段一致便于对照；
+  # 各窗口终点 +20 交易日均早于 valid_start=2025-10-09（泄漏卫生）。
+  windows:
+    - ["2023-04-01", "2024-03-29"]
+    - ["2023-04-01", "2024-09-30"]
+    - ["2023-04-01", "2025-09-02"]
+  segment: "test"
+  threshold: 0.02
+
 research:
   stock_label_horizon: 20
   stock_topk: 3
