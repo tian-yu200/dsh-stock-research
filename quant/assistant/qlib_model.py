@@ -84,6 +84,10 @@ def _model_cache_identity(
                 # 2026-09-11 整改(P0-2)：信号日退化的绝对下限会影响 scores 集合，
                 # 必须进缓存键，否则改它可能复用旧缓存而看不出差异。
                 "min_signal_scores",
+                # 2026-09-19 缓存卫生：稳定性检查开关改变检查语义，
+                # 必须进缓存键，否则开窗后命中旧缓存会静默跳过检查。
+                "stability_windows",
+                "stability_ic_std_threshold",
             )
             if key in config["research"]
         },
