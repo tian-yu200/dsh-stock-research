@@ -8,6 +8,14 @@ import pandas as pd
 DAILY_COLUMNS = ("date", "open", "high", "low", "close", "volume", "amount", "turnover")
 REQUIRED_COLUMNS = ("date", "open", "high", "low", "close", "volume")
 
+# 单位契约（2026-08-28 volume/turnover 单位口径切换事故后立约，见
+# quant/logs/codex-runs/step0f-unit-residual-verify.md）。
+# 落盘 CSV 必须满足：volume 单位 = 股；turnover 单位 = 小数（非百分数）。
+# 单快照无法判定单位（000783 全历史手口径自洽即合法），口径切换只能逐日环比发现，
+# 因此强制执行点在 fetch_utils.merge_daily_frames 的单位守卫
+#（price_guards.detect_unit_breaks），此处仅声明契约本身。
+UNIT_CONTRACT = {"volume": "shares", "turnover": "decimal-fraction"}
+
 class DailyBarSchemaError(ValueError):
     """A deterministic incompatibility in an upstream daily-bar payload."""
 
@@ -72,6 +80,13 @@ def normalize_daily_bars(frame: pd.DataFrame, *, source: str = "unknown") -> pd.
 
     Price and volume fields are required. Amount and turnover are optional and are
     represented by ``NaN`` when an upstream source does not provide them.
+
+    Unit contract (see UNIT_CONTRACT): downstream CSVs use volume in shares
+    (股) and turnover as a decimal fraction (小数). A single snapshot cannot
+    prove units (a consistently hand-denominated history like 000783 is legal),
+    so switching is enforced day-over-day by the unit guard in
+    ``fetch_utils.merge_daily_frames`` (``price_guards.detect_unit_breaks``),
+    not here.
     """
     if frame is None or frame.empty:
         raise EmptyDailyBarResponse(f"{source}: empty daily-bar response")

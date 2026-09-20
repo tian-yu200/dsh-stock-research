@@ -269,6 +269,20 @@ def merge_daily_frames(
             result = _pg_clean
     except Exception as _pg_exc:
         print("  [" + existing_path.stem + "] 价格守卫跳过: " + type(_pg_exc).__name__)
+    try:
+        # 单位守卫（UNIT_CONTRACT，见 market_data）：volume/turnover 日环比跳变
+        # （close 不动的纯单位切换也能独立发射）。隔离机制与价格守卫相同
+        # （quarantine + 原因记录）；价格守卫既有语义不受影响。
+        from price_guards import detect_unit_breaks as _ug_detect
+        from price_guards import write_quarantine as _ug_quarantine
+        _ug_flags, _ug_reasons = _ug_detect(result, source=source, symbol=existing_path.stem)
+        if bool(_ug_flags.any()):
+            _ug_bad = result.loc[_ug_flags].reset_index(drop=True)
+            _ug_qpath = _ug_quarantine(existing_path.parent, existing_path.stem, _ug_bad, _ug_reasons)
+            print("  [" + existing_path.stem + "] 单位守卫隔离 " + str(len(_ug_bad)) + " 行 -> " + str(_ug_qpath))
+            result = result.loc[~_ug_flags].reset_index(drop=True)
+    except Exception as _ug_exc:
+        print("  [" + existing_path.stem + "] 单位守卫跳过: " + type(_ug_exc).__name__)
     for key, value in incoming.attrs.items():
         result.attrs[key] = value
     return result

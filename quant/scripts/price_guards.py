@@ -252,3 +252,114 @@ def ths_patch_recent(symbol, frame, *, threshold=THS_CONFLICT_THRESHOLD):
                 out.loc[mask, col] = t[col]
             patched += 1
     return out, {"patched": patched, "detail": "ths_patch_recent"}
+
+
+# --- 单位守卫（2026-08-28 volume/turnover 口径切换事故后增设） ---
+# 与价格守卫同级、语义独立：只看 volume/turnover 的日环比（r = V/T），close 不动
+# 的纯单位跳变也能独立发射。现有价格函数一律未动（不变量 :27 的 A/B 零差异要求）。
+# 单位契约见 market_data.UNIT_CONTRACT：volume=股，turnover=小数。
+UNIT_JUMP_HI = 50.0
+UNIT_JUMP_LO = 0.02
+UNIT_BIG_HI = 2000.0
+UNIT_BIG_LO = 0.0005
+# amount 协同带：v/t 跳变落在 [30,50)（或反向）时，只看 v/t 无法区分
+# “真实放量”（amount 同步）与“单位错”（amount 不动），此时以 amount 裁决。
+# 50x 以上直接发射的行为不变。
+UNIT_BAND_HI = 30.0
+UNIT_BAND_LO = 1.0 / 30.0
+UNIT_AMT_SYNC = 10.0
+# 停牌豁免（与价格守卫对称，但已收紧，见 R1）：自然日 gap >10 天的首行，
+# 仅当该行量价自洽（隐含均价 amount/volume 落在近 60 日中位的 X 倍带内）才豁免。
+# 纯 gap 判定无法区分真停牌与数据缺口（实证 000875：11 天 gap 实为缺行，
+# 且该行 volume 低估约 100 倍）；无法评估（隐含 NaN / 历史不足）时沿用旧行为豁免。
+UNIT_HALT_DAYS = 10
+UNIT_SELFCHECK_X = 5.0
+
+
+def _unit_band(jump):
+    try:
+        j = float(jump)
+    except (TypeError, ValueError):
+        return "unit_jump_other"
+    if UNIT_JUMP_HI <= j <= 500.0:
+        return "unit_up_x100"
+    if UNIT_BIG_HI <= j <= 200000.0:
+        return "unit_up_x10000"
+    if 0.002 <= j <= UNIT_JUMP_LO:
+        return "unit_down_x100"
+    if 0.000005 <= j <= UNIT_BIG_LO:
+        return "unit_down_x10000"
+    if UNIT_BAND_HI <= j < UNIT_JUMP_HI:
+        return "unit_up_30_50_amtflat"
+    if UNIT_JUMP_LO < j <= UNIT_BAND_LO:
+        return "unit_down_30_50_amtflat"
+    return "unit_jump_other"
+
+
+def detect_unit_breaks(frame, *, source="", symbol=""):
+    """Flag rows whose volume/turnover day-over-day ratio jumps unit-scale.
+
+    r = volume/turnover per row; jump = r_i / r_{i-1}; suspect when
+    jump >= UNIT_JUMP_HI (50) or jump <= UNIT_JUMP_LO (0.02), covering x100 /
+    x10000 in both directions. Close is never consulted, so pure unit switches
+    fire independently of price breaks. A level-consistent history (e.g. 000783
+    hand-denominated throughout) has jump ~= 1 and is never flagged.
+    Narrow band [30,50) (and mirror): amount corroborates — fire only when
+    amount is flat (|day-ratio| < 10x), i.e. money didn't move; a synced
+    amount move means real trading and stays quiet. Missing amount never
+    fires in this band. Rows after a >10-natural-day gap are exempt only when
+    amount/volume self-consistent (implied price within X of trailing median,
+    R1); unevaluable rows keep the old exempt behavior.
+    Returns (flags Series aligned to frame.index, reasons list shaped like
+    validate_daily_bars reasons for write_quarantine).
+    """
+    flags = pd.Series(False, index=frame.index)
+    reasons = []
+    try:
+        vol = pd.to_numeric(frame.get("volume"), errors="coerce")
+        tov = pd.to_numeric(frame.get("turnover"), errors="coerce")
+        amt = pd.to_numeric(frame.get("amount"), errors="coerce")
+        valid = vol.gt(0) & tov.gt(0)
+        ratio = vol / tov.where(valid, pd.NA)
+        prev = ratio.shift(1)
+        prev_valid = valid.shift(1, fill_value=False)
+        # valid/prev_valid guarantee finite positive ratio and prev: no inf/0 risk.
+        jump = ratio / prev
+        hit_big = valid & prev_valid & jump.notna() & ((jump >= UNIT_JUMP_HI) | (jump <= UNIT_JUMP_LO))
+        amt_valid = amt.gt(0)
+        amt_prev_valid = amt_valid.shift(1, fill_value=False)
+        aratio = amt / amt.shift(1)
+        in_band = ((jump >= UNIT_BAND_HI) & (jump < UNIT_JUMP_HI)) | ((jump > UNIT_JUMP_LO) & (jump <= UNIT_BAND_LO))
+        amt_flat = amt_valid & amt_prev_valid & aratio.notna() & (aratio < UNIT_AMT_SYNC) & (aratio > 1.0 / UNIT_AMT_SYNC)
+        hit_band = valid & prev_valid & jump.notna() & in_band & amt_flat
+        hit = hit_big | hit_band
+        try:
+            gap_days = (pd.to_datetime(frame.get("date"), errors="coerce") -
+                        pd.to_datetime(frame.get("date"), errors="coerce").shift(1)).dt.days
+            gap_mask = gap_days.fillna(0) > UNIT_HALT_DAYS
+            # R1: gap 首行豁免须量价自洽。implied = amount/volume（与 close 无关，
+            # hfq 安全）；偏离近 60 日中位超过 X 倍则拒绝豁免（如 000875 偏离 97x）。
+            # 只在有肯定证据（可计算且偏离）时拒绝；无法评估则沿用旧行为豁免，
+            # 避免误伤真停牌。已知上限（R2）：amount 若被同比例污染，
+            # implied 保持自洽，豁免仍会生效。
+            implied = amt / vol.where(vol.gt(0), pd.NA)
+            implied = implied.where(amt.gt(0), pd.NA)
+            trail_med = implied.rolling(60, min_periods=5).median().shift(1)
+            dev = pd.to_numeric(implied / trail_med, errors="coerce")
+            inconsistent = dev.notna() & ((dev < 1.0 / UNIT_SELFCHECK_X) | (dev > UNIT_SELFCHECK_X))
+            hit = hit & ~(gap_mask & ~inconsistent)
+        except Exception:
+            pass
+        flags = hit.fillna(False).astype(bool)
+        dates = frame.get("date")
+        for idx in flags.index[flags]:
+            try:
+                ds = pd.Timestamp(dates.loc[idx]).date().isoformat()
+            except Exception:
+                ds = str(dates.loc[idx]) if dates is not None else str(idx)
+            reasons.append({"date": ds, "symbol": symbol, "source": source,
+                            "reasons": [_unit_band(jump.loc[idx])],
+                            "gap": 0.0, "deviation": 0.0})
+    except Exception:
+        return pd.Series(False, index=frame.index), []
+    return flags, reasons
