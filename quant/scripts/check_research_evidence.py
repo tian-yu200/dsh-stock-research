@@ -1,7 +1,7 @@
 """复现《量化系统评估报告-20260911.md》的全部运行台账证据（只读）。
 
-用法（在任意目录）：
-    D:/dsh-gupiao/quant/.venv/Scripts/python.exe quant/scripts/check_research_evidence.py
+用法（在仓库根目录）：
+    quant/.venv/Scripts/python.exe quant/scripts/check_research_evidence.py
 
 本脚本只读文件，不写入、不删除、不联网、不启动任何研究进程。
 输出量有界（每个运行一行汇总），便于快速核对报告 §2/§3 的断言。
@@ -64,7 +64,7 @@ def check_runs() -> None:
     month = RUNS / "2026/09"
     if not month.is_dir():
         print(f"  目录不存在：{month}")
-        print("  → 如果你看到的正是这个结果，说明当前所在的工作树不是 D:/dsh-gupiao。")
+        print("  → 如果你看到的正是这个结果，说明当前所在的工作树不是主仓库。")
         return
     header = ("run", "mode", "depth", "status", "IC", "IR", "maxDD", "netRet", "turn", "scores", "False检查项")
     print("  %-15s %-9s %-8s %-8s %7s %6s %8s %8s %6s %7s %s" % header)

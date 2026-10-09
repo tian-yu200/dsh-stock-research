@@ -194,8 +194,10 @@ class RegimeAwareModelManager:
         }
 
 
-def get_benchmark_returns(data_dir: str = "D:/dsh-gupiao/quant/data") -> pd.Series:
+def get_benchmark_returns(data_dir: str | None = None) -> pd.Series:
     """从你的数据中提取基准收益（沪深300或000001平安银行作为proxy）"""
+    if data_dir is None:
+        data_dir = str(Path(__file__).resolve().parents[1] / "data")
     benchmark_path = Path(data_dir) / "stocks" / "000001.csv"
     
     if not benchmark_path.exists():
@@ -217,7 +219,7 @@ if __name__ == "__main__":
     
     # 2. 检测当前regime
     manager = RegimeAwareModelManager(
-        state_file="D:/dsh-gupiao/quant/data/model_regime_state.json"
+        state_file=str(Path(__file__).resolve().parents[1] / "data" / "model_regime_state.json")
     )
     
     result = manager.check_should_retrain(

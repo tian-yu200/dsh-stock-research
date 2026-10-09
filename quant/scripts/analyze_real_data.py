@@ -23,8 +23,8 @@ import json
 class RealDataAnalyzer:
     """基于你的真实数据做诊断"""
     
-    def __init__(self, quant_dir: str = "D:/dsh-gupiao/quant"):
-        self.quant_dir = Path(quant_dir)
+    def __init__(self, quant_dir: str | None = None):
+        self.quant_dir = Path(quant_dir) if quant_dir else Path(__file__).resolve().parents[1]
         self.data_dir = self.quant_dir / "data"
         self.results_dir = self.quant_dir / "results/assistant"
         
@@ -292,7 +292,7 @@ if __name__ == "__main__":
     print(json.dumps(recommendations, indent=2, ensure_ascii=False))
     
     # 保存分析结果
-    output_path = Path("D:/dsh-gupiao/quant/data/real_data_analysis.json")
+    output_path = analyzer.data_dir / "real_data_analysis.json"
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(recommendations, f, indent=2, ensure_ascii=False)
     

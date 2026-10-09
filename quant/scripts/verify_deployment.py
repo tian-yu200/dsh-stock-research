@@ -5,6 +5,9 @@
 import sys
 from pathlib import Path
 
+QUANT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def check_integration():
     """检查代码集成状态"""
     
@@ -13,7 +16,7 @@ def check_integration():
     print("="*60)
     print()
     
-    research_file = Path("D:/dsh-gupiao/quant/assistant/research.py")
+    research_file = QUANT_ROOT / "assistant" / "research.py"
     
     if not research_file.exists():
         print("❌ research.py 不存在")
@@ -52,12 +55,12 @@ def check_new_files():
     print()
     
     files = {
-        "Regime检测器": "D:/dsh-gupiao/quant/assistant/regime_detector.py",
-        "低换手率策略": "D:/dsh-gupiao/quant/assistant/strategy_lowto.py",
-        "因子动物园": "D:/dsh-gupiao/quant/assistant/factor_zoo.py",
-        "熊市配置": "D:/dsh-gupiao/quant/configs/assistant_bear.yaml",
-        "数据分析器": "D:/dsh-gupiao/quant/scripts/analyze_real_data.py",
-        "测试脚本": "D:/dsh-gupiao/quant/scripts/test_improvements.py",
+        "Regime检测器": QUANT_ROOT / "assistant" / "regime_detector.py",
+        "低换手率策略": QUANT_ROOT / "assistant" / "strategy_lowto.py",
+        "因子动物园": QUANT_ROOT / "assistant" / "factor_zoo.py",
+        "熊市配置": QUANT_ROOT / "configs" / "assistant_bear.yaml",
+        "数据分析器": QUANT_ROOT / "scripts" / "analyze_real_data.py",
+        "测试脚本": QUANT_ROOT / "scripts" / "test_improvements.py",
     }
     
     all_exist = True
@@ -87,7 +90,7 @@ def show_next_steps():
     print("  优点: 不干扰当前流程，自然验证")
     print()
     print("选项2: 手动触发一次完整研究")
-    print("  cd D:/dsh-gupiao/quant")
+    print("  cd quant")
     print("  .venv/Scripts/python.exe scripts/continuous_research.py --mode daily")
     print("  注意: 可能需要20-30分钟完成")
     print()

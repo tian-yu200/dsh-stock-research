@@ -1,122 +1,155 @@
-# DSH 股票基金私人研究助手
+# A 股与基金量化研究助手
 
-本目录把已安装的 DSH 运行时与量化研究项目隔离开，所有项目配置、结果、日志、数据和 Skill 都位于 `D:\dsh-gupiao`。
+面向个人本地研究的 A 股 / ETF / 场外基金量化研究系统。把行情采集、特征工程、模型训练、回测验证和组合约束串成一条可复现的流水线，并内置**发布门槛**：模型指标不达标时不输出个股买入权重，只给现金/观察结论。
 
-## 目录
+> **这不是交易系统。** 不连接券商、不读取账户、不自动下单，只输出百分比目标权重和调仓比例。所有结论仅供研究参考，不构成投资建议。
+
+## 它解决什么问题
+
+个人做 A 股量化研究容易踩三类坑，本项目针对性地做了处理：
+
+1. **数据不可信** —— 多数据源抓取（东财 / 腾讯 / 新浪依次降级）、统一字段、价格守卫、源级熔断、断点续抓；抓取状态持久化到 SQLite，进程重启后接着跑，不会从零重来。
+2. **回测虚高** —— A 股有涨跌停和停牌，只用收盘价回测会系统性高估收益。回测按开盘价判定可成交性，并扣除手续费、印花税和最低费用。
+3. **过拟合被当成有效信号** —— 用 RankIC、RankIC IR、分组超额收益、超额回撤和多窗口 IC 标准差等门槛把关，不达标就拒绝发布并保留上一份成功快照。
+
+## 研究流水线
 
 ```text
-D:\dsh-gupiao\
-  .dsh\                         DSH_HOME、profile patch、preset 和 Skill
-  quant\                        独立 Python 环境、数据、Qlib provider、研究代码
-  bin\                          启动 DSH 和手动研究入口
-  tasks\                        Windows 任务计划程序脚本
-  docs\                         运行、验收和安全边界说明
+AkShare 多源抓取 → 统一日线字段 → Qlib 文件 provider
+                 → Alpha158 特征 → LightGBM 训练与预测
+                 → TopkDropout 策略回测 → 门槛判定 → 目标权重
 ```
 
-## 启动
+三条独立路径：
 
-在 PowerShell 中执行：
+- **股票**：Alpha158 + LightGBM，只有通过全部模型门槛才生成个股目标权重。
+- **ETF / 场外基金**：走独立的趋势、收益、波动、回撤、基准相对表现和同类比较路径。
+- **组合**：统一执行现金比例、类别敞口、单标的权重和换手限制。
+
+## 快速开始
+
+需要 Python 3.12。研究代码跨平台，`bin/` 与 `tasks/` 下的 PowerShell 入口依赖 Windows。
 
 ```powershell
-& 'D:\dsh-gupiao\bin\start-stock-assistant.ps1'
+# 1. 建立虚拟环境并安装依赖
+python -m venv quant\.venv
+quant\.venv\Scripts\python.exe -m pip install -r quant\requirements-base.txt
+
+# 2. 抓取行情并构建 Qlib provider
+quant\.venv\Scripts\python.exe quant\scripts\fetch_stock_data.py
+quant\.venv\Scripts\python.exe quant\scripts\build_qlib_data.py --replace
+
+# 3. 跑一次定向研究（指定股票代码）
+quant\.venv\Scripts\python.exe quant\scripts\run_assistant_research.py `
+    --mode on_demand --asset-scope stock --symbols 600519
 ```
 
-启动脚本设置：
-
-```text
-DSH_HOME=D:\dsh-gupiao\.dsh
-DSH_CWD=D:\dsh-gupiao
-```
-
-它调用已安装的 `D:\deepseek-harness\node_modules\.bin\dsh.cmd`，不会修改 DSH 安装目录。
-
-## 手动研究
+也可以走 PowerShell 入口：
 
 ```powershell
-& 'D:\dsh-gupiao\bin\run-research.ps1' -Mode on_demand -AssetScope stock -Symbols 600519 000001
-& 'D:\dsh-gupiao\bin\run-research.ps1' -Mode on_demand -AssetScope etf -Symbols 510300
-& 'D:\dsh-gupiao\bin\run-research.ps1' -Mode on_demand -AssetScope otc_fund -Symbols 110020
+& .\bin\run-research.ps1 -Mode on_demand -AssetScope stock -Symbols 600519 000001
 ```
 
-省略 `-Symbols` 会按 `quant\data\universe.json` 扫描完整股票、ETF 或场外基金代码池。入口只接受固定模式、固定资产范围和最多 100 个六位代码，不接受输出目录、Python 路径或命令参数。
+省略 `-Symbols` 时按 `quant\data\universe.json` 扫描完整代码池。入口只接受固定模式、固定资产范围和最多 100 个六位代码，不接受输出目录、Python 路径或任意命令参数。
 
-### 研究深度 depth
+### 研究深度
 
-所有入口（MCP `run_research`、CLI `--depth`、`run-research.ps1 -Depth`）共用三级深度：
+所有入口共用三级深度：
 
-```text
-quick      只读缓存 CSV 与既有 Qlib provider/模型缓存，不刷新任何行情；
-           秒级返回，数据可能陈旧（结果中带 data_end_date 与 stale_allowed_by_depth 标记）。
-standard   缺省值：daily/monthly 定时任务与带 -Symbols 的定向请求刷新指定代码，
-           全市场请求按代码池推进。
-full       忽略定向代码，刷新整个所选资产代码池并重建 provider；不能与 symbols 组合。
-```
+| 深度 | 行为 |
+|---|---|
+| `quick` | 只读缓存 CSV 与既有 provider/模型缓存，不刷新行情；秒级返回，数据可能陈旧 |
+| `standard` | 缺省值：定向请求刷新指定代码，全市场请求按代码池推进 |
+| `full` | 忽略定向代码，刷新整个资产代码池并重建 provider |
 
-`quant\configs\assistant.yaml` 的 `research.default_depth` 只影响 on_demand 请求的缺省深度；daily/monthly 定时任务始终按 standard（全量维护）执行。
+注意冷启动成本：provider 重建会使模型缓存失效，重建后第一次股票分析需要完整训练一次模型（实测 8 线程约 26 分钟）。完成后同周期内后续请求为秒级。
 
-注意冷启动：provider 每次重建（全市场维护后）都会使模型缓存失效，**重建后的第一笔股票分析**（quick 或 standard）需要完整训练一次模型——实测 8 线程约 26 分钟（训练无检查点，属每周期一次性成本），完成后缓存随即可用，同周期后续请求为秒级（实测缓存命中约 8 秒）。定向任务一次 worker 预算由 `fetch.targeted_time_budget_seconds`（缺省 3600 秒）保证，研究阶段也不会被全市场波次预算（`fetch.batch_time_budget_seconds`，600 秒）截断。另外研究阶段有全局锁：上一笔研究未结束时提交的新请求会失败，请等完成通知后再发下一笔。
+### 自动任务
 
-`get_current_snapshot` 返回只读 `freshness` 块：按交易日目标计算所选切片的 completed/pending/stale/coverage，与抓取队列判定一致。数据够新时先答 `quick`，`pending>0` 时再用 `standard` 刷新指定代码，即可把"询问到出结果"压到最短。
-
-抓取波次支持并行通道（`fetch.parallel_asset_fetch`，缺省开启）：股票脚本与基金脚本访问不同数据源，两通道并行不提高同一端点请求速率；etf 与 otc_fund 共用基金通道内部串行。全市场任务的抓取墙钟时间约等于两条通道中较慢者，而非两者之和。
-
-每次运行的 `status.json` 记录 `depth`、排队等待 `queue_wait_seconds` 与各阶段耗时 `stage_timings`（cache_check/fetch/qlib_build/research 等）；研究 `manifest.json` 也带 `depth` 与 `stage_timings`，用于后续定位耗时。
+注册每周一至周五 18:30（北京时间）的 Windows 计划任务：
 
 ```powershell
-# 秒级看某只股票的既有结论
-& 'D:\dsh-gupiao\bin\run-research.ps1' -Mode on_demand -AssetScope stock -Depth quick -Symbols 600519
-# 刷新该股票后出结论（分钟级）
-& 'D:\dsh-gupiao\bin\run-research.ps1' -Mode on_demand -AssetScope stock -Depth standard -Symbols 600519
-# 全代码池维护（后台波次推进，最慢）
-& 'D:\dsh-gupiao\bin\run-research.ps1' -Mode on_demand -AssetScope stock -Depth full
+& .\tasks\register-task.ps1    # 注册
+& .\tasks\unregister-task.ps1  # 注销
 ```
 
-## 自动任务
+任务先通过交易日历判断是否为交易日，非交易日跳过；当月最后一个有效交易日运行 `monthly`，其他交易日运行 `daily`。
 
-以当前 Windows 用户注册每周一至周五 18:30 的任务：
+## 目录结构
+
+```text
+.
+├── quant/
+│   ├── assistant/     研究服务核心（研究管线、模型、风险、组合、路径守卫）
+│   ├── scripts/       抓取、provider 构建、回测、任务入口
+│   ├── configs/       YAML 配置（抓取、门槛、模型、数据集）
+│   ├── mcp/           MCP server
+│   ├── tests/         单元测试与回归测试
+│   └── docs/          研究管线不变量
+├── bin/               PowerShell 启动与手动研究入口
+├── tasks/             Windows 任务计划程序脚本
+└── docs/              运行说明、安全边界、验收说明、重构计划
+```
+
+运行时数据（`quant/data/`、`quant/results/`、`quant/logs/`、`quant/qlib_data/`）和虚拟环境不入库。
+
+## MCP 接口
+
+研究能力以 MCP 工具形式暴露，可接入支持 MCP 的 agent 客户端：
+
+```text
+run_research           提交研究请求（模式 / 资产范围 / 深度 / 代码）
+get_current_snapshot   读取当前已发布快照
+get_rolling_scan       读取滚动初选池
+get_run_status         查询运行状态与阶段耗时
+list_notifications     列出通知
+ack_notification       确认通知
+```
+
+工具只接受固定模式、固定资产范围和六位代码，**没有路径、命令或输出目录参数**——不会执行任意 PowerShell 或任意 Python 文件。MCP 使用独立虚拟环境，协议 JSON 写 stdout，诊断日志写 stderr。
+
+## 门槛与安全边界
+
+发布判据位于 `quant/configs/assistant.yaml` 的 `gate` 段：
+
+| 门槛 | 缺省值 | 含义 |
+|---|---|---|
+| `min_mean_rank_ic` | 0.02 | 平均 RankIC 下限 |
+| `min_rank_ic_ir` | 0.10 | RankIC 信息比下限 |
+| `min_top_bottom_excess_return` | 0.00 | 分组多空超额收益下限 |
+| `max_excess_test_drawdown` | 0.15 | 策略回撤超出基准的容忍度 |
+| `max_ic_std` | 0.02 | 多窗口 IC 标准差上限（稳定性检查启用时生效） |
+
+设计上的几个硬约束：
+
+- **宁缺毋滥**：剔除 ST/*ST/退市整理、上市不满约 60 个交易日的次新、20 日均成交额低于 1000 万元的低流动性标的。
+- **海选原则**：个股目标权重只能由全市场筛选的排名给出；定向单票研究只输出信号与门槛，不产生买入权重。
+- **失败即保留**：失败、超时或校验失败时保留上一份成功快照并写入通知，不会用坏结果覆盖好结果。
+- **门槛只收紧不放宽**：配置内保留了每次门槛调整的理由与实证依据；调整门槛必须同步修改测试。
+
+## 测试
 
 ```powershell
-& 'D:\dsh-gupiao\tasks\register-task.ps1'
+quant\.venv\Scripts\python.exe -m pytest quant\tests -q
 ```
 
-任务先通过 AkShare 交易日历接口判断是否为交易日，并将成功日历原子缓存到 `quant\data\benchmarks\trade_calendar.csv`；在线接口失败时只使用该本地缓存。非交易日跳过；当月最后一个有效交易日运行 `monthly`，其他交易日运行 `daily`。注销：
+测试覆盖数据源降级与熔断、统一字段与复权、provider 构建与二进制契约、模型门槛、标签泄漏检查、单位守卫、组合约束、结果原子发布、通知、MCP 参数校验和路径越界拒绝。
 
-```powershell
-& 'D:\dsh-gupiao\tasks\unregister-task.ps1'
-```
+## 已知局限
 
-## MCP 工具
+- AkShare 接口稳定性受上游影响；抓取侧有降级、熔断和续跑保护，但不保证数据源永远可用。
+- 横截面样本规模决定结论强度。小样本回测只能证明工程链路可通，不足以支撑策略收益结论。
+- 门槛参数基于特定市场阶段调参，换市场或换周期需要重新验证。
+- 场外基金只使用净值研究，不输出盘中成交价和精确股数。
 
-股票 preset 只挂载以下固定工具：
+## 文档
 
-```text
-mcp__stock_research__run_research
-mcp__stock_research__get_current_snapshot
-mcp__stock_research__get_run_status
-mcp__stock_research__list_notifications
-mcp__stock_research__ack_notification
-```
+- [`docs/运行说明.md`](docs/运行说明.md) —— 部署与运行细节
+- [`docs/安全边界.md`](docs/安全边界.md) —— 工具面与写入边界
+- [`docs/数据守卫说明.md`](docs/数据守卫说明.md) —— 数据质量与价格守卫
+- [`quant/docs/研究管线不变量.md`](quant/docs/研究管线不变量.md) —— 修改研究代码前必读的实证不变量与禁忌
+- [`docs/重构计划.md`](docs/重构计划.md) —— 架构演进计划
 
-MCP server 通过 `D:\dsh-gupiao\quant\.venv` 的 Python 启动，stdout 只用于 MCP 协议，日志写 stderr。
+## License
 
-## 结果
-
-每次运行写入：
-
-```text
-D:\dsh-gupiao\quant\results\assistant\runs\YYYY\MM\DD\<run_id>\
-```
-
-目录包含 manifest、数据事实、模型信号、规则门槛、决策支持、配置快照、摘要和日志。只有成功且校验通过的运行才原子更新：
-
-```text
-D:\dsh-gupiao\quant\results\assistant\current.json
-```
-
-失败、超时和校验失败保留上一份成功快照，并写入 DSH 收件箱。
-
-## 研究边界
-
-股票使用 Alpha158 + LightGBM，只有通过 RankIC、RankIC IR、分组超额收益和回撤门槛才会生成个股目标权重。ETF 与场外基金走独立的趋势、收益、波动、回撤、基准相对表现和同类比较路径。组合结果统一执行现金比例、类别敞口、单标的权重和换手限制。
-
-首期只生成百分比目标权重和调仓比例，不连接真实券商、不自动下单。场外基金只使用净值研究，不输出盘中成交价和精确股数。详细说明见 `docs\安全边界.md`。
+[MIT](LICENSE)

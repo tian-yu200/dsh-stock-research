@@ -120,7 +120,7 @@ def show_next_steps(all_passed):
         print("✓ 所有测试通过！")
         print("\n🚀 下一步操作:")
         print("\n1. 运行一次完整研究（测试环境）:")
-        print("   cd D:/dsh-gupiao/quant")
+        print("   cd quant")
         print("   .venv/Scripts/python.exe -c \"from assistant.research import run_research; run_research(mode='on_demand', _force_sync=True)\"")
         
         print("\n2. 检查日志文件:")
