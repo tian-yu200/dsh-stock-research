@@ -101,6 +101,52 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _offline_stability_summary(report_path: Path | str | None = None) -> dict[str, Any]:
+    """只读关联离线稳定性报告到发布快照（诊断用途，永不参与门槛）。
+
+    读取 ``results/assistant/stability_report.json``（独立脚本
+    ``quant/scripts/stability_check.py`` 的产物，不进日常管线），只摘录
+    有界摘要字段。任何异常（缺失/损坏/形态不符）都 fail-open 返回
+    ``{"available": False, ...}``，绝不抛异常、绝不触发额外训练。
+
+    禁忌：返回值不得喂给 ``risk.model_gate_checks`` 或任何发布判据；
+    稳定性检查接入阻断需另行决策（见门槛语义不变量 §6）。
+    """
+    path = Path(report_path) if report_path is not None else (
+        ASSISTANT_RESULTS_DIR / "stability_report.json"
+    )
+    try:
+        # 哨兵 None 区分"缺失/损坏"与"存在但形态不符"（read_json 缺失时回 default）。
+        report = read_json(path, None)
+    except Exception:
+        return {"available": False, "reason": "unreadable report file"}
+    if report is None:
+        return {"available": False, "reason": "unreadable report file"}
+    if not isinstance(report, dict):
+        return {"available": False, "reason": "report is not a mapping"}
+    stability = report.get("stability")
+    if not isinstance(stability, dict):
+        return {"available": False, "reason": "missing stability section"}
+    stable = stability.get("stable")
+    dataset = report.get("dataset")
+    fit_window = None
+    if isinstance(dataset, dict):
+        fit_window = [dataset.get("fit_start_time"), dataset.get("fit_end_time")]
+    return {
+        "available": True,
+        "status": report.get("status"),
+        "segment": report.get("segment"),
+        "stable": stable if isinstance(stable, bool) or stable is None else None,
+        "ic_mean": _number(stability.get("ic_mean")),
+        "ic_std": _number(stability.get("ic_std")),
+        "threshold": _number(stability.get("threshold")),
+        "windows_used": stability.get("windows_used"),
+        "windows_requested": stability.get("windows_requested"),
+        "fit_window": fit_window,
+        "report_path": str(path),
+    }
+
+
 # --- 阶段 1 兼容层（docs/重构计划.md §4 纪律 2）：数据加载与质量函数组已逐字
 # 搬迁至 data_layer.py，此处把原名重新挂回 research 命名空间，旧调用方与测试
 # （含 patch.object(research, ...)）零改动；阶段 1 结束时评估是否移除。
@@ -1126,6 +1172,8 @@ def run_research(
             "retry_count": int(config["fetch"]["retries"]),
             "failure_reasons": failure_reasons,
             "publication": publication,
+            # 只读可观测性：离线 stability 报告摘要（诊断用，不进门槛）。
+            "offline_stability": _offline_stability_summary(),
             "stage_timings": _jsonable(stage_timings),
             "config_snapshot": config_snapshot(config),
         }
@@ -1224,6 +1272,8 @@ def run_research(
             "depth": depth,
             "asset_scope": asset_scope,
             "error": error,
+            # 只读可观测性：离线 stability 报告摘要（诊断用，不进门槛）。
+            "offline_stability": _offline_stability_summary(),
             "stage_timings": _jsonable(stage_timings),
             "config_snapshot": config_snapshot(config),
         }

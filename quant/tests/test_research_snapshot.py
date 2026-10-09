@@ -449,7 +449,7 @@ class ResearchSnapshotTests(unittest.TestCase):
                 "asset_scope", "asset_types", "analyzed_types",
                 "requested_symbols", "data_sources", "data_end_date",
                 "retry_count", "failure_reasons", "publication", "config_snapshot",
-                "paths", "stage_timings",
+                "paths", "stage_timings", "offline_stability",
             },
         )
         self.assertEqual(manifest["status"], "success")

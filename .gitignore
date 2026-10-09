@@ -24,6 +24,11 @@ quant/tests/*-????????/
 .dsh/
 .analysis-session/
 
+# 推送凭据（ServerChan 等推送服务的 key，禁止入库）
+# 只忽略密钥本体，保留同名目录下的脚本/模板可正常入库。
+notify/*.key
+*.key
+
 # 会话导出与压缩包
 codex-conversation-export-*
 *.zip
@@ -34,3 +39,4 @@ Thumbs.db
 
 # Hermes 编排上下文（本地脚手架，不属于项目代码）
 .hermes.md
+BOSS.md

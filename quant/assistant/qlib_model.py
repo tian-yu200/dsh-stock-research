@@ -936,6 +936,9 @@ def _run_qlib_stock_model(
                 fit_end_time=dataset_config["fit_end_time"],
                 label_horizon=label_horizon,
                 segments=segments,
+                # A 股可成交性判定需要开盘价：涨跌停/停牌时无法按收盘价成交，
+                # 只用 close 会系统性高估收益（见 `_tradable_mask`）。
+                backtest_fields={"$open": "BACKTEST_OPEN", "$close": "BACKTEST_CLOSE"},
             )
             _report_progress(progress_callback, "lightgbm_train")
             model = train_lgbm(dataset, config["model"])

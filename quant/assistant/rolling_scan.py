@@ -210,7 +210,7 @@ def _read_state(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
             # 重算 totals 排除跨境分母：重查全量 assets 并按 name 过滤（fail-open）
             try:
                 import sqlite3 as _sql
-                uri2 = f"{research.DATA_DIR / "fetch_state.sqlite3"}"
+                uri2 = f"{research.DATA_DIR / 'fetch_state.sqlite3'}"
                 # 使用之前的 path 参数对应的 fetch_state 路径
                 fetch_path = path if "fetch_state" in str(path) else (research.DATA_DIR / "fetch_state.sqlite3")
                 # rolling _read_state的path是fetch_state.sqlite3
