@@ -266,8 +266,13 @@ def merge_daily_frames(
     if not existing.empty:
         try:
             from price_guards import detect_basis_seam as _bs_detect
+            _existing_norm = normalize_daily_bars(existing, source=source)
+            _existing_dates = set(_existing_norm["date"].astype(str))
+            # 只把「新行」交给 seam 探测器（历史内部断裂不发射）。
+            _new_mask = ~result["date"].astype(str).isin(_existing_dates)
+            _new_rows = result.loc[_new_mask].reset_index(drop=True)
             _bs_raise, _bs_hold, _bs_reasons = _bs_detect(
-                normalize_daily_bars(existing, source=source), result,
+                _existing_norm, _new_rows,
                 source=source, symbol=existing_path.stem,
             )
             if bool(_bs_raise.any()):
@@ -279,9 +284,9 @@ def merge_daily_frames(
                 )
             if bool(_bs_hold.any()):
                 # 未确认的尾部 seam 行：不写该行及之后任何行（不删、不制造缺口），
-                # 下轮合并重新判定。
+                # 下轮合并重新判定。只对「新行」生效，不动既有历史。
                 _hold_pos = int(_bs_hold.values.argmax())
-                _hold_dates = set(result["date"].astype(str).iloc[_hold_pos:])
+                _hold_dates = set(_new_rows["date"].astype(str).iloc[_hold_pos:])
                 result = result.loc[~result["date"].astype(str).isin(_hold_dates)].reset_index(drop=True)
         except BaselineDiscontinuityError:
             raise

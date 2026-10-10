@@ -493,6 +493,7 @@ class PriceGuardsTests(unittest.TestCase):
             back = pd.read_csv(path)
             self.assertEqual(len(back), 1)
     def test_merge_hook_drops_corrupt_rows(self):
+        # T1（Q6）：尾部未确认的坏价行不再删除/隔离，而是「保留不写」（下轮重判）。
         from fetch_utils import merge_daily_frames
         from price_guards import validate_daily_bars
         frame, _ = self._clean_frame(n=40)
@@ -503,9 +504,10 @@ class PriceGuardsTests(unittest.TestCase):
             incoming.at[incoming.index[-1], "open"] = 39.29
             incoming.at[incoming.index[-1], "close"] = 39.10
             merged = merge_daily_frames(target, incoming, source="unit TEST01")
+            # 坏行被保留（不写），但 OHLC 未被删改
             self.assertNotIn(39.10, list(merged["close"]))
-            qpath = pathlib.Path(directory) / "quarantine" / "TEST01.quarantine.csv"
-            self.assertTrue(qpath.exists())
+            # 不删行、不隔离：尾行只是不写入，原 CSV 不被污染
+            self.assertGreaterEqual(len(merged), 39)
 
     def test_stock_write_success_handles_guarded_date_strings(self):
         from fetch_stock_data import _write_success
