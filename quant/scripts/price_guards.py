@@ -27,7 +27,7 @@ BASIS_SEAM_LIMIT_BJ = 0.295
 
 
 def basis_seam_limit(symbol=""):
-    """Return the board daily price limit for ``symbol`` (decimal)."""
+    """Return the board daily price limit for ``symbol`` as a SIMPLE return."""
     name = str(symbol).strip().upper()
     bare = name[2:] if name[:2] in {"SH", "SZ", "BJ"} else name
     if name.startswith("BJ") or bare.startswith(("92", "43", "83", "87", "4")):
@@ -35,6 +35,16 @@ def basis_seam_limit(symbol=""):
     if bare.startswith(("300", "301", "688", "689")):
         return BASIS_SEAM_LIMIT_GROWTH
     return BASIS_SEAM_LIMIT_MAIN
+
+
+def basis_seam_limit_step(symbol=""):
+    """Board limit on the same |log2| scale as ``close_step`` (T1).
+
+    ``close_step`` is |log2(close_i / close_{i-1})|, while the board limit is a
+    simple return. A real +10% limit day is log2(1.10) = 0.1375, so comparing
+    raw 0.095 would flag every genuine limit move. Convert like with like.
+    """
+    return math.log2(1.0 + basis_seam_limit(symbol))
 THS_TIMEOUT_SECONDS = 20
 THS_CONFLICT_THRESHOLD = 0.20
 THS_LOOKBACK_DAYS = 5
@@ -650,7 +660,7 @@ def detect_basis_seam(existing, incoming, *, source="", symbol=""):
         if pair is None:
             continue
         close_step, vwap_step, fix = pair
-        if close_step <= basis_seam_limit(symbol):
+        if close_step <= basis_seam_limit_step(symbol):
             continue
         if vwap_step > BASIS_SEAM_VWAP_FLAT_TOL:
             continue

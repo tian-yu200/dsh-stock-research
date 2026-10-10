@@ -272,6 +272,37 @@ class UnitGuardTests(unittest.TestCase):
                 self.assertFalse(bool((gaps > 10).any()))
                 prev_len = len(result)
 
+    def test_seam_limit_is_log2_scale(self):
+        # 修正：close_step 是 |log2|，板块限幅必须换算到同一尺度。
+        # 真 +10% 涨板 log2(1.10)=0.1375 不得被当成「超过板限」。
+        from price_guards import basis_seam_limit, basis_seam_limit_step
+        self.assertAlmostEqual(basis_seam_limit("000001"), 0.095, places=4)
+        self.assertAlmostEqual(basis_seam_limit_step("000001"),
+                               __import__("math").log2(1.095), places=4)
+        self.assertGreater(basis_seam_limit_step("300212"),
+                           basis_seam_limit_step("000001"))
+        self.assertGreater(basis_seam_limit_step("920779"),
+                           basis_seam_limit_step("300212"))
+
+    def test_seam_limit_move_written_not_held(self):
+        # 真涨停（close +10%，VWAP 同步 +10%）不是候选，不得 hold/raise。
+        df = pd.read_csv(FIXTURES / "erosion_regression.csv")
+        df["date"] = pd.to_datetime(df["date"])
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = pathlib.Path(tmp) / "LIMITUP.csv"
+            hist = normalize_daily_bars(df, source="t")
+            hist.to_csv(csv_path, index=False)
+            last = hist.iloc[-1].copy()
+            up = last.copy()
+            up["date"] = pd.Timestamp("2026-09-04")
+            up["open"] = up["high"] = up["low"] = up["close"] = float(last["close"]) * 1.10
+            up["volume"] = float(last["volume"])
+            up["amount"] = float(last["amount"]) * 1.10  # VWAP 同步
+            up["turnover"] = float(last["turnover"])
+            incoming = normalize_daily_bars(pd.DataFrame([up]), source="t")
+            result = merge_daily_frames(csv_path, incoming, source="t")
+            self.assertIn("2026-09-04", set(result["date"].astype(str)))
+
 
 if __name__ == "__main__":
     unittest.main()
