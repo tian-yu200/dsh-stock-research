@@ -4,6 +4,7 @@ Catches cases like 603826 2026-08-28 before bad rows reach CSV caches.
 """
 from __future__ import annotations
 import json
+import math
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,12 @@ from statistics import median
 import pandas as pd
 IMPLIED_DEVIATION_THRESHOLD = 0.25
 OVERNIGHT_GAP_THRESHOLD = 0.30
+# 拼接基准探测（2026-10-10 T1）：只看 merge seam，用「复权收盘台阶 + 原始 VWAP 连续」
+# 判别基准/口径切换。BASIS_SEAM_STEP 由全市场 seam 扫描选定（见不变量 §3）。
+BASIS_SEAM_STEP = 0.25
+BASIS_SEAM_PERSIST_TOL = 0.05
+BASIS_SEAM_MIN_HISTORY = 20
+BASIS_SEAM_BASELINE_ROWS = 60
 THS_TIMEOUT_SECONDS = 20
 THS_CONFLICT_THRESHOLD = 0.20
 THS_LOOKBACK_DAYS = 5
@@ -550,3 +557,219 @@ def detect_unit_breaks(frame, *, source="", symbol=""):
     except Exception:
         return pd.Series(False, index=frame.index), []
     return flags, reasons
+
+
+# --- 拼接基准探测（2026-10-10 T1）---
+# 背景：000875 断点两侧复权基准差 1.448×、volume 单位股→手，close 台阶 +45% 而
+# 原始 VWAP（amount/volume）连续；`assert_basis_continuity` 的 1.5 阈值放过，
+# 单位守卫只标断点首行 → 每次合并吃掉一天（数据侵蚀）。
+# 语义（只判 seam，见不变量 §3）：
+#   * 只对「不在既有 CSV 日期集合内」的新行（seam 行）判定；历史内部断裂不管
+#     （T2 负责存量数据），全量重取后无 seam 自然放行。
+#   * 判别器用价格连续性而非 exdiv 启发式：基准切换 = 复权收盘台阶超阈 + 单位
+#     修正后的原始 VWAP 连续；真除权相反（收盘连续、原始 VWAP 台阶）。
+#   * 持久性 >=2 行：新收盘水平须延续到下一行，否则视为未确认（hold-back）。
+
+def _seam_vwap(row):
+    try:
+        a = float(row.get("amount"))
+        v = float(row.get("volume"))
+    except (TypeError, ValueError):
+        return None
+    if not (a and v and a > 0 and v > 0):
+        return None
+    return a / v
+
+
+def _seam_pair(prev, cur):
+    """返回 (close_step, vwap_step, unit_fix) 或 None。"""
+    try:
+        cp = float(prev.get("close"))
+        cc = float(cur.get("close"))
+    except (TypeError, ValueError):
+        return None
+    if not (cp and cc and cp > 0 and cc > 0):
+        return None
+    close_step = abs(math.log2(cc / cp))
+    vp = _seam_vwap(prev)
+    vc = _seam_vwap(cur)
+    vwap_step = float("inf")
+    fix = 1.0
+    for candidate in (1.0, 100.0, 0.01):
+        if vp and vc and vp > 0 and vc * candidate > 0:
+            step = abs(math.log2((vc * candidate) / vp))
+            if step < vwap_step:
+                vwap_step = step
+                fix = candidate
+    return close_step, vwap_step, fix
+
+
+def detect_basis_seam(existing, incoming, *, source="", symbol=""):
+    """检查 merge seam 的基准连续性（T1）。
+
+    ``existing``/``incoming`` 为已规范化的日线帧（date/close/amount/volume）。
+    只判定 incoming 行，与紧邻的前一行比较。判别器：复权收盘出现台阶
+    （``|log2(close_i/close_{i-1})| > BASIS_SEAM_STEP``）而按单位修正后的原始
+    VWAP（amount/volume）保持连续（``vwap_step <= BASIS_SEAM_STEP``）→ 基准/
+    口径切换；真除权/真涨跌停时 VWAP 与 close 同步移动，不发射。
+    返回 ``(raise_mask, hold_mask, reasons)``，均与 incoming 对齐：
+    - ``raise_mask``：已确认的台阶首行（新收盘水平延续到下一行，或本行有下一
+      个 incoming 行佐证），调用方应抛 ``BaselineDiscontinuityError`` 拒写；
+    - ``hold_mask``：未能确认的尾部 seam 行（无下一行佐证），应保留不写、下轮
+      重新判定——既不删行也不制造缺口。
+    """
+    empty = pd.Series(False, index=incoming.index if incoming is not None else [])
+    if existing is None or incoming is None or incoming.empty             or len(existing) < BASIS_SEAM_MIN_HISTORY:
+        return empty, empty.copy(), []
+    prev = existing.tail(BASIS_SEAM_BASELINE_ROWS).iloc[-1]
+    steps = []
+    for idx, cur in incoming.iterrows():
+        steps.append((idx, cur, _seam_pair(prev, cur)))
+        prev = cur
+    raise_mask = pd.Series(False, index=incoming.index)
+    hold_mask = pd.Series(False, index=incoming.index)
+    reasons = []
+    for pos, (idx, cur, pair) in enumerate(steps):
+        if pair is None:
+            continue
+        close_step, vwap_step, fix = pair
+        if close_step <= BASIS_SEAM_STEP:
+            continue
+        if vwap_step > BASIS_SEAM_STEP:
+            continue
+        nxt = steps[pos + 1][1] if pos + 1 < len(steps) else None
+        if nxt is None:
+            hold_mask.iloc[pos] = True
+            reasons.append({"date": str(cur.get("date"))[:10], "symbol": symbol,
+                            "source": source, "close_step": round(close_step, 4),
+                            "vwap_step": round(vwap_step, 4), "unit_fix": fix,
+                            "confirmed": False})
+            continue
+        try:
+            nxt_close = float(nxt.get("close"))
+            cur_close = float(cur.get("close"))
+            persists = nxt_close > 0 and cur_close > 0 and                 abs(math.log2(nxt_close / cur_close)) <= BASIS_SEAM_PERSIST_TOL
+        except (TypeError, ValueError):
+            persists = False
+        if not persists:
+            continue
+        raise_mask.iloc[pos] = True
+        reasons.append({"date": str(cur.get("date"))[:10], "symbol": symbol,
+                        "source": source, "close_step": round(close_step, 4),
+                        "vwap_step": round(vwap_step, 4), "unit_fix": fix,
+                        "confirmed": True})
+    return raise_mask, hold_mask, reasons
+
+
+
+def _unit_fix_for_row(volume, amount, low, high):
+    """Return the exact x100 / /100 unit fix that lands VWAP in [low, high].
+
+    Only exact unit hypotheses are tried; a wrong guess (e.g. 300212's ~9x
+    anomaly) returns ``None`` so the caller sets the field to NaN instead of
+    inventing a price.
+    """
+    for fix in (100.0, 0.01):
+        v = volume * fix
+        if v > 0 and amount > 0 and low > 0 and high > 0:
+            vwap = amount / v
+            if low * 0.98 <= vwap <= high * 1.02:
+                return fix
+    return None
+
+
+def triage_price_flags(frame, flags, *, tol=0.05):
+    """分诊价格守卫标记行（T1），返回与 ``frame.index`` 对齐的
+    ``(raise_mask, delete_mask, hold_mask)``。
+
+    - ``raise``：新水平延续的段级断裂（相邻标记行相互印证，或本行与前一标记行
+      同一水平）→ 调用方抛 ``BaselineDiscontinuityError`` 拒写；
+    - ``delete``：**唯一**仍允许删行的情形——内部孤立单行毒值，其前后两个
+      邻居彼此一致（该行才是尖刺）→ 隔离并删除；
+    - ``hold``：无法确认的尾部标记行（后面没有行可比）→ 不写该行及之后的
+      任何行，下轮合并重判——既不删行也不制造缺口。
+    """
+    raise_mask = pd.Series(False, index=frame.index)
+    delete_mask = pd.Series(False, index=frame.index)
+    hold_mask = pd.Series(False, index=frame.index)
+    if frame is None or len(frame) == 0:
+        return raise_mask, delete_mask, hold_mask
+    close = pd.to_numeric(frame.get("close"), errors="coerce").tolist()
+    idx = list(frame.index)
+    f = pd.Series(flags, index=frame.index).fillna(False).astype(bool).tolist()
+
+    def _agree(a, b):
+        try:
+            return bool(a and b and a > 0 and b > 0 and abs(math.log2(a / b)) <= tol)
+        except Exception:
+            return False
+
+    n = len(idx)
+    for pos, _ in enumerate(idx):
+        if not f[pos]:
+            continue
+        prev_c = close[pos - 1] if pos - 1 >= 0 else None
+        cur_c = close[pos]
+        nxt_c = close[pos + 1] if pos + 1 < n else None
+        prev_f = f[pos - 1] if pos - 1 >= 0 else False
+        nxt_f = f[pos + 1] if pos + 1 < n else False
+        if nxt_c is None:
+            if prev_f and _agree(prev_c, cur_c):
+                raise_mask.iloc[pos] = True
+            else:
+                hold_mask.iloc[pos] = True
+            continue
+        if not prev_f and not nxt_f and _agree(prev_c, nxt_c):
+            delete_mask.iloc[pos] = True
+            continue
+        raise_mask.iloc[pos] = True
+    return raise_mask, delete_mask, hold_mask
+
+
+def repair_unit_breaks(frame, flags, *, source="", symbol=""):
+    """Repair unit-flagged rows in place instead of deleting them (T1).
+
+    The OHLC of every row is preserved so the guard never manufactures a trading
+    gap. ``volume`` is corrected only for an exact x100 / /100 hypothesis whose
+    resulting VWAP ``amount / volume`` falls inside the row's ``[low, high]``;
+    otherwise it is set to NaN. ``turnover`` is set to NaN when it is
+    inconsistent with the trailing ``volume / turnover`` ratio (or when volume
+    itself became NaN). A copy is returned; the input is not mutated.
+    """
+    out = frame.copy()
+    if flags is None or not bool(getattr(flags, "any", lambda: False)()):
+        return out
+    vol = pd.to_numeric(out.get("volume"), errors="coerce")
+    amt = pd.to_numeric(out.get("amount"), errors="coerce")
+    low = pd.to_numeric(out.get("low"), errors="coerce")
+    high = pd.to_numeric(out.get("high"), errors="coerce")
+    tov = pd.to_numeric(out.get("turnover"), errors="coerce")
+    # 尾随 v/t 比值（未标记行的中位数），用于 turnover 一致性判定。
+    good = vol.gt(0) & tov.gt(0) & (~flags)
+    trail = (vol / tov.where(tov.gt(0)))[good].tail(20)
+    trail_med = float(trail.median()) if len(trail) else None
+    for idx in out.index[flags]:
+        try:
+            v = float(vol.loc[idx])
+            a = float(amt.loc[idx])
+            lo = float(low.loc[idx])
+            hi = float(high.loc[idx])
+        except (TypeError, ValueError):
+            out.at[idx, "volume"] = float("nan")
+            continue
+        if not (v > 0 and a > 0 and lo > 0 and hi > 0):
+            out.at[idx, "volume"] = float("nan")
+        else:
+            fix = _unit_fix_for_row(v, a, lo, hi)
+            out.at[idx, "volume"] = (v * fix) if fix is not None else float("nan")
+        t = tov.loc[idx]
+        new_v = out.at[idx, "volume"]
+        if not (pd.notna(t) and t > 0 and pd.notna(new_v) and new_v > 0) or trail_med is None:
+            if not (pd.notna(t) and t > 0):
+                continue
+            out.at[idx, "turnover"] = float("nan")
+            continue
+        ratio = new_v / t
+        if not (trail_med / 5.0 <= ratio <= trail_med * 5.0):
+            out.at[idx, "turnover"] = float("nan")
+    return out

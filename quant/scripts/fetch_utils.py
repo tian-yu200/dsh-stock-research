@@ -259,28 +259,74 @@ def merge_daily_frames(
             raise
         except Exception as _guard_exc:
             print("  [" + existing_path.stem + "] 基准连续性守卫跳过: " + type(_guard_exc).__name__)
+    # ---- T1 基准 seam 探测（只判 incoming 行 vs 紧邻历史）----
+    # 复权收盘出现台阶而单位修正后的原始 VWAP 连续 → 基准/口径切换，拒写
+    # （走 worker 的 .discont.bak 全量重取路径）。只看 seam，历史内部的断裂
+    # 一律不发射，避免每轮合并都重取同一段历史。
+    if not existing.empty:
+        try:
+            from price_guards import detect_basis_seam as _bs_detect
+            _bs_raise, _bs_hold, _bs_reasons = _bs_detect(
+                normalize_daily_bars(existing, source=source), result,
+                source=source, symbol=existing_path.stem,
+            )
+            if bool(_bs_raise.any()):
+                _r = _bs_reasons[0] if _bs_reasons else {}
+                raise BaselineDiscontinuityError(
+                    f"{source} {existing_path.stem}",
+                    f"拼接 seam 基准台阶 close_step={_r.get('close_step')} "
+                    f"vwap_step={_r.get('vwap_step')} ({_r.get('date')})，疑似口径切换",
+                )
+            if bool(_bs_hold.any()):
+                # 未确认的尾部 seam 行：不写该行及之后任何行（不删、不制造缺口），
+                # 下轮合并重新判定。
+                _hold_pos = int(_bs_hold.values.argmax())
+                _hold_dates = set(result["date"].astype(str).iloc[_hold_pos:])
+                result = result.loc[~result["date"].astype(str).isin(_hold_dates)].reset_index(drop=True)
+        except BaselineDiscontinuityError:
+            raise
+        except Exception as _bs_exc:
+            print("  [" + existing_path.stem + "] 基准 seam 守卫跳过: " + type(_bs_exc).__name__)
+    # ---- 价格守卫：分诊（删行仅在内部孤立尖刺时保留）----
     try:
         from price_guards import validate_daily_bars as _pg_validate
         from price_guards import write_quarantine as _pg_quarantine
+        from price_guards import triage_price_flags as _pg_triage
         _pg_clean, _pg_bad, _pg_reasons = _pg_validate(result, source=source, symbol=existing_path.stem)
         if len(_pg_bad) > 0:
-            _pg_qpath = _pg_quarantine(existing_path.parent, existing_path.stem, _pg_bad, _pg_reasons)
-            print("  [" + existing_path.stem + "] 价格守卫隔离 " + str(len(_pg_bad)) + " 行 -> " + str(_pg_qpath))
-            result = _pg_clean
+            _flag_mask = result["date"].isin(_pg_bad["date"])
+            _raise_m, _delete_m, _hold_m = _pg_triage(result, _flag_mask)
+            if bool(_raise_m.any()):
+                _bad_dates = result.loc[_raise_m, "date"].astype(str).tolist()
+                raise BaselineDiscontinuityError(
+                    f"{source} {existing_path.stem}",
+                    f"价格守卫确认段级断裂（{len(_bad_dates)} 行，{_bad_dates[:3]}），拒写并要求全量重取",
+                )
+            if bool(_hold_m.any()):
+                _hpos = int(_hold_m.values.argmax())
+                _hdates = set(result["date"].astype(str).iloc[_hpos:])
+                result = result.loc[~result["date"].astype(str).isin(_hdates)].reset_index(drop=True)
+            if bool(_delete_m.any()):
+                _del = result.loc[_delete_m].reset_index(drop=True)
+                _d_reasons = [r for r in _pg_reasons if str(r.get("date")) in set(_del["date"].astype(str))]
+                _qpath = _pg_quarantine(existing_path.parent, existing_path.stem, _del, _d_reasons)
+                print("  [" + existing_path.stem + "] 价格守卫隔离内部尖刺 " + str(len(_del)) + " 行 -> " + str(_qpath))
+                result = result.loc[~_delete_m].reset_index(drop=True)
+    except BaselineDiscontinuityError:
+        raise
     except Exception as _pg_exc:
         print("  [" + existing_path.stem + "] 价格守卫跳过: " + type(_pg_exc).__name__)
+    # ---- 单位守卫：修复字段而非删行 ----
     try:
-        # 单位守卫（UNIT_CONTRACT，见 market_data）：volume/turnover 日环比跳变
-        # （close 不动的纯单位切换也能独立发射）。隔离机制与价格守卫相同
-        # （quarantine + 原因记录）；价格守卫既有语义不受影响。
         from price_guards import detect_unit_breaks as _ug_detect
+        from price_guards import repair_unit_breaks as _ug_repair
         from price_guards import write_quarantine as _ug_quarantine
         _ug_flags, _ug_reasons = _ug_detect(result, source=source, symbol=existing_path.stem)
         if bool(_ug_flags.any()):
             _ug_bad = result.loc[_ug_flags].reset_index(drop=True)
             _ug_qpath = _ug_quarantine(existing_path.parent, existing_path.stem, _ug_bad, _ug_reasons)
-            print("  [" + existing_path.stem + "] 单位守卫隔离 " + str(len(_ug_bad)) + " 行 -> " + str(_ug_qpath))
-            result = result.loc[~_ug_flags].reset_index(drop=True)
+            print("  [" + existing_path.stem + "] 单位守卫修正 " + str(len(_ug_bad)) + " 行（保留不删）-> " + str(_ug_qpath))
+            result = _ug_repair(result, _ug_flags, source=source, symbol=existing_path.stem)
     except Exception as _ug_exc:
         print("  [" + existing_path.stem + "] 单位守卫跳过: " + type(_ug_exc).__name__)
     for key, value in incoming.attrs.items():
