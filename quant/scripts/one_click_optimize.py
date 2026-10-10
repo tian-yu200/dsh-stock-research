@@ -91,7 +91,7 @@ def main():
     print(f"  1. 手动测试熊市配置")
     print(f"  2. 集成低换手率策略")
     print(f"  3. 监控IC 7天")
-    print("\n详细执行步骤见仓库根目录的 短期优化执行计划.md")
+    print("\n详细执行步骤见 docs/reports/短期优化执行计划.md")
 
 
 if __name__ == "__main__":

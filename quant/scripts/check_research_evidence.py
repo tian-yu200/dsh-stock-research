@@ -1,4 +1,4 @@
-"""复现《量化系统评估报告-20260911.md》的全部运行台账证据（只读）。
+"""复现 docs/reports/量化系统评估报告-20260911.md 的全部运行台账证据（只读）。
 
 用法（在仓库根目录）：
     quant/.venv/Scripts/python.exe quant/scripts/check_research_evidence.py
@@ -167,7 +167,7 @@ def check_gate_config() -> None:
 
 def main() -> int:
     print()
-    print("复核《量化系统评估报告-20260911.md》运行台账证据（只读）")
+    print("复核 docs/reports/量化系统评估报告-20260911.md 运行台账证据（只读）")
     print(f"仓库根：{REPO}")
     print()
     check_files()

@@ -17,6 +17,13 @@ This rule exists because prior sessions repeatedly combined 47-60 KB tool result
 
 ## Sandbox Limits (read before running anything)
 
+> **Scope (2026-10-10)**: this section applies **only to the retired Codex
+> sandbox** — Codex was retired 2026-09-19 (see `BOSS.md`). It is *not* a
+> property of this repository or of the current agents. `pi` and `opencode` run
+> the project interpreter `quant\.venv\Scripts\python.exe` directly (verified
+> 2026-10-10). Everything below is kept as historical record of the Codex
+> limitation.
+
 Codex runs in a restricted Windows sandbox (account `codexsandboxoffline`, not
 elevated) and cannot use the Windows Store Python that this project's venv is
 built on. Concretely:

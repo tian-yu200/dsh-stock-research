@@ -881,7 +881,7 @@ def run_research(
                 # |score| 阈值过滤。而回测路径（qlib_model.py）并不经过该策略，
                 # 造成实盘选股口径与回测不一致。此处恢复"按得分取 top-k"的文档化契约。
                 # 低换手/持仓惯性若要真正生效，必须持久化持仓与成本价状态，并同时
-                # 接入回测（见《量化系统评估报告-20260911》P1-8）。
+                # 接入回测（见 docs/reports/量化系统评估报告-20260911.md 的 P1-8）。
                 ranked = eligible_signals[: int(config["research"]["stock_topk"])]
 
                 min_score = float(config["research"].get("min_qlib_score_for_weights", 0.0))
