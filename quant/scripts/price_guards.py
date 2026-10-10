@@ -219,16 +219,37 @@ def write_quarantine(data_dir, symbol, bad, reasons):
     if bad is None or len(bad) == 0:
         return None
     out = bad.copy()
+    # 日期统一 YYYY-MM-DD（去掉 00:00:00 时间戳），并去重（保留最后一行）。
+    if "date" in out.columns:
+        out["date"] = out["date"].map(_quarantine_date_str)
     out["quarantine_reasons"] = [",".join(r["reasons"]) for r in reasons]
     path = quarantine_path(data_dir, symbol)
     if path.exists():
         try:
             old = pd.read_csv(path)
-            out = pd.concat([old, out], ignore_index=True).drop_duplicates(subset=["date"], keep="last")
+            if "date" in old.columns:
+                old["date"] = old["date"].map(_quarantine_date_str)
+            out = pd.concat([old, out], ignore_index=True)
         except Exception:
             pass
+    if "date" in out.columns:
+        out = out.drop_duplicates(subset=["date"], keep="last")
     out.to_csv(path, index=False, encoding="utf-8-sig")
     return path
+
+
+def _quarantine_date_str(value):
+    """Normalise a quarantine date cell to ``YYYY-MM-DD`` (T1)."""
+    if value is None or (isinstance(value, float) and value != value):
+        return value
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat"}:
+        return value
+    try:
+        return pd.Timestamp(text).strftime("%Y-%m-%d")
+    except Exception:
+        return text[:10] if len(text) >= 10 else text
+
 def fetch_ths_daily(symbol, *, timeout=THS_TIMEOUT_SECONDS):
     mk = "bj_" if str(symbol)[:1] in ("4", "8") else "hs_"
     url = "http://d.10jqka.com.cn/v2/line/" + mk + str(symbol) + "/01/last.js"
