@@ -24,8 +24,11 @@ import run_research_worker as worker
 # Fixture data must stay inside the rolling scan's staleness window
 # (stale_after_days), otherwise every symbol is rejected as 数据过期 and the
 # pool never leaves "accumulating". A fixed calendar date goes stale on its
-# own, so derive it from today instead.
-END_DATE = (pd.Timestamp.today().normalize() - pd.Timedelta(1, "D")).strftime("%Y-%m-%d")
+# own, so derive it from today instead. Use the previous *business* day so the
+# date is always a trading day: on Sundays/Mondays today-1 is a non-trading
+# day, while the CSVs come from pd.bdate_range and end on the prior Friday, so
+# data_end_date (Saturday/Sunday) would never match the CSV fingerprint.
+END_DATE = (pd.Timestamp.today().normalize() - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
 
 
 def _trading_days_before(end_date: str, days: int) -> str:
