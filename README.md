@@ -135,6 +135,15 @@ quant\.venv\Scripts\python.exe -m pytest quant\tests -q
 
 测试覆盖数据源降级与熔断、统一字段与复权、provider 构建与二进制契约、模型门槛、标签泄漏检查、单位守卫、组合约束、结果原子发布、通知、MCP 参数校验和路径越界拒绝。
 
+### 提交前测试门禁（可选）
+
+```powershell
+pip install pre-commit
+pre-commit install
+```
+
+安装后每次 `git commit` 会自动运行 `quant/docs/研究管线不变量.md` §8 的聚焦测试集（9 个文件，约 1 分钟），全绿才允许提交。hook 以相对路径调用主检出的 `quant\.venv\Scripts\python.exe`，并依赖主检出的 `quant\data`；在这两者缺失的 worktree 中会失败，属预期。手动全量执行：`pre-commit run --all-files`。
+
 ## 已知局限
 
 - AkShare 接口稳定性受上游影响；抓取侧有降级、熔断和续跑保护，但不保证数据源永远可用。
