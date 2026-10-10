@@ -16,11 +16,12 @@ import pandas as pd
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fetch_utils import merge_daily_frames
+from fetch_utils import BaselineDiscontinuityError, merge_daily_frames
 from market_data import UNIT_CONTRACT, normalize_daily_bars
 from price_guards import UNIT_BIG_HI, UNIT_JUMP_HI, UNIT_JUMP_LO, detect_unit_breaks
 
 COLS = ["date", "open", "high", "low", "close", "volume", "amount", "turnover"]
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "unit_guard"
 
 
 def bars(start, n, price, vol, to, vol_walk=None):
@@ -150,12 +151,10 @@ class UnitGuardTests(unittest.TestCase):
         self.assertEqual(reasons[0]["reasons"], ["unit_down_x100"])
 
     def test_real_000875_gap_row_flagged(self):
-        path = ROOT / "data" / "stocks" / "000875.csv"
-        if not path.exists():
-            self.skipTest("000875.csv not present")
-        df = pd.read_csv(path)
+        # T1：不再读生产目录，改读夹具（真实行切片，隔离区是唯一原始存档）。
+        df = pd.read_csv(FIXTURES / "000875_shape.csv")
         _, reasons = detect_unit_breaks(df, source="t", symbol="000875")
-        self.assertIn("2026-09-14", [r["date"] for r in reasons])
+        self.assertIn("2026-09-04", [r["date"] for r in reasons])
 
     def test_real_920427_exempt(self):
         path = ROOT / "data" / "stocks" / "920427.csv"
@@ -174,10 +173,8 @@ class UnitGuardTests(unittest.TestCase):
         self.assertNotIn("2021-05-27", [r["date"] for r in reasons])
 
     def test_real_300212_caught(self):
-        path = ROOT / "data" / "stocks" / "300212.csv"
-        if not path.exists():
-            self.skipTest("300212.csv not present")
-        df = pd.read_csv(path)
+        # T1：改读夹具（单行字段异常，真实行切片）。
+        df = pd.read_csv(FIXTURES / "300212_shape.csv")
         flags, reasons = detect_unit_breaks(df, source="t", symbol="300212")
         dates = [r["date"] for r in reasons]
         self.assertIn("2024-09-27", dates)
@@ -191,6 +188,8 @@ class UnitGuardTests(unittest.TestCase):
         self.assertEqual(int(flags.sum()), 0)
 
     def test_merge_hook_quarantines_unit_break(self):
+        # T1：单位守卫不再删行。标记行保留在 CSV 中，字段被修正（volume x100
+        # 落回 [low, high]）或置 NaN，且写入隔离区留档。
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
             hist = bars("2026-08-01", 20, 10.0, 100000.0, 2.0)
@@ -202,12 +201,76 @@ class UnitGuardTests(unittest.TestCase):
                 columns=COLS)
             result = merge_daily_frames(csv_path, normalize_daily_bars(incoming, source="t"),
                                         source="t")
-            self.assertNotIn("2026-08-30", set(result["date"].astype(str)))
-            self.assertIn("2026-08-29", set(result["date"].astype(str)))
+            dates = set(result["date"].astype(str))
+            self.assertIn("2026-08-30", dates)  # 不再删行
+            self.assertIn("2026-08-29", dates)
+            row = result.loc[result["date"].astype(str) == "2026-08-30"].iloc[0]
+            # 精确 /100 修正后 VWAP=amount/volume=10 落在 [10,10] 内 → volume=1e5
+            self.assertEqual(float(row["volume"]), 100000.0)
+            # turnover 与尾随 v/t 比值不一致 → 置 NaN（不发明）
+            self.assertTrue(pd.isna(row["turnover"]))
+            self.assertEqual(float(row["close"]), 10.0)
             qpath = tmp_path / "quarantine" / "T00001.quarantine.csv"
             self.assertTrue(qpath.exists())
             quar = pd.read_csv(qpath)
             self.assertTrue(quar["quarantine_reasons"].str.contains("unit_up_x10000").any())
+
+    def test_real_000875_shape_raises_no_rows_deleted(self):
+        # 000875 形态：历史段（股，系数约 1.0）+ 12 交易日缺口 + 尾段（手，系数约 1.448）。
+        # 断言合并时抛 BaselineDiscontinuityError，且没有任何行被删。
+        df = pd.read_csv(FIXTURES / "000875_shape.csv")
+        df["date"] = pd.to_datetime(df["date"])
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = pathlib.Path(tmp) / "000875.csv"
+            hist = normalize_daily_bars(df[df["date"] < "2026-09-04"], source="t")
+            hist.to_csv(csv_path, index=False)
+            incoming = normalize_daily_bars(df[df["date"] >= "2026-09-04"], source="t")
+            with self.assertRaises(BaselineDiscontinuityError):
+                merge_daily_frames(csv_path, incoming, source="t")
+            # 原 CSV 未被改写（拒绝写入而非删行）。
+            back = pd.read_csv(csv_path)
+            self.assertEqual(len(back), len(hist))
+            self.assertEqual(set(back["date"].astype(str)),
+                             set(hist["date"].dt.strftime("%Y-%m-%d")))
+
+    def test_real_300212_shape_row_kept_field_repaired(self):
+        # 300212 形态：单行 volume 单位异常（~9x，非精确 x100）。
+        # 断言该行保留，字段被修正或置为 NaN（不发明价格）。
+        df = pd.read_csv(FIXTURES / "300212_shape.csv")
+        df["date"] = pd.to_datetime(df["date"])
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = pathlib.Path(tmp) / "300212.csv"
+            hist = normalize_daily_bars(df[df["date"] < "2024-09-27"], source="t")
+            hist.to_csv(csv_path, index=False)
+            incoming = normalize_daily_bars(df[df["date"] >= "2024-09-27"], source="t")
+            result = merge_daily_frames(csv_path, incoming, source="t")
+            dates = set(result["date"].astype(str))
+            self.assertIn("2024-09-27", dates)  # 行被保留
+            self.assertIn("2024-09-30", dates)
+            bad = result.loc[result["date"].astype(str) == "2024-09-27"].iloc[0]
+            # 非精确 x100（~9x）→ 不发明，volume 置 NaN，turnover 同置 NaN
+            self.assertTrue(pd.isna(bad["volume"]))
+            self.assertTrue(pd.isna(bad["turnover"]))
+            # OHLC 必须原样保留
+            self.assertEqual(float(bad["close"]), 175.89)
+
+    def test_erosion_regression_merge_three_times_no_new_gaps(self):
+        # 侵蚀回归：同一份数据连续合并 3 次（模拟 3 个交易日），
+        # 行数单调不减，且不出现新缺口。
+        df = pd.read_csv(FIXTURES / "erosion_regression.csv")
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = pathlib.Path(tmp) / "EROSION.csv"
+            normalize_daily_bars(df, source="t").to_csv(csv_path, index=False)
+            prev_len = len(df)
+            for _ in range(3):
+                incoming = normalize_daily_bars(df.tail(3), source="t")
+                result = merge_daily_frames(csv_path, incoming, source="t")
+                self.assertGreaterEqual(len(result), prev_len)
+                # 交易日序列无新缺口（相邻自然日 gap > 10 视为缺口）
+                dates = pd.to_datetime(result["date"])
+                gaps = dates.diff().dt.days.fillna(1)
+                self.assertFalse(bool((gaps > 10).any()))
+                prev_len = len(result)
 
 
 if __name__ == "__main__":
