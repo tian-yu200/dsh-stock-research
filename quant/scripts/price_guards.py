@@ -3,7 +3,9 @@
 Catches cases like 603826 2026-08-28 before bad rows reach CSV caches.
 """
 from __future__ import annotations
+import json
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 import pandas as pd
@@ -12,6 +14,19 @@ OVERNIGHT_GAP_THRESHOLD = 0.30
 THS_TIMEOUT_SECONDS = 20
 THS_CONFLICT_THRESHOLD = 0.20
 THS_LOOKBACK_DAYS = 5
+# T1b fail-closed THS patch: conversion must be proven within this tolerance
+# (rootcause-0928 implied-factor ratio was 0.83-0.84 -> refused at 0.15).
+THS_FACTOR_TOLERANCE = 0.15
+# Same-segment local evidence window (rows each side of the target row).
+THS_SEGMENT_HALF_WINDOW = 10
+THS_SEGMENT_MIN_ROWS = 5
+# Hypothesis grid for THS /01 raw fields vs local UNIT_CONTRACT
+# (volume=shares, turnover=decimal-fraction): volume lots->shares, amount
+# yuan->yuan (or thousand-yuan->yuan), turnover parser output -> decimal.
+THS_VOLUME_SCALES = (1.0, 100.0)
+THS_AMOUNT_SCALES = (1.0, 0.001)
+THS_TURNOVER_SCALES = (0.01, 1.0, 0.0001)
+THS_CONFLICT_LOG = Path(__file__).resolve().parents[1] / "logs" / "ths-conflicts.log"
 def _num(s):
     return pd.to_numeric(s, errors="coerce")
 def implied_ratio(frame):
@@ -232,26 +247,176 @@ def ths_crosscheck(symbol, frame, *, threshold=THS_CONFLICT_THRESHOLD, lookback=
         result["conflict"] = True
         result["detail"] = "ths_close_ratio=" + str(round(med, 4))
     return result
+def _append_ths_conflict(record):
+    """Tiny durable trace: one JSON line to quant/logs/ths-conflicts.log.
+
+    Fetch worker stdout/stderr is DEVNULL (run_research_worker.py), so the
+    conflict evidence must be appended to a file, never printed. Any failure
+    is swallowed silently: logging must never break the fetch path.
+    """
+    try:
+        line = json.dumps(record, ensure_ascii=True, default=str)
+        try:
+            Path(THS_CONFLICT_LOG).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        with open(THS_CONFLICT_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _ths_segment_evidence(out, pos):
+    """(implied_factor_ref, shares_ref) from same-segment local rows.
+
+    implied factor = close*volume/amount on the LOCAL series: the anchor that
+    a converted THS row must reproduce. shares_ref = volume/turnover gives the
+    total-share scale both series must agree on (proves the turnover unit).
+    The target row itself (pos) is excluded so its own corruption cannot
+    become its own reference.
+    """
+    try:
+        lo = max(0, int(pos) - THS_SEGMENT_HALF_WINDOW)
+        hi = min(len(out), int(pos) + THS_SEGMENT_HALF_WINDOW + 1)
+        seg = out.iloc[lo:hi]
+        c = _num(seg.get("close"))
+        v = _num(seg.get("volume"))
+        a = _num(seg.get("amount"))
+        tv = _num(seg.get("turnover"))
+        keep = pd.Series(True, index=seg.index)
+        if pos - lo < len(keep):
+            keep.iloc[pos - lo] = False
+        ok = keep & (c > 0) & (v > 0) & (a > 0)
+        factors = ((c * v) / a)[ok]
+        factors = factors.dropna()
+        if int(factors.count()) < THS_SEGMENT_MIN_ROWS:
+            return None, None
+        shares = (v / tv.where(tv > 0))[ok].dropna()
+        if int(shares.count()) < THS_SEGMENT_MIN_ROWS:
+            return float(factors.median()), None
+        return float(factors.median()), float(shares.median())
+    except Exception:
+        return None, None
+
+
+def _ths_conversion_proof(t, out, pos, *, tolerance=THS_FACTOR_TOLERANCE):
+    """Prove a THS row convertible, or return None (fail-closed).
+
+    Proofs (all required):
+    1. implied factor of the converted THS row (close*volume/amount, THS
+       volume/amount scaled to the local UNIT_CONTRACT) matches the local
+       same-segment factor within tolerance -- this pins the adjustment
+       basis AND the volume/amount units together;
+    2. converted volume/turnover reproduces the local shares-ref scale
+       within tolerance -- an independent pin on the turnover unit;
+    3. re-check: implied factor of the fully converted row vs the local
+       reference (the requirement's literal check).
+    """
+    try:
+        c = float(t["close"])
+        v = float(t["volume"])
+        a = float(t["amount"])
+        tv = float(t["turnover"])
+        o = float(t["open"])
+        h = float(t["high"])
+        lo_ = float(t["low"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(x == x and x > 0 for x in (c, v, a, tv, o, h, lo_)):
+        return None
+    ref_factor, ref_shares = _ths_segment_evidence(out, pos)
+    if not ref_factor or not ref_shares:
+        return None
+    for kv in THS_VOLUME_SCALES:
+        for ka in THS_AMOUNT_SCALES:
+            iths = (c * (v * kv)) / (a * ka)
+            if not (iths > 0) or abs(iths / ref_factor - 1.0) > tolerance:
+                continue
+            for kt in THS_TURNOVER_SCALES:
+                shares_ths = (v * kv) / (tv * kt)
+                if abs(shares_ths / ref_shares - 1.0) > tolerance:
+                    continue
+                basis = ref_factor / iths
+                patched_implied = ((c * basis) * (v * kv)) / (a * ka)
+                if abs(patched_implied / ref_factor - 1.0) > tolerance:
+                    continue
+                return {
+                    "volume": kv,
+                    "amount": ka,
+                    "turnover": kt,
+                    "basis": basis,
+                    "ref_factor": ref_factor,
+                    "ref_shares": ref_shares,
+                }
+    return None
+
+
 def ths_patch_recent(symbol, frame, *, threshold=THS_CONFLICT_THRESHOLD):
+    """Re-check recent rows against THS -- but never overwrite blindly.
+
+    The THS /01 channel is unadjusted and its raw fields do not carry the
+    local unit contract (volume in shares, turnover as a decimal). Writing
+    those 7 columns over local hfq rows produced 0.84x close seams
+    (rootcause-0928, ~183 symbols). Now each deviating row must first pass
+    _ths_conversion_proof; proven rows are written exactly converted
+    (OHLC x basis, volume/amount/turnover x unit scales), unproven rows are
+    REFUSED: local row kept and the conflict appended as a JSON line to
+    quant/logs/ths-conflicts.log (durable, outside DEVNULL stdout/stderr).
+    """
     try:
         ths = fetch_ths_daily(symbol)
     except Exception:
-        return frame, {"patched": 0, "detail": "ths_unreachable"}
+        return frame, {"patched": 0, "refused": 0, "detail": "ths_unreachable"}
     if ths is None or len(ths) == 0:
-        return frame, {"patched": 0, "detail": "ths_empty"}
+        return frame, {"patched": 0, "refused": 0, "detail": "ths_empty"}
     out = frame.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     patched = 0
+    refused = 0
     for _, t in ths.iterrows():
         mask = out["date"] == t["date"]
         if not mask.any():
             continue
-        cur = float(out.loc[mask, "close"].iloc[0])
-        if cur and abs(float(t["close"]) / cur - 1.0) > threshold:
-            for col in ["open", "high", "low", "close", "volume", "amount", "turnover"]:
-                out.loc[mask, col] = t[col]
-            patched += 1
-    return out, {"patched": patched, "detail": "ths_patch_recent"}
+        pos = int(mask.to_numpy().nonzero()[0][0])
+        cur = float(out.iloc[pos]["close"]) if "close" in out.columns else 0.0
+        try:
+            ths_close = float(t["close"])
+        except (TypeError, ValueError):
+            continue
+        if not (cur and cur > 0 and ths_close > 0):
+            continue
+        if abs(ths_close / cur - 1.0) <= threshold:
+            continue
+        proof = _ths_conversion_proof(t, out, pos)
+        record = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "symbol": str(symbol),
+            "date": str(t["date"]),
+            "close_local": cur,
+            "close_ths": ths_close,
+            "ratio": round(ths_close / cur, 6),
+        }
+        if proof is None:
+            record.update({"action": "refused", "reason": "basis_or_units_unproven"})
+            _append_ths_conflict(record)
+            refused += 1
+            continue
+        for col, scale in (("open", "basis"), ("high", "basis"), ("low", "basis"), ("close", "basis")):
+            if col in out.columns:
+                out.loc[mask, col] = float(t[col]) * proof[scale]
+        if "volume" in out.columns:
+            out.loc[mask, "volume"] = float(t["volume"]) * proof["volume"]
+        if "amount" in out.columns:
+            out.loc[mask, "amount"] = float(t["amount"]) * proof["amount"]
+        if "turnover" in out.columns:
+            out.loc[mask, "turnover"] = float(t["turnover"]) * proof["turnover"]
+        record.update({
+            "action": "patched",
+            "scales": {k: proof[k] for k in ("volume", "amount", "turnover", "basis")},
+        })
+        _append_ths_conflict(record)
+        patched += 1
+    return out, {"patched": patched, "refused": refused, "detail": "ths_patch_recent"}
 
 
 # --- 单位守卫（2026-08-28 volume/turnover 口径切换事故后增设） ---
