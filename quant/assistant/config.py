@@ -127,6 +127,12 @@ DEFAULTS: dict[str, Any] = {
         # research.stock_label_horizon（20），每 horizon/cohorts 个交易日轮换一个
         # cohort，任意时点同时有 cohorts 个 cohort 在场，换手降到约 1/cohorts。
         "backtest_cohorts": 5,
+        # 2026-10-10 回测可执行性：信号由 t 日收盘价算出、系统收盘后运行，
+        # t 日收盘不可成交 → t+1 收盘入场（lag=1，与标签 close(t+H+1)/close(t+1)
+        # 同区间）；入场日封涨停/停牌的候选跳过不补位。lag=0 + False 为旧口径。
+        # 两键进模型缓存键；生产与默认一致（tests/test_gate_policy.py 锁定）。
+        "backtest_entry_lag_days": 1,
+        "backtest_skip_limit_up": True,
         # 2026-09-11 整改(P0-2)：信号日横截面样本数的**绝对**下限。
         # 0 = 关闭，只用相对判据（>= 50% 日中位数）——测试夹具与 under50
         # 等小规模 provider 因此不受影响；生产在 assistant.yaml 设为 100。

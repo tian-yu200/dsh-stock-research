@@ -88,6 +88,9 @@ def _model_cache_identity(
                 # 必须进缓存键，否则开窗后命中旧缓存会静默跳过检查。
                 "stability_windows",
                 "stability_ic_std_threshold",
+                # 2026-10-10 回测可执行性：入场时点与涨停/停牌跳过改变回测语义。
+                "backtest_entry_lag_days",
+                "backtest_skip_limit_up",
             )
             if key in config["research"]
         },
@@ -151,6 +154,67 @@ def cohort_schedule(
         if active:
             schedule[index] = active
     return schedule
+
+
+# 涨停判定阈值（收盘涨幅 >= 阈值视为封板买不进）。沿用 Qlib Exchange 的
+# limit_threshold=0.095 惯例，给分价取整留 0.5% 容差。
+_LIMIT_UP_MAIN = 0.095
+_LIMIT_UP_GROWTH = 0.195  # 创业板 300/301、科创板 688/689（±20%）
+_LIMIT_UP_BJ = 0.295  # 北交所（±30%）；与 _top_symbols 的 BJ 号段口径一致
+
+
+def _limit_up_threshold(instrument: str) -> float:
+    name = str(instrument).strip().upper()
+    bare = name[2:] if name[:2] in {"SH", "SZ", "BJ"} else name
+    if name.startswith("BJ") or bare.startswith(("92", "43", "83", "87", "4")):
+        return _LIMIT_UP_BJ
+    if bare.startswith(("300", "301", "688", "689")):
+        return _LIMIT_UP_GROWTH
+    return _LIMIT_UP_MAIN
+
+
+def entry_returns_and_tradability(
+    closes: pd.DataFrame,
+    *,
+    entry_lag_days: int,
+    skip_limit_up: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """回测逐日收益与入场可成交性（2026-10-10 回测可执行性整改）。
+
+    ``closes`` 为 日期 × 标的 的收盘价。返回 ``(future, entry_ok)``：
+
+    - ``future.loc[t]``：信号日 t 选出的组合在该日承担的单日收益
+      ``close(t+lag+1)/close(t+lag) - 1``。cohort 持有 H 日即复利
+      ``close(t+lag) → close(t+lag+H)``；``lag=1`` 时恰为标签
+      ``close(t+H+1)/close(t+1)`` 的区间。``lag=0`` 是旧口径——在产生信号的
+      同一根收盘价成交，而系统收盘后才运行，实盘不可达。
+    - ``entry_ok.loc[t, s]``：标的 s 能否在入场日 t+lag 按收盘价买入。入场日无
+      bar（停牌）不可买；``skip_limit_up`` 时收盘较上一有效收盘涨幅达到板块
+      涨停阈值（视为封板）也不可买。旧口径（lag=0 且不判涨停）返回 ``None``，
+      调用方不做任何过滤，保持与改动前逐位一致。
+
+    已知未建模：跌停卖不出、ST ±5% 板（回测无历史名称）、新股无涨跌幅期
+    （会被误判为涨停而跳过，方向保守）。
+    """
+    lag = max(0, int(entry_lag_days))
+    future = closes.shift(-1) / closes - 1.0
+    if lag:
+        future = future.shift(-lag)
+    if lag == 0 and not skip_limit_up:
+        return future, None
+    entry_close = closes.shift(-lag) if lag else closes
+    entry_ok = entry_close.notna()
+    if skip_limit_up:
+        reference = closes.ffill().shift(1)
+        if lag:
+            reference = reference.shift(-lag)
+        change = entry_close / reference - 1.0
+        thresholds = pd.Series(
+            {column: _limit_up_threshold(column) for column in closes.columns},
+            dtype=float,
+        )
+        entry_ok &= ~change.ge(thresholds, axis=1)
+    return future, entry_ok
 
 
 def _check_label_leakage(
@@ -936,9 +1000,6 @@ def _run_qlib_stock_model(
                 fit_end_time=dataset_config["fit_end_time"],
                 label_horizon=label_horizon,
                 segments=segments,
-                # A 股可成交性判定需要开盘价：涨跌停/停牌时无法按收盘价成交，
-                # 只用 close 会系统性高估收益（见 `_tradable_mask`）。
-                backtest_fields={"$open": "BACKTEST_OPEN", "$close": "BACKTEST_CLOSE"},
             )
             _report_progress(progress_callback, "lightgbm_train")
             model = train_lgbm(dataset, config["model"])
@@ -1017,7 +1078,6 @@ def _run_qlib_stock_model(
                 data_key="raw",
             )
             closes = raw["BACKTEST_CLOSE"].unstack("instrument").sort_index()
-            future = closes.shift(-1) / closes - 1.0
             transaction_cost_rate = (
                 float(config["research"]["transaction_cost_bps"]) / 10000.0
             )
@@ -1039,6 +1099,15 @@ def _run_qlib_stock_model(
                 else 1.0
             )
             weight_strategy = str(research_cfg.get("weight_strategy", "equal_score"))
+            # 2026-10-10 回测可执行性：信号次日收盘入场（与标签同区间），入场日
+            # 封涨停/停牌的候选跳过不补位（见 entry_returns_and_tradability）。
+            entry_lag_days = max(int(research_cfg.get("backtest_entry_lag_days", 1)), 0)
+            skip_limit_up = bool(research_cfg.get("backtest_skip_limit_up", True))
+            future, entry_ok = entry_returns_and_tradability(
+                closes, entry_lag_days=entry_lag_days, skip_limit_up=skip_limit_up
+            )
+            entry_candidates = 0
+            entry_skipped = 0
             benchmark_returns: dict[pd.Timestamp, float] = {}
             legacy_returns: dict[pd.Timestamp, float] = {}
             legacy_turnovers: dict[pd.Timestamp, float] = {}
@@ -1080,6 +1149,12 @@ def _run_qlib_stock_model(
                 scores = test_prediction.xs(date, level="datetime")
                 values = future.loc[date]
                 picks = [s for s in _top_symbols(scores) if s in values.index]
+                if entry_ok is not None:
+                    tradable = entry_ok.loc[date]
+                    candidate_count = len(picks)
+                    picks = [s for s in picks if bool(tradable.get(s, False))]
+                    entry_candidates += candidate_count
+                    entry_skipped += candidate_count - len(picks)
                 daily_picks.append(picks)
                 daily_scores.append(
                     {s: float(scores.get(s, 0.0)) for s in picks}
@@ -1241,6 +1316,11 @@ def _run_qlib_stock_model(
                 "backtest_traded_budget": float(traded_budget),
                 "backtest_holding_days": holding_days,
                 "backtest_cohorts": cohort_count,
+                "backtest_entry_lag_days": entry_lag_days,
+                "backtest_skip_limit_up": skip_limit_up,
+                # 可执行性整改的作用量：入场时被判停牌/封涨停而跳过的 top-k 候选数。
+                "backtest_entry_candidates": entry_candidates,
+                "backtest_entry_skipped": entry_skipped,
                 # 旧口径基线：满仓等权 + **1 日**持有、逐日重选。仅作模型质量监控。
                 "model_quality_backtest": {
                     "net_annualized_return": legacy_performance[

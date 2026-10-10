@@ -183,6 +183,15 @@ def test_production_backtest_policy_keys_exist():
     assert research["stock_label_horizon"] == 20
 
 
+def test_production_backtest_execution_matches_defaults():
+    """2026-10-10：回测入场时点与涨停跳过，生产必须与默认一致且为可执行口径。"""
+    research = _production_config()["research"]
+    for key in ("backtest_entry_lag_days", "backtest_skip_limit_up"):
+        assert research[key] == DEFAULTS["research"][key], key
+    assert research["backtest_entry_lag_days"] == 1
+    assert research["backtest_skip_limit_up"] is True
+
+
 def test_cohort_schedule_keeps_cohorts_active_and_holds_full_horizon():
     """每只 cohort 必须恰好在场 holding_days 天，且稳态下同时有 cohorts 只在场。"""
     schedule = cohort_schedule(200, holding_days=20, cohorts=5)
