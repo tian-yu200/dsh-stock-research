@@ -354,8 +354,11 @@ def _fetch_one(
             failure_class = getattr(exc, "failure_class", None) or "baseline_discontinuity"
             if discont_backup is None:
                 # 拼接基准断裂：挪开本地历史，降级为同源全量重取一次
+                # （T2 冷启动下 CSV 可能本就不存在，跳过挪动，避免 FileNotFoundError
+                # 打爆 worker 池；重试后走 discont_backup 非空分支干净失败）。
                 discont_backup = path.with_name(path.name + ".discont.bak")
-                os.replace(path, discont_backup)
+                if path.exists():
+                    os.replace(path, discont_backup)
                 start = next_start_date(None, "20200101")
                 continue
             break

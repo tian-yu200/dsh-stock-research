@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import pathlib
 import sys
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import fetch_stock_data as worker
 from data_source import NoDailyBarsError
+from fetch_utils import BaselineDiscontinuityError
 
 
 class _FakeLimiter:
@@ -332,6 +334,116 @@ class StockWorkerTests(unittest.TestCase):
         self.assertEqual(result["candidate_count"], 0)
         self.assertEqual(result["checked_count"], 0)
         self.assertEqual(result["deferred_count"], 0)
+
+
+    def test_missing_csv_discont_marks_failure_without_crash(self) -> None:
+        # T2 incident regression: CSV already moved aside (.pre-t2.bak) and the
+        # fresh full series trips the seam/price guard twice. The discont
+        # handler must tolerate the missing file, fail the symbol cleanly and
+        # never crash the worker pool.
+        with tempfile.TemporaryDirectory(
+            prefix="stock-worker-", dir=ROOT / "tests"
+        ) as directory:
+            path = pathlib.Path(directory) / "000016.csv"
+            state = _FetchStateSpy()
+            with (
+                patch.object(worker, "_data_path", return_value=path),
+                patch.object(
+                    worker,
+                    "fetch_a_stock_daily",
+                    return_value=_bars("2026-08-26"),
+                ) as fetch,
+                patch.object(
+                    worker,
+                    "merge_daily_frames",
+                    side_effect=BaselineDiscontinuityError(
+                        "stock 000016", "synthetic seam"
+                    ),
+                ),
+            ):
+                result = worker._fetch_one(
+                    {"symbol": "000016", "data_end_date": None},
+                    state=state,
+                    limiter=_FakeLimiter(),
+                    target="2026-08-27",
+                    retries=3,
+                    backoff_base=0,
+                    backoff_max=0,
+                    lease_owner="test-owner",
+                    deadline=None,
+                )
+
+            self.assertEqual(result[0:2], ("000016", False))
+            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(len(state.failures), 1)
+            self.assertEqual(state.failures[0][0], "000016")
+            self.assertEqual(
+                state.failures[0][1]["failure_class"], "baseline_discontinuity"
+            )
+            self.assertFalse(path.exists())
+            self.assertFalse(
+                path.with_name(path.name + ".discont.bak").exists()
+            )
+
+    def test_pool_continues_after_discont_on_missing_csv(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="stock-worker-", dir=ROOT / "tests"
+        ) as directory:
+            directory_path = pathlib.Path(directory)
+
+            def data_path(code: str) -> pathlib.Path:
+                return directory_path / f"{code}.csv"
+
+            real_merge = worker.merge_daily_frames
+
+            def merge_gate(path, frame, *, source):
+                if path.name == "000016.csv":
+                    raise BaselineDiscontinuityError(source, "synthetic seam")
+                return real_merge(path, frame, source=source)
+
+            state = _FetchStateSpy()
+            with (
+                patch.object(worker, "_data_path", side_effect=data_path),
+                patch.object(
+                    worker,
+                    "fetch_a_stock_daily",
+                    return_value=_bars("2026-08-26"),
+                ),
+                patch.object(worker, "merge_daily_frames", side_effect=merge_gate),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [
+                        pool.submit(
+                            worker._fetch_one,
+                            {"symbol": code, "data_end_date": None},
+                            state=state,
+                            limiter=_FakeLimiter(),
+                            target="2026-08-27",
+                            retries=3,
+                            backoff_base=0,
+                            backoff_max=0,
+                            lease_owner="test-owner",
+                            deadline=None,
+                        )
+                        for code in ("000016", "000017")
+                    ]
+                    results = [future.result() for future in as_completed(futures)]
+
+            by_code = {item[0]: item for item in results}
+            self.assertEqual(by_code["000016"][1], False)
+            self.assertEqual(by_code["000017"][1], True)
+            self.assertEqual([item[0] for item in state.failures], ["000016"])
+            self.assertEqual([item[0] for item in state.successes], ["000017"])
+            self.assertTrue(data_path("000017").exists())
+            self.assertFalse(data_path("000016").exists())
+            self.assertEqual(
+                [
+                    entry.name
+                    for entry in directory_path.iterdir()
+                    if entry.name.endswith(".discont.bak")
+                ],
+                [],
+            )
 
 
 if __name__ == "__main__":

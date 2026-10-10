@@ -296,8 +296,12 @@ def _fetch_one(
                 # 拼接基准断裂：本地历史不可信（2026-09-02 毒数据事故根源）。
                 # 把 CSV 挪开，降级为同源全量重取一次；挪开后 merge 无既有序列
                 # 可比，守卫自然放行干净的全量序列。
+                # 全量重取路径下 CSV 可能本就不存在（T2 无历史冷启动）：价格守卫
+                # 拒写同样走这里，缺文件时跳过挪动，重试后由 discont_backup 非空
+                # 分支干净失败，避免 FileNotFoundError 打爆整个 worker 池。
                 discont_backup = path.with_name(path.name + ".discont.bak")
-                os.replace(path, discont_backup)
+                if path.exists():
+                    os.replace(path, discont_backup)
                 start = next_start_date(None, "20200101")
                 continue
             break

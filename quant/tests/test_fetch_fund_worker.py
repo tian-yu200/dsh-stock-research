@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pathlib
 import tempfile
 import unittest
@@ -14,7 +15,26 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import fetch_fund_data as worker
 from fetch_state import FetchState
-from fetch_utils import FundNavValidationError, merge_otc_frames
+from fetch_utils import (
+    BaselineDiscontinuityError,
+    FundNavValidationError,
+    merge_otc_frames,
+)
+
+
+def _etf_bars(date: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "date": [date],
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+            "volume": [100],
+            "amount": [100],
+            "turnover": [1],
+        }
+    )
 
 
 class _FakeLimiter:
@@ -29,7 +49,12 @@ class _FetchStateSpy:
         self.claim_count = 0
         self.failures: list[str] = []
         self.quarantines: list[str] = []
+        self.successes: list[tuple[str, dict]] = []
         self.registered: list[tuple[str, list[str], dict[str, str | None]]] = []
+
+    def mark_success(self, kind: str, symbol: str, **kwargs) -> bool:
+        self.successes.append((symbol, kwargs))
+        return True
 
     def reclaim_orphaned_leases(self) -> int:
         return 0
@@ -387,6 +412,119 @@ class BulkRefreshTests(unittest.TestCase):
         )
         with patch.object(worker.ak, "fund_open_fund_daily_em", return_value=raw):
             self.assertIsNone(worker._bulk_otc_snapshot())
+
+
+    def test_missing_csv_discont_marks_failure_without_crash(self) -> None:
+        # T2 incident regression (fund twin): CSV already moved aside
+        # (.pre-t2.bak) and the fresh full series trips the seam/price guard
+        # twice. Must fail cleanly, keep the CSV absent, create no
+        # .discont.bak and never raise out of _fetch_one.
+        with tempfile.TemporaryDirectory(
+            prefix="fund-worker-", dir=ROOT / "tests"
+        ) as directory:
+            path = pathlib.Path(directory) / "510300.csv"
+            state = _FetchStateSpy()
+            with (
+                patch.object(
+                    worker,
+                    "_path",
+                    side_effect=lambda kind, code: pathlib.Path(directory)
+                    / f"{code}.csv",
+                ),
+                patch.object(
+                    worker,
+                    "fetch_etf_daily",
+                    return_value=_etf_bars("2026-08-26"),
+                ) as fetch,
+                patch.object(
+                    worker,
+                    "merge_daily_frames",
+                    side_effect=BaselineDiscontinuityError(
+                        "ETF 510300", "synthetic seam"
+                    ),
+                ),
+            ):
+                result = worker._fetch_one(
+                    "etf",
+                    {"symbol": "510300", "data_end_date": None},
+                    state=state,
+                    limiter=_FakeLimiter(),
+                    target="2026-08-27",
+                    retries=3,
+                    backoff_base=0,
+                    backoff_max=0,
+                    lease_owner="test-owner",
+                    deadline=None,
+                )
+
+            self.assertEqual(result[0:3], ("etf", "510300", False))
+            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(state.failures, ["510300"])
+            self.assertFalse(path.exists())
+            self.assertFalse(
+                path.with_name(path.name + ".discont.bak").exists()
+            )
+
+    def test_pool_continues_after_discont_on_missing_csv(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="fund-worker-", dir=ROOT / "tests"
+        ) as directory:
+            directory_path = pathlib.Path(directory)
+
+            def fund_path(kind: str, code: str) -> pathlib.Path:
+                return directory_path / f"{code}.csv"
+
+            real_merge = worker.merge_daily_frames
+
+            def merge_gate(path, frame, *, source):
+                if path.name == "510300.csv":
+                    raise BaselineDiscontinuityError(source, "synthetic seam")
+                return real_merge(path, frame, source=source)
+
+            state = _FetchStateSpy()
+            with (
+                patch.object(worker, "_path", side_effect=fund_path),
+                patch.object(
+                    worker,
+                    "fetch_etf_daily",
+                    return_value=_etf_bars("2026-08-26"),
+                ),
+                patch.object(worker, "merge_daily_frames", side_effect=merge_gate),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [
+                        pool.submit(
+                            worker._fetch_one,
+                            "etf",
+                            {"symbol": code, "data_end_date": None},
+                            state=state,
+                            limiter=_FakeLimiter(),
+                            target="2026-08-27",
+                            retries=3,
+                            backoff_base=0,
+                            backoff_max=0,
+                            lease_owner="test-owner",
+                            deadline=None,
+                        )
+                        for code in ("510300", "510310")
+                    ]
+                    results = [future.result() for future in as_completed(futures)]
+
+            by_code = {item[1]: item for item in results}
+            self.assertEqual(by_code["510300"][2], False)
+            self.assertEqual(by_code["510310"][2], True)
+            self.assertEqual(state.failures, ["510300"])
+            self.assertEqual([item[0] for item in state.successes], ["510310"])
+            self.assertTrue(fund_path("etf", "510310").exists())
+            self.assertFalse(fund_path("etf", "510300").exists())
+            self.assertEqual(
+                [
+                    entry.name
+                    for entry in directory_path.iterdir()
+                    if entry.name.endswith(".discont.bak")
+                ],
+                [],
+            )
 
 
 if __name__ == "__main__":
