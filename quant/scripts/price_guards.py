@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 import pandas as pd
+
+import silent_trace
+
 IMPLIED_DEVIATION_THRESHOLD = 0.25
 OVERNIGHT_GAP_THRESHOLD = 0.30
 # 拼接基准探测（2026-10-10 T1）：只看 merge seam，用「复权收盘台阶 + 原始 VWAP 连续」
@@ -153,7 +156,8 @@ def validate_daily_bars(frame, *, source="", symbol=""):
     work = frame.copy().reset_index(drop=True)
     try:
         work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
-    except Exception:
+    except Exception as exc:
+        silent_trace.trace("price_guards", "validate_daily_bars.normalize_date", exc, symbol=symbol)
         pass
     row_count = len(work)
 
@@ -274,7 +278,8 @@ def write_quarantine(data_dir, symbol, bad, reasons):
             if "date" in old.columns:
                 old["date"] = old["date"].map(_quarantine_date_str)
             out = pd.concat([old, out], ignore_index=True)
-        except Exception:
+        except Exception as exc:
+            silent_trace.trace("price_guards", "write_quarantine.merge_existing", exc, symbol=symbol)
             pass
     if "date" in out.columns:
         out = out.drop_duplicates(subset=["date"], keep="last")
@@ -634,7 +639,8 @@ def detect_unit_breaks(frame, *, source="", symbol=""):
             dev = pd.to_numeric(implied / trail_med, errors="coerce")
             inconsistent = dev.notna() & ((dev < 1.0 / UNIT_SELFCHECK_X) | (dev > UNIT_SELFCHECK_X))
             hit = hit & ~(gap_mask & ~inconsistent)
-        except Exception:
+        except Exception as exc:
+            silent_trace.trace("price_guards", "detect_unit_breaks.halt_selfcheck", exc, symbol=symbol)
             pass
         flags = hit.fillna(False).astype(bool)
         dates = frame.get("date")
