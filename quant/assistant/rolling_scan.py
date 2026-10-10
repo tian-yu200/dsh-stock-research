@@ -42,6 +42,11 @@ except ImportError:  # pragma: no cover - 直接以脚本方式运行时的回�
         sys.path.insert(0, str(scripts_root))
     from universe import load_universe_manifest, manifest_names
 
+try:
+    from scripts import silent_trace
+except ImportError:  # pragma: no cover - 直接以脚本方式运行时的回退
+    import silent_trace
+
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "enabled": True,
@@ -243,9 +248,11 @@ def _read_state(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
                     for at in list(totals.keys()):
                         if at in ("etf", "otc_fund"):
                             totals[at]["success"] = len([r for r in rows if str(r["asset_type"])==at])
-            except Exception:
+            except Exception as exc:
+                silent_trace.trace("rolling_scan", "_read_state.totals_recompute", exc)
                 pass
-        except Exception:
+        except Exception as exc:
+            silent_trace.trace("rolling_scan", "_read_state.read", exc)
             pass
     for row in rows:
         row["file_revision"] = _file_revision(str(row["asset_type"]), str(row["symbol"]))

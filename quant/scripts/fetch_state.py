@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+import silent_trace
 
 UTC = timezone.utc
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "fetch_state.sqlite3"
@@ -468,7 +469,8 @@ class FetchState:
                 selected = _kept
                 if not selected:
                     return []
-            except Exception:
+            except Exception as exc:
+                silent_trace.trace("fetch_state", "claim_due.cross_border_filter", exc)
                 pass
         # A newer target date may bypass a prior success refresh once.
         clauses = [
@@ -522,7 +524,8 @@ class FetchState:
                         r for r in rows
                         if not _is_cross_border_f(_names_all.get(str(r["symbol"]), ""), asset_type=asset_type)
                     ]
-                except Exception:
+                except Exception as exc:
+                    silent_trace.trace("fetch_state", "progress.cross_border_filter", exc)
                     pass
             for row in rows:
                 connection.execute(
@@ -899,7 +902,8 @@ class FetchState:
                         if not _is_cross_border_f(nm, asset_type=at):
                             filtered.append(r)
                 rows = filtered
-            except Exception:
+            except Exception as exc:
+                silent_trace.trace("fetch_state", "progress.recompute_filter", exc)
                 pass
         completed = 0
         inactive = 0

@@ -33,6 +33,14 @@ from .paths import (
 )
 
 try:
+    from scripts import silent_trace
+except ImportError:
+    scripts_root = Path(__file__).resolve().parents[1] / "scripts"
+    if str(scripts_root) not in sys.path:
+        sys.path.insert(0, str(scripts_root))
+    import silent_trace
+
+try:
     from scripts.fetch_state import FetchState
     from scripts.fetch_targets import asset_target_dates
     from scripts.universe import load_asset_metadata
@@ -384,7 +392,8 @@ def _start_background_worker(
         metadata = job.get("metadata", {}) if isinstance(job, dict) else {}
         if job and not bool(metadata.get("full_universe", True)):
             command += ["--time-budget", str(max(wave_budget, targeted_budget))]
-    except Exception:
+    except Exception as exc:
+        silent_trace.trace("queueing", "_start_background_worker.budget", exc, job_id=job_id)
         pass
     try:
         creation_flags = 0

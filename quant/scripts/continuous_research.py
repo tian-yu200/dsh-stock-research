@@ -1604,7 +1604,9 @@ def _refresh_calendar_dates() -> list[str]:
         calendar = _online_calendar()
         _atomic_write_calendar(calendar)
         return sorted(calendar["trade_date"].astype(str))
-    except Exception:
+    except Exception as exc:
+        _logger().warning("silent-exception continuous_research._refresh_calendar_dates.online: %s: %s",
+                          type(exc).__name__, str(exc)[:300])
         pass
     try:
         from trading_calendar import _cached_calendar
