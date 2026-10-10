@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 from assistant.qlib_model import (  # noqa: E402
     build_dataset,
     init_qlib,
+    limit_up_threshold,
     segment_prediction,
     train_lgbm,
 )
@@ -189,6 +190,8 @@ def monthly_signal_dates(prediction: pd.Series) -> list[pd.Timestamp]:
     dates = pd.DatetimeIndex(prediction.index.get_level_values("datetime").unique()).sort_values()
     return list(pd.Series(dates, index=dates).groupby(dates.to_period("M")).last())
 
+MAX_OPEN_CHASE = 0.05  # 开盘较信号收盘涨幅超过 5% 属追价，当次不买（报告"不追价"条款）
+
 def simulate_account(
     prediction: pd.Series,
     opens: pd.DataFrame,
@@ -236,8 +239,20 @@ def simulate_account(
                 old_qty = holdings.get(symbol, 0)
                 buy_qty = max(0, target_qty - old_qty)
                 price = float(opens.at[date, symbol]) if symbol in opens.columns else float("nan")
-                if not buy_qty or not np.isfinite(price):
+                if not buy_qty:
                     continue
+                if not np.isfinite(price):
+                    trades.append({"signal_date": signal_date, "trade_date": date, "symbol": symbol, "side": "skip_buy", "quantity": 0, "price": price, "value": 0.0, "cost": 0.0, "reason": "missing_open"})
+                    continue
+                reference = float(signal_prices.get(symbol, np.nan))
+                if np.isfinite(reference) and reference > 0:
+                    change = price / reference - 1.0
+                    if change >= limit_up_threshold(symbol):
+                        trades.append({"signal_date": signal_date, "trade_date": date, "symbol": symbol, "side": "skip_buy", "quantity": 0, "price": price, "value": 0.0, "cost": 0.0, "reason": "limit_up"})
+                        continue
+                    if change > MAX_OPEN_CHASE:
+                        trades.append({"signal_date": signal_date, "trade_date": date, "symbol": symbol, "side": "skip_buy", "quantity": 0, "price": price, "value": 0.0, "cost": 0.0, "reason": "open_gap_over_5pct"})
+                        continue
                 while buy_qty > 0:
                     value = buy_qty * price
                     fee = order_cost(value, open_cost, minimum)
@@ -261,12 +276,17 @@ def simulate_account(
         records.append({"date": date, "cash": cash, "market_value": market_value, "equity": cash + market_value, "positions": len(holdings)})
     report = pd.DataFrame(records).set_index("date")
     trade_frame = pd.DataFrame(trades)
+    executed = (
+        int((trade_frame["side"] != "skip_buy").sum())
+        if "side" in trade_frame.columns
+        else 0
+    )
     metrics = performance_metrics(report["equity"])
     metrics.update({
         "total_cost": total_cost,
         "turnover_value": total_turnover,
         "turnover_ratio": total_turnover / report["equity"].mean() / max(1.0, len(report) / 252.0),
-        "trade_orders": int(len(trade_frame)),
+        "trade_orders": executed,
         "ending_equity": float(report["equity"].iloc[-1]),
     })
     return report, trade_frame, metrics

@@ -163,7 +163,7 @@ _LIMIT_UP_GROWTH = 0.195  # 创业板 300/301、科创板 688/689（±20%）
 _LIMIT_UP_BJ = 0.295  # 北交所（±30%）；与 _top_symbols 的 BJ 号段口径一致
 
 
-def _limit_up_threshold(instrument: str) -> float:
+def limit_up_threshold(instrument: str) -> float:
     name = str(instrument).strip().upper()
     bare = name[2:] if name[:2] in {"SH", "SZ", "BJ"} else name
     if name.startswith("BJ") or bare.startswith(("92", "43", "83", "87", "4")):
@@ -171,6 +171,10 @@ def _limit_up_threshold(instrument: str) -> float:
     if bare.startswith(("300", "301", "688", "689")):
         return _LIMIT_UP_GROWTH
     return _LIMIT_UP_MAIN
+
+
+# 旧名保留为别名：外部与既有测试仍引用 _limit_up_threshold。
+_limit_up_threshold = limit_up_threshold
 
 
 def entry_returns_and_tradability(
