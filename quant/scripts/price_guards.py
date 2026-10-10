@@ -18,39 +18,50 @@ OVERNIGHT_GAP_THRESHOLD = 0.30
 # 5-15% 的 VWAP 波动会被当成「平」）。
 # 容差 0.05（2026-10-10 T1 复审 B1/B2 裁决，原 0.02 在被侵蚀的生产形态上漏报：
 # 000001 的 09-24→09-30 缺行缝 vwap_step=0.0209、09-30→10-08 为 0.0287，均恰过 0.02）：
-# close 腿已用板块日涨跌幅把真行情排除在外——close 台阶超过日限只可能出现在
-# 上市首日/复牌（此时 VWAP 移动远大于 5%，不会被当成「平」），除权日在 hfq 下
-# close 不跳、更不会触发 close 腿。因此 0.05 只放宽 VWAP 侧的缺行形变容差，
-# 不放进来任何真实涨跌（全市场生产形态扫描：raise 8 / hold 26，见不变量 §3）。
+# 0.05 只放宽 VWAP 侧的「缺行形变」容差；真行情由 close 腿的**留余量板限**排除（见下）。
 BASIS_SEAM_VWAP_FLAT_TOL = 0.05
 BASIS_SEAM_PERSIST_TOL = 0.05
 BASIS_SEAM_MIN_HISTORY = 20
 BASIS_SEAM_BASELINE_ROWS = 60
-# 板块日涨跌幅上限（与 qlib_model.limit_up_threshold 同口径，留 0.5% 取整容差）。
-BASIS_SEAM_LIMIT_MAIN = 0.095
-BASIS_SEAM_LIMIT_GROWTH = 0.195
-BASIS_SEAM_LIMIT_BJ = 0.295
+# 板块**真实**日涨跌幅（不是 qlib_model.limit_up_threshold 的 0.095「接近涨停」判定阈值——
+# 那个阈值带 0.5% 取整容差，用来判「能否买进」；本处判「是不是真实行情」，必须用真实限幅）。
+BASIS_SEAM_REAL_LIMIT_MAIN = 0.10
+BASIS_SEAM_REAL_LIMIT_GROWTH = 0.20
+BASIS_SEAM_REAL_LIMIT_BJ = 0.30
+# close 腿的留余量系数：真实涨停日 close_step = log2(1.10) = 0.1375，取 1.2× 真实限幅后
+# 门限 = log2(1 + 1.2×0.10) = log2(1.12) = 0.1635（主板）/ log2(1.24) = 0.3103（创业·科创）
+# / log2(1.36) = 0.4436（北交所）。0.1375 < 0.1635 → 涨停日落在腿外，不再依赖 VWAP 腿排除。
+BASIS_SEAM_LIMIT_MARGIN = 1.2
 
 
 def basis_seam_limit(symbol=""):
-    """Return the board daily price limit for ``symbol`` as a SIMPLE return."""
+    """Return the board's REAL daily price limit for ``symbol`` (simple return)."""
     name = str(symbol).strip().upper()
     bare = name[2:] if name[:2] in {"SH", "SZ", "BJ"} else name
     if name.startswith("BJ") or bare.startswith(("92", "43", "83", "87", "4")):
-        return BASIS_SEAM_LIMIT_BJ
+        return BASIS_SEAM_REAL_LIMIT_BJ
     if bare.startswith(("300", "301", "688", "689")):
-        return BASIS_SEAM_LIMIT_GROWTH
-    return BASIS_SEAM_LIMIT_MAIN
+        return BASIS_SEAM_REAL_LIMIT_GROWTH
+    return BASIS_SEAM_REAL_LIMIT_MAIN
 
 
 def basis_seam_limit_step(symbol=""):
-    """Board limit on the same |log2| scale as ``close_step`` (T1).
+    """Close-leg threshold on the same |log2| scale as ``close_step`` (T1).
 
-    ``close_step`` is |log2(close_i / close_{i-1})|, while the board limit is a
-    simple return. A real +10% limit day is log2(1.10) = 0.1375, so comparing
-    raw 0.095 would flag every genuine limit move. Convert like with like.
+    ``close_step`` is |log2(close_i / close_{i-1})| while the board limit is a
+    simple return, so the limit must be converted (a real +10% limit day is
+    log2(1.10) = 0.1375, not 0.095). The leg then adds a 1.2x margin: main
+    log2(1.12) = 0.1635, growth log2(1.24) = 0.3103, BJ log2(1.36) = 0.4436.
+    Genuine limit days (0.1375 / 0.2630 / 0.3785) all stay below their leg, so
+    real moves are excluded by construction rather than by the VWAP leg.
+
+    Known blind spot (2026-10-10 B3): a basis step that stays inside the leg is
+    invisible -- main-board steps between about 0.89x and 1.12x (|log2| <
+    0.1635) and growth-board steps under about 24% (|log2| < 0.3103) are not
+    caught here. The known source of such steps is the THS blind overwrite,
+    which T1b's fail-closed patch removes.
     """
-    return math.log2(1.0 + basis_seam_limit(symbol))
+    return math.log2(1.0 + BASIS_SEAM_LIMIT_MARGIN * basis_seam_limit(symbol))
 THS_TIMEOUT_SECONDS = 20
 THS_CONFLICT_THRESHOLD = 0.20
 THS_LOOKBACK_DAYS = 5
@@ -71,6 +82,33 @@ THS_CONFLICT_LOG = Path(__file__).resolve().parents[1] / "logs" / "ths-conflicts
 # <name>.1 (replacing any old .1) before the next append, inside the same
 # silent try -- the evidence file must never grow unbounded.
 THS_CONFLICT_LOG_MAX_BYTES = 5 * 1024 * 1024
+# T1 seam 守卫留痕（2026-10-10 复审 B3 裁决 3）：raise 与 hold 各写一行 JSON。
+# 抓取 worker 的 stdout/stderr 是 DEVNULL（run_research_worker.py），所以必须落文件，
+# 绝不 print。5 MB 轮转到 .1；任何异常静默吞掉，日志永不打断抓取路径。
+SEAM_GUARD_LOG = Path(__file__).resolve().parents[1] / "logs" / "seam-guard.log"
+SEAM_GUARD_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def append_seam_guard_trace(record):
+    """Append one JSON line describing a seam raise/hold. Never raises."""
+    try:
+        line = json.dumps(record, ensure_ascii=True, default=str)
+        path = Path(SEAM_GUARD_LOG)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if path.exists() and path.stat().st_size > SEAM_GUARD_LOG_MAX_BYTES:
+                path.replace(path.with_name(path.name + ".1"))
+        except Exception:
+            pass
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
 def _num(s):
     return pd.to_numeric(s, errors="coerce")
 def implied_ratio(frame):

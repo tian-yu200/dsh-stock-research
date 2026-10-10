@@ -266,6 +266,8 @@ def merge_daily_frames(
     if not existing.empty:
         try:
             from price_guards import detect_basis_seam as _bs_detect
+            from price_guards import append_seam_guard_trace as _bs_trace
+            from price_guards import basis_seam_limit_step as _bs_limit
             _existing_norm = normalize_daily_bars(existing, source=source)
             _existing_dates = set(_existing_norm["date"].astype(str))
             # 只把「新行」交给 seam 探测器（历史内部断裂不发射）。
@@ -275,6 +277,18 @@ def merge_daily_frames(
                 _existing_norm, _new_rows,
                 source=source, symbol=existing_path.stem,
             )
+            _bs_limit_step = round(float(_bs_limit(existing_path.stem)), 4)
+            for _bs_rec in _bs_reasons:
+                _bs_trace({
+                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "symbol": existing_path.stem,
+                    "date": _bs_rec.get("date"),
+                    "decision": "raise" if _bs_rec.get("confirmed") else "hold",
+                    "close_step": _bs_rec.get("close_step"),
+                    "vwap_step": _bs_rec.get("vwap_step"),
+                    "limit_step": _bs_limit_step,
+                    "source": source,
+                })
             if bool(_bs_raise.any()):
                 _r = _bs_reasons[0] if _bs_reasons else {}
                 raise BaselineDiscontinuityError(
@@ -290,13 +304,15 @@ def merge_daily_frames(
                 result = result.loc[~result["date"].astype(str).isin(_hold_dates)].reset_index(drop=True)
         except BaselineDiscontinuityError:
             raise
-        except Exception as _bs_exc:
-            print("  [" + existing_path.stem + "] 基准 seam 守卫跳过: " + type(_bs_exc).__name__)
+        except Exception:
+            # 2026-10-10 复审 B3 裁决 3：不再 print（worker stdout/stderr 是 DEVNULL）。
+            pass
     # ---- 价格守卫：分诊（删行仅在内部孤立尖刺时保留）----
     try:
         from price_guards import validate_daily_bars as _pg_validate
         from price_guards import write_quarantine as _pg_quarantine
         from price_guards import triage_price_flags as _pg_triage
+        from price_guards import append_seam_guard_trace as _pg_trace
         _pg_clean, _pg_bad, _pg_reasons = _pg_validate(result, source=source, symbol=existing_path.stem)
         if len(_pg_bad) > 0:
             _flag_mask = result["date"].isin(_pg_bad["date"])
@@ -315,25 +331,42 @@ def merge_daily_frames(
                 _del = result.loc[_delete_m].reset_index(drop=True)
                 _d_reasons = [r for r in _pg_reasons if str(r.get("date")) in set(_del["date"].astype(str))]
                 _qpath = _pg_quarantine(existing_path.parent, existing_path.stem, _del, _d_reasons)
-                print("  [" + existing_path.stem + "] 价格守卫隔离内部尖刺 " + str(len(_del)) + " 行 -> " + str(_qpath))
+                _pg_trace({
+                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "symbol": existing_path.stem,
+                    "date": str(_del["date"].iloc[0])[:10],
+                    "decision": "price_spike_quarantine",
+                    "rows": int(len(_del)),
+                    "source": source,
+                })
                 result = result.loc[~_delete_m].reset_index(drop=True)
     except BaselineDiscontinuityError:
         raise
-    except Exception as _pg_exc:
-        print("  [" + existing_path.stem + "] 价格守卫跳过: " + type(_pg_exc).__name__)
+    except Exception:
+        # 2026-10-10 复审 B3 裁决 3：不再 print（worker stdout/stderr 是 DEVNULL）。
+        pass
     # ---- 单位守卫：修复字段而非删行 ----
     try:
         from price_guards import detect_unit_breaks as _ug_detect
         from price_guards import repair_unit_breaks as _ug_repair
         from price_guards import write_quarantine as _ug_quarantine
+        from price_guards import append_seam_guard_trace as _ug_trace
         _ug_flags, _ug_reasons = _ug_detect(result, source=source, symbol=existing_path.stem)
         if bool(_ug_flags.any()):
             _ug_bad = result.loc[_ug_flags].reset_index(drop=True)
             _ug_qpath = _ug_quarantine(existing_path.parent, existing_path.stem, _ug_bad, _ug_reasons)
-            print("  [" + existing_path.stem + "] 单位守卫修正 " + str(len(_ug_bad)) + " 行（保留不删）-> " + str(_ug_qpath))
+            _ug_trace({
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "symbol": existing_path.stem,
+                "date": str(_ug_bad["date"].iloc[0])[:10],
+                "decision": "unit_repair",
+                "rows": int(len(_ug_bad)),
+                "source": source,
+            })
             result = _ug_repair(result, _ug_flags, source=source, symbol=existing_path.stem)
-    except Exception as _ug_exc:
-        print("  [" + existing_path.stem + "] 单位守卫跳过: " + type(_ug_exc).__name__)
+    except Exception:
+        # 2026-10-10 复审 B3 裁决 3：不再 print（worker stdout/stderr 是 DEVNULL）。
+        pass
     for key, value in incoming.attrs.items():
         result.attrs[key] = value
     return result

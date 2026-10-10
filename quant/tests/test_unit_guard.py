@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import json
+import math
 import pathlib
 import sys
 import tempfile
@@ -16,6 +18,7 @@ import pandas as pd
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import price_guards
 from fetch_utils import BaselineDiscontinuityError, merge_daily_frames
 from market_data import UNIT_CONTRACT, normalize_daily_bars
 from price_guards import (
@@ -23,6 +26,8 @@ from price_guards import (
     UNIT_JUMP_HI,
     UNIT_JUMP_LO,
     BASIS_SEAM_VWAP_FLAT_TOL,
+    SEAM_GUARD_LOG,
+    append_seam_guard_trace,
     basis_seam_limit_step,
     detect_basis_seam,
     detect_unit_breaks,
@@ -281,16 +286,22 @@ class UnitGuardTests(unittest.TestCase):
                 prev_len = len(result)
 
     def test_seam_limit_is_log2_scale(self):
-        # 修正：close_step 是 |log2|，板块限幅必须换算到同一尺度。
-        # 真 +10% 涨板 log2(1.10)=0.1375 不得被当成「超过板限」。
+        # close_step 是 |log2|，close 腿用**真实限幅 × 1.2 余量**换算到同一尺度。
+        # 真 +10% 涨停 log2(1.10)=0.1375 必须落在腿外（B3 修正）。
         from price_guards import basis_seam_limit, basis_seam_limit_step
-        self.assertAlmostEqual(basis_seam_limit("000001"), 0.095, places=4)
+        import math as _math
+        self.assertAlmostEqual(basis_seam_limit("000001"), 0.10, places=4)
+        self.assertAlmostEqual(basis_seam_limit("300212"), 0.20, places=4)
+        self.assertAlmostEqual(basis_seam_limit("920779"), 0.30, places=4)
         self.assertAlmostEqual(basis_seam_limit_step("000001"),
-                               __import__("math").log2(1.095), places=4)
-        self.assertGreater(basis_seam_limit_step("300212"),
-                           basis_seam_limit_step("000001"))
-        self.assertGreater(basis_seam_limit_step("920779"),
-                           basis_seam_limit_step("300212"))
+                               _math.log2(1.0 + 1.2 * 0.10), places=4)   # 0.1635
+        self.assertAlmostEqual(basis_seam_limit_step("300212"),
+                               _math.log2(1.0 + 1.2 * 0.20), places=4)   # 0.3103
+        self.assertAlmostEqual(basis_seam_limit_step("920779"),
+                               _math.log2(1.0 + 1.2 * 0.30), places=4)   # 0.4436
+        self.assertGreater(basis_seam_limit_step("000001"), _math.log2(1.10))
+        self.assertGreater(basis_seam_limit_step("300212"), _math.log2(1.20))
+        self.assertGreater(basis_seam_limit_step("920779"), _math.log2(1.30))
 
     def test_seam_limit_move_written_not_held(self):
         # 真涨停（close +10%，VWAP 同步 +10%）不是候选，不得 hold/raise。
@@ -312,27 +323,40 @@ class UnitGuardTests(unittest.TestCase):
             self.assertIn("2026-09-04", set(result["date"].astype(str)))
 
 
-    def test_seam_prod_shape_000001_0924_to_0930_same_level_confirmation_raises(self):
+    def test_seam_prod_shape_000001_0924_to_0930_seam_surfaces_next_wave(self):
         # B1 生产形态回归：fixture = 000001 主 CSV 末 40 行（09-28/09-29 已删，
-        # 无隔离区行拼回）+ 下一波真实行 10-08/10-09。
-        # (a) existing 截到 09-24，incoming 09-30 + 同水位佐证行：
-        # close_step=0.2453 > 板限 0.1309，vwap_step=0.0209 <= 0.05（旧 0.02 漏报）
-        # → 下一行同水位持久 → raise，不得静默写入。
+        # 无隔离区行拼回）+ 下一波真实行 10-08/10-09（该两行取自隔离区，见 R-2）。
+        # existing 截到 09-24，incoming = 09-30 + 10-08 + 10-09（全部真实行，
+        # 不再克隆非交易日佐证行）：
+        #   09-30 是候选（close_step=0.2453 > 0.1635、vwap_step=0.0209 ≤ 0.05）
+        #   但其下一行 10-08 不延续同水位（log2=0.2905 > 0.05）→ 不 raise；
+        #   10-08 是候选且 10-09 延续同水位（log2=0.0178 ≤ 0.05）→ raise。
         self.assertEqual(BASIS_SEAM_VWAP_FLAT_TOL, 0.05)
         df = pd.read_csv(FIXTURES / "000001_prod_shape.csv")
         existing = df[df["date"] <= "2026-09-24"].reset_index(drop=True)
-        inc930 = df[df["date"] == "2026-09-30"].reset_index(drop=True)
+        incoming = df[df["date"] >= "2026-09-30"].reset_index(drop=True)
         self.assertGreaterEqual(len(existing), 20)
-        confirm = inc930.iloc[0].copy()
-        confirm["date"] = "2026-10-05"  # 同水位佐证行（该水位无真实下一行，克隆 09-30 行）
-        incoming = pd.concat([inc930, pd.DataFrame([confirm])], ignore_index=True)
+        self.assertEqual(list(incoming["date"]), ["2026-09-30", "2026-10-08", "2026-10-09"])
         raise_mask, hold_mask, reasons = detect_basis_seam(
             existing, incoming, source="t", symbol="000001")
         self.assertEqual(int(raise_mask.sum()), 1)
         self.assertEqual(int(hold_mask.sum()), 0)
-        self.assertEqual(reasons[0]["date"], "2026-09-30")
+        self.assertEqual(reasons[0]["date"], "2026-10-08")
         self.assertGreater(reasons[0]["close_step"], basis_seam_limit_step("000001"))
         self.assertLessEqual(reasons[0]["vwap_step"], BASIS_SEAM_VWAP_FLAT_TOL)
+
+    def test_seam_prod_shape_000001_0930_single_tail_is_held_not_written(self):
+        # 同上形态但只抓到 09-30 一行（尾部无佐证）→ hold 1，该行不写入、
+        # 也不删行，下一波再判（不制造缺口）。
+        df = pd.read_csv(FIXTURES / "000001_prod_shape.csv")
+        existing = df[df["date"] <= "2026-09-24"].reset_index(drop=True)
+        incoming = df[df["date"] == "2026-09-30"].reset_index(drop=True)
+        raise_mask, hold_mask, reasons = detect_basis_seam(
+            existing, incoming, source="t", symbol="000001")
+        self.assertEqual(int(raise_mask.sum()), 0)
+        self.assertEqual(int(hold_mask.sum()), 1)
+        self.assertEqual(reasons[0]["date"], "2026-09-30")
+        self.assertFalse(reasons[0]["confirmed"])
 
     def test_seam_prod_shape_000001_1008_after_erasured_history_raises(self):
         # (b) existing 截到 09-30（09-24→09-30 缝在历史内部，永不发射），
@@ -363,8 +387,8 @@ class UnitGuardTests(unittest.TestCase):
         self.assertEqual(int(hold_mask.sum()), 0)
 
     def test_seam_real_limitup_plus10_vwap_plus8_no_raise_no_hold(self):
-        # 真 +10% 涨停日（close log2(1.10)=0.1375 > 板限 0.1309）且 VWAP 只动
-        # +8%（log2=0.111 > 容差 0.05）→ 不是候选：不得 raise、不得 hold。
+        # 真 +10% 涨停日（close log2(1.10)=0.1375）且 VWAP 只动 +8%
+        # （log2=0.111 > 容差 0.05）→ 不是候选：不得 raise、不得 hold。
         dates = pd.bdate_range("2026-08-03", periods=25).strftime("%Y-%m-%d").tolist()
         rows = [[d, 10.0, 10.0, 10.0, 10.0, 1_000_000.0, 10_000_000.0, 0.005]
                 for d in dates]
@@ -377,6 +401,50 @@ class UnitGuardTests(unittest.TestCase):
         self.assertEqual(int(raise_mask.sum()), 0)
         self.assertEqual(int(hold_mask.sum()), 0)
         self.assertEqual(reasons, [])
+
+    def test_seam_b3_limitup_low_vwap_move_next_day_pullback_no_raise(self):
+        # B3 回归（hermes 复审 dcd6b0c）：涨停日 close 11.00 但成交均价只 +2%，
+        # 次日 -3% 回调。旧 close 腿（log2(1.095)=0.1309）会误判：
+        #   close_step=0.1375 > 0.1309、vwap_step=0.0286 ≤ 0.05、
+        #   |log2(10.67/11.00)|=0.0444 ≤ 0.05 → raise（假阳性，无谓全量重取）。
+        # 新腿 0.1635 > 0.1375 → 真涨停落在腿外：不得 raise、不得 hold。
+        dates = pd.bdate_range("2026-08-03", periods=25).strftime("%Y-%m-%d").tolist()
+        rows = [[d, 10.0, 10.0, 10.0, 10.0, 1_000_000.0, 10_000_000.0, 0.005]
+                for d in dates]
+        existing = pd.DataFrame(rows, columns=COLS)
+        incoming = pd.DataFrame(
+            [["2026-09-07", 10.0, 11.0, 10.0, 11.0, 1_000_000.0, 10_200_000.0, 0.005],
+             ["2026-09-08", 10.9, 10.9, 10.6, 10.67, 1_000_000.0, 10_150_000.0, 0.005]],
+            columns=COLS)
+        self.assertGreater(math.log2(1.10), 0.1309)          # 旧腿确实会误判
+        self.assertLess(math.log2(1.10), basis_seam_limit_step("000001"))
+        raise_mask, hold_mask, reasons = detect_basis_seam(
+            existing, incoming, source="t", symbol="000001")
+        self.assertEqual(int(raise_mask.sum()), 0)
+        self.assertEqual(int(hold_mask.sum()), 0)
+        self.assertEqual(reasons, [])
+
+    def test_seam_hold_writes_trace_line(self):
+        # B3 裁决 3：hold 也必须留痕（append_seam_guard_trace → seam-guard.log）。
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "seam-guard.log"
+            original = price_guards.SEAM_GUARD_LOG
+            price_guards.SEAM_GUARD_LOG = log
+            try:
+                append_seam_guard_trace({
+                    "ts": "2026-10-10T00:00:00Z", "symbol": "000001",
+                    "date": "2026-09-30", "decision": "hold",
+                    "close_step": 0.2453, "vwap_step": 0.0209,
+                    "limit_step": 0.1635,
+                })
+            finally:
+                price_guards.SEAM_GUARD_LOG = original
+            self.assertTrue(log.exists())
+            rec = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(rec["decision"], "hold")
+            self.assertEqual(rec["symbol"], "000001")
+            self.assertEqual(rec["limit_step"], 0.1635)
+        self.assertTrue(str(SEAM_GUARD_LOG).replace("\\", "/").endswith("logs/seam-guard.log"))
 
 
 if __name__ == "__main__":
