@@ -13,11 +13,28 @@ import pandas as pd
 IMPLIED_DEVIATION_THRESHOLD = 0.25
 OVERNIGHT_GAP_THRESHOLD = 0.30
 # 拼接基准探测（2026-10-10 T1）：只看 merge seam，用「复权收盘台阶 + 原始 VWAP 连续」
-# 判别基准/口径切换。BASIS_SEAM_STEP 由全市场 seam 扫描选定（见不变量 §3）。
-BASIS_SEAM_STEP = 0.25
+# 判别基准/口径切换。close 台阶需超过该板块日涨跌幅（board limit，见下），
+# VWAP 平坦用独立的 BASIS_SEAM_VWAP_FLAT_TOL（不能用 close 阈值，否则普通
+# 5-15% 的 VWAP 波动会被当成「平」）。阈值由全市场 seam 扫描选定（见不变量 §3）。
+BASIS_SEAM_VWAP_FLAT_TOL = 0.02
 BASIS_SEAM_PERSIST_TOL = 0.05
 BASIS_SEAM_MIN_HISTORY = 20
 BASIS_SEAM_BASELINE_ROWS = 60
+# 板块日涨跌幅上限（与 qlib_model.limit_up_threshold 同口径，留 0.5% 取整容差）。
+BASIS_SEAM_LIMIT_MAIN = 0.095
+BASIS_SEAM_LIMIT_GROWTH = 0.195
+BASIS_SEAM_LIMIT_BJ = 0.295
+
+
+def basis_seam_limit(symbol=""):
+    """Return the board daily price limit for ``symbol`` (decimal)."""
+    name = str(symbol).strip().upper()
+    bare = name[2:] if name[:2] in {"SH", "SZ", "BJ"} else name
+    if name.startswith("BJ") or bare.startswith(("92", "43", "83", "87", "4")):
+        return BASIS_SEAM_LIMIT_BJ
+    if bare.startswith(("300", "301", "688", "689")):
+        return BASIS_SEAM_LIMIT_GROWTH
+    return BASIS_SEAM_LIMIT_MAIN
 THS_TIMEOUT_SECONDS = 20
 THS_CONFLICT_THRESHOLD = 0.20
 THS_LOOKBACK_DAYS = 5
@@ -609,8 +626,8 @@ def detect_basis_seam(existing, incoming, *, source="", symbol=""):
 
     ``existing``/``incoming`` 为已规范化的日线帧（date/close/amount/volume）。
     只判定 incoming 行，与紧邻的前一行比较。判别器：复权收盘出现台阶
-    （``|log2(close_i/close_{i-1})| > BASIS_SEAM_STEP``）而按单位修正后的原始
-    VWAP（amount/volume）保持连续（``vwap_step <= BASIS_SEAM_STEP``）→ 基准/
+    （``|log2(close_i/close_{i-1})|`` 超过该板块日涨跌幅）而按单位修正后的原始
+    VWAP（amount/volume）保持平坦（``vwap_step <= BASIS_SEAM_VWAP_FLAT_TOL``）→ 基准/
     口径切换；真除权/真涨跌停时 VWAP 与 close 同步移动，不发射。
     返回 ``(raise_mask, hold_mask, reasons)``，均与 incoming 对齐：
     - ``raise_mask``：已确认的台阶首行（新收盘水平延续到下一行，或本行有下一
@@ -633,9 +650,9 @@ def detect_basis_seam(existing, incoming, *, source="", symbol=""):
         if pair is None:
             continue
         close_step, vwap_step, fix = pair
-        if close_step <= BASIS_SEAM_STEP:
+        if close_step <= basis_seam_limit(symbol):
             continue
-        if vwap_step > BASIS_SEAM_STEP:
+        if vwap_step > BASIS_SEAM_VWAP_FLAT_TOL:
             continue
         nxt = steps[pos + 1][1] if pos + 1 < len(steps) else None
         if nxt is None:
