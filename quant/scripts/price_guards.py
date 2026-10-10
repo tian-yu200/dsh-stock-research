@@ -27,6 +27,10 @@ THS_VOLUME_SCALES = (1.0, 100.0)
 THS_AMOUNT_SCALES = (1.0, 0.001)
 THS_TURNOVER_SCALES = (0.01, 1.0, 0.0001)
 THS_CONFLICT_LOG = Path(__file__).resolve().parents[1] / "logs" / "ths-conflicts.log"
+# Rotation cap: when the conflict log exceeds this size it is renamed to
+# <name>.1 (replacing any old .1) before the next append, inside the same
+# silent try -- the evidence file must never grow unbounded.
+THS_CONFLICT_LOG_MAX_BYTES = 5 * 1024 * 1024
 def _num(s):
     return pd.to_numeric(s, errors="coerce")
 def implied_ratio(frame):
@@ -256,11 +260,17 @@ def _append_ths_conflict(record):
     """
     try:
         line = json.dumps(record, ensure_ascii=True, default=str)
+        path = Path(THS_CONFLICT_LOG)
         try:
-            Path(THS_CONFLICT_LOG).parent.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        with open(THS_CONFLICT_LOG, "a", encoding="utf-8") as fh:
+        try:
+            if path.exists() and path.stat().st_size > THS_CONFLICT_LOG_MAX_BYTES:
+                path.replace(path.with_name(path.name + ".1"))
+        except Exception:
+            pass
+        with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except Exception:
         pass
@@ -270,8 +280,18 @@ def _ths_segment_evidence(out, pos):
     """(implied_factor_ref, shares_ref) from same-segment local rows.
 
     implied factor = close*volume/amount on the LOCAL series: the anchor that
-    a converted THS row must reproduce. shares_ref = volume/turnover gives the
-    total-share scale both series must agree on (proves the turnover unit).
+    a converted THS row must reproduce.
+    shares_ref = volume/turnover is only the local series' own
+    volume-to-turnover scale, used to pin the THS kv/kt ratio against local
+    convention -- it is NOT the share count. UNIT_CONTRACT (market_data.py)
+    declares volume=shares, turnover=decimal-fraction, but on real repo data
+    volume/turnover = total shares / 100 (000001 2026-09-23:
+    906726/0.0047 = 1.93e8 vs ~19.3e9 true shares), i.e. stored volume
+    behaves as 手 despite the declared contract. So neither leg proves
+    absolute units: combined they are a relative convention check that is
+    fail-closed -- on real THS /01 rows (unadjusted basis) the implied-factor
+    leg fails and _ths_conversion_proof returns None by design; local scale
+    errors are remediated by full single-source refetch, never by patching.
     The target row itself (pos) is excluded so its own corruption cannot
     become its own reference.
     """
@@ -308,7 +328,9 @@ def _ths_conversion_proof(t, out, pos, *, tolerance=THS_FACTOR_TOLERANCE):
        same-segment factor within tolerance -- this pins the adjustment
        basis AND the volume/amount units together;
     2. converted volume/turnover reproduces the local shares-ref scale
-       within tolerance -- an independent pin on the turnover unit;
+       within tolerance -- an independent pin on the THS volume/turnover
+       ratio against local convention (a relative check only; ref_shares is
+       not the share count, see _ths_segment_evidence);
     3. re-check: implied factor of the fully converted row vs the local
        reference (the requirement's literal check).
     """
