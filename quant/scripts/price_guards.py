@@ -15,8 +15,14 @@ OVERNIGHT_GAP_THRESHOLD = 0.30
 # 拼接基准探测（2026-10-10 T1）：只看 merge seam，用「复权收盘台阶 + 原始 VWAP 连续」
 # 判别基准/口径切换。close 台阶需超过该板块日涨跌幅（board limit，见下），
 # VWAP 平坦用独立的 BASIS_SEAM_VWAP_FLAT_TOL（不能用 close 阈值，否则普通
-# 5-15% 的 VWAP 波动会被当成「平」）。阈值由全市场 seam 扫描选定（见不变量 §3）。
-BASIS_SEAM_VWAP_FLAT_TOL = 0.02
+# 5-15% 的 VWAP 波动会被当成「平」）。
+# 容差 0.05（2026-10-10 T1 复审 B1/B2 裁决，原 0.02 在被侵蚀的生产形态上漏报：
+# 000001 的 09-24→09-30 缺行缝 vwap_step=0.0209、09-30→10-08 为 0.0287，均恰过 0.02）：
+# close 腿已用板块日涨跌幅把真行情排除在外——close 台阶超过日限只可能出现在
+# 上市首日/复牌（此时 VWAP 移动远大于 5%，不会被当成「平」），除权日在 hfq 下
+# close 不跳、更不会触发 close 腿。因此 0.05 只放宽 VWAP 侧的缺行形变容差，
+# 不放进来任何真实涨跌（全市场生产形态扫描：raise 8 / hold 26，见不变量 §3）。
+BASIS_SEAM_VWAP_FLAT_TOL = 0.05
 BASIS_SEAM_PERSIST_TOL = 0.05
 BASIS_SEAM_MIN_HISTORY = 20
 BASIS_SEAM_BASELINE_ROWS = 60

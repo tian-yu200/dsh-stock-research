@@ -18,7 +18,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from fetch_utils import BaselineDiscontinuityError, merge_daily_frames
 from market_data import UNIT_CONTRACT, normalize_daily_bars
-from price_guards import UNIT_BIG_HI, UNIT_JUMP_HI, UNIT_JUMP_LO, detect_unit_breaks
+from price_guards import (
+    UNIT_BIG_HI,
+    UNIT_JUMP_HI,
+    UNIT_JUMP_LO,
+    BASIS_SEAM_VWAP_FLAT_TOL,
+    basis_seam_limit_step,
+    detect_basis_seam,
+    detect_unit_breaks,
+)
 
 COLS = ["date", "open", "high", "low", "close", "volume", "amount", "turnover"]
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "unit_guard"
@@ -302,6 +310,73 @@ class UnitGuardTests(unittest.TestCase):
             incoming = normalize_daily_bars(pd.DataFrame([up]), source="t")
             result = merge_daily_frames(csv_path, incoming, source="t")
             self.assertIn("2026-09-04", set(result["date"].astype(str)))
+
+
+    def test_seam_prod_shape_000001_0924_to_0930_same_level_confirmation_raises(self):
+        # B1 生产形态回归：fixture = 000001 主 CSV 末 40 行（09-28/09-29 已删，
+        # 无隔离区行拼回）+ 下一波真实行 10-08/10-09。
+        # (a) existing 截到 09-24，incoming 09-30 + 同水位佐证行：
+        # close_step=0.2453 > 板限 0.1309，vwap_step=0.0209 <= 0.05（旧 0.02 漏报）
+        # → 下一行同水位持久 → raise，不得静默写入。
+        self.assertEqual(BASIS_SEAM_VWAP_FLAT_TOL, 0.05)
+        df = pd.read_csv(FIXTURES / "000001_prod_shape.csv")
+        existing = df[df["date"] <= "2026-09-24"].reset_index(drop=True)
+        inc930 = df[df["date"] == "2026-09-30"].reset_index(drop=True)
+        self.assertGreaterEqual(len(existing), 20)
+        confirm = inc930.iloc[0].copy()
+        confirm["date"] = "2026-10-05"  # 同水位佐证行（该水位无真实下一行，克隆 09-30 行）
+        incoming = pd.concat([inc930, pd.DataFrame([confirm])], ignore_index=True)
+        raise_mask, hold_mask, reasons = detect_basis_seam(
+            existing, incoming, source="t", symbol="000001")
+        self.assertEqual(int(raise_mask.sum()), 1)
+        self.assertEqual(int(hold_mask.sum()), 0)
+        self.assertEqual(reasons[0]["date"], "2026-09-30")
+        self.assertGreater(reasons[0]["close_step"], basis_seam_limit_step("000001"))
+        self.assertLessEqual(reasons[0]["vwap_step"], BASIS_SEAM_VWAP_FLAT_TOL)
+
+    def test_seam_prod_shape_000001_1008_after_erasured_history_raises(self):
+        # (b) existing 截到 09-30（09-24→09-30 缝在历史内部，永不发射），
+        # incoming = 下一波真实抓取的 10-08/10-09：
+        # close_step=0.2905 > 0.1309、vwap_step=0.0287 <= 0.05、10-09 同水位
+        # 持久（log2=0.0178 <= 0.05）→ raise，不得静默拼接。
+        df = pd.read_csv(FIXTURES / "000001_prod_shape.csv")
+        existing = df[df["date"] <= "2026-09-30"].reset_index(drop=True)
+        incoming = df[df["date"] >= "2026-10-08"].reset_index(drop=True)
+        raise_mask, hold_mask, reasons = detect_basis_seam(
+            existing, incoming, source="t", symbol="000001")
+        self.assertEqual(int(raise_mask.sum()), 1)
+        self.assertEqual(int(hold_mask.sum()), 0)
+        self.assertEqual(reasons[0]["date"], "2026-10-08")
+        self.assertGreater(reasons[0]["close_step"], basis_seam_limit_step("000001"))
+        self.assertLessEqual(reasons[0]["vwap_step"], BASIS_SEAM_VWAP_FLAT_TOL)
+
+    def test_seam_000875_fixture_history_cutoff_raises(self):
+        # 000875 夹具 seam 测试保留：历史段 <09-04 / incoming >=09-04，
+        # 段级断裂（close_step 0.5355，VWAP 平 0.0028）→ raise 1 / hold 0。
+        df = pd.read_csv(FIXTURES / "000875_shape.csv")
+        existing = df[df["date"] < "2026-09-04"].reset_index(drop=True)
+        incoming = df[df["date"] >= "2026-09-04"].reset_index(drop=True)
+        self.assertGreaterEqual(len(existing), 20)
+        raise_mask, hold_mask, reasons = detect_basis_seam(
+            existing, incoming, source="t", symbol="000875")
+        self.assertEqual(int(raise_mask.sum()), 1)
+        self.assertEqual(int(hold_mask.sum()), 0)
+
+    def test_seam_real_limitup_plus10_vwap_plus8_no_raise_no_hold(self):
+        # 真 +10% 涨停日（close log2(1.10)=0.1375 > 板限 0.1309）且 VWAP 只动
+        # +8%（log2=0.111 > 容差 0.05）→ 不是候选：不得 raise、不得 hold。
+        dates = pd.bdate_range("2026-08-03", periods=25).strftime("%Y-%m-%d").tolist()
+        rows = [[d, 10.0, 10.0, 10.0, 10.0, 1_000_000.0, 10_000_000.0, 0.005]
+                for d in dates]
+        existing = pd.DataFrame(rows, columns=COLS)
+        incoming = pd.DataFrame(
+            [["2026-09-07", 10.0, 11.0, 10.0, 11.0,
+              1_000_000.0, 10_800_000.0, 0.005]], columns=COLS)
+        raise_mask, hold_mask, reasons = detect_basis_seam(
+            existing, incoming, source="t", symbol="000001")
+        self.assertEqual(int(raise_mask.sum()), 0)
+        self.assertEqual(int(hold_mask.sum()), 0)
+        self.assertEqual(reasons, [])
 
 
 if __name__ == "__main__":
