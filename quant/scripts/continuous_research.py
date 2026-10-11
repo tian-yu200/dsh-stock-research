@@ -36,6 +36,7 @@ from assistant.paths import atomic_write_json, read_json, run_directory
 from assistant.research import run_research
 from fetch_state import FetchState, parse_iso, iso_now, process_alive
 from fetch_targets import asset_target_dates
+from fetch_utils import install_request_timeout
 from trading_calendar import resolve_trading_day
 
 
@@ -60,6 +61,10 @@ WORKER_LOG_DIR = CONTINUOUS_DIR / "workers"
 # 实证：fetch+qlib 约 10min，分析 58min 未完），故提到 7200s。
 WORKER_TIME_BUDGET_SECONDS = 7200
 WORKER_WALL_TIMEOUT_SECONDS = 8400
+# 单次 HTTP 请求超时（与 fetcher 的 --request-timeout 默认值一致）。
+# 调度器自己也走网络（_refresh_calendar_dates -> trading_calendar -> ak
+# 裸 requests.get），必须安装全局超时，否则一次卡死会阻塞 IgnoreNew 任务。
+REQUEST_TIMEOUT_SECONDS = 30.0
 STALE_AFTER_SECONDS = 21600
 LONG_STALE_EXTRA_DAYS = 20
 LONG_STALE_RETRY_INTERVAL_SECONDS = 6 * 60 * 60
@@ -1744,6 +1749,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 调度器自身的网络调用（日历刷新等）必须有超时：akshare 裸 requests.get
+    # 无 timeout，一次卡死会阻塞 IgnoreNew 任务（hang-rca.md §2.2 / T9b）。
+    install_request_timeout(REQUEST_TIMEOUT_SECONDS)
     args = _parser().parse_args(argv)
     try:
         if args.action in {"once", "start"}:

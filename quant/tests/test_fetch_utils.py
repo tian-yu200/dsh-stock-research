@@ -96,23 +96,24 @@ class RequestTimeoutTests(unittest.TestCase):
         self.server = _NeverReplyServer()
         self.addCleanup(self.server.close)
         requests.sessions.Session.request = _ORIGINAL_REQUEST
-
-    def tearDown(self) -> None:
-        requests.sessions.Session.request = _ORIGINAL_REQUEST
+        # N3: restore via addCleanup so a mid-test failure cannot leak the patch.
+        self.addCleanup(lambda: setattr(
+            requests.sessions.Session, "request", _ORIGINAL_REQUEST))
 
     def _url(self) -> str:
         return "http://127.0.0.1:%d/slow" % self.server.port
 
     def test_explicit_none_timeout_is_overridden(self) -> None:
         # RED before the fix: the request blocks forever (finished=False).
-        install_request_timeout(2.0)
+        # N4: install 1.0 with a loose bound so load jitter cannot flip it red.
+        install_request_timeout(1.0)
         start = time.monotonic()
         _, exc, finished = _call_bounded(
             lambda: requests.get(self._url(), timeout=None), limit=10.0)
         elapsed = time.monotonic() - start
         self.assertTrue(finished, "request blocked: timeout not applied")
         self.assertIsInstance(exc, requests.exceptions.ReadTimeout)
-        self.assertLess(elapsed, 3.5)
+        self.assertLess(elapsed, 4.0)
 
     def test_explicit_numeric_timeout_not_overridden(self) -> None:
         install_request_timeout(30.0)
@@ -139,3 +140,24 @@ class RequestTimeoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContinuousResearchEntryTests(unittest.TestCase):
+    """T9b: the scheduler entry point must install the request timeout."""
+
+    def setUp(self) -> None:
+        requests.sessions.Session.request = _ORIGINAL_REQUEST
+        self.addCleanup(lambda: setattr(
+            requests.sessions.Session, "request", _ORIGINAL_REQUEST))
+
+    def test_main_installs_request_timeout(self) -> None:
+        from unittest import mock
+        import continuous_research as cr
+
+        # Bypass the action handler so no config/DB/network work happens.
+        with mock.patch.object(cr, "status", return_value={}):
+            rc = cr.main(["--action", "status"])
+        self.assertEqual(rc, 0)
+        wrapper = requests.sessions.Session.request
+        self.assertTrue(getattr(wrapper, "_dsh_timeout_wrapper", False),
+                        "continuous_research.main did not install the request timeout")
