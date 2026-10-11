@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -1073,6 +1073,265 @@ class ContinuousResearchTests(unittest.TestCase):
             {"name": "\u05e5"},
         )
 
+    # --- T14: partial 作业被更新交易日取代（sched-stuck-rca 2026-10-12）---
+
+    NEWER_DATE = "2026-08-27"
+    NEW_JOB_ID = "20260827T100000Z-00000002"
+
+    def _patch_calendar(self, stack: ExitStack, **overrides: object) -> Mock:
+        payload = {
+            "status": "ok",
+            "date": self.NEWER_DATE,
+            "is_trading_day": True,
+            "is_month_end_trading_day": False,
+            "source": "test",
+        }
+        payload.update(overrides)
+        return stack.enter_context(
+            patch.object(continuous, "_calendar_today", return_value=payload)
+        )
+
+    def test_partial_job_superseded_by_newer_trading_day(self) -> None:
+        """partial + 更新交易日：旧作业按 superseded 收尾，新作业为该交易日创建。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-supersede-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state,
+                    environment["run_root"],
+                    status="partial",
+                )
+                calendar = self._patch_calendar(stack)
+
+                def create_job(**kwargs: object) -> dict[str, str]:
+                    self._create_job(
+                        state,
+                        environment["run_root"],
+                        status="queued",
+                        job_id=self.NEW_JOB_ID,
+                        target_date=self.NEWER_DATE,
+                    )
+                    return {"status": "queued", "job_id": self.NEW_JOB_ID}
+
+                create = stack.enter_context(
+                    patch.object(continuous, "run_research", side_effect=create_job)
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=601,
+                        returncode=0,
+                        timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                result = continuous.run_once(worker_runner=worker)
+
+            # 日历只取一次（取代分支与新作业分支复用同一份）
+            calendar.assert_called_once()
+            # 新作业按更新交易日创建
+            create.assert_called_once_with(
+                mode="daily",
+                asset_scope="all",
+                symbols=None,
+                _target_date=self.NEWER_DATE,
+                _start_background_worker=False,
+            )
+            self.assertEqual(result["run_id"], self.NEW_JOB_ID)
+            worker.assert_called_once_with(self.NEW_JOB_ID, ANY)
+            # 旧作业：completed 终态 + completion 块 + metadata 保留
+            old_job = state.get_job(JOB_ID)
+            assert old_job is not None
+            self.assertEqual(old_job["status"], "completed")
+            self.assertIsNotNone(old_job.get("finished_at"))
+            metadata = json.loads(old_job["metadata"]) if isinstance(
+                old_job["metadata"], str
+            ) else old_job["metadata"]
+            self.assertEqual(metadata["mode"], "daily")
+            self.assertEqual(metadata["asset_scope"], "all")
+            self.assertEqual(metadata["target_date"], TARGET_DATE)
+            self.assertEqual(
+                metadata["asset_types"], ["stock", "etf", "otc_fund"]
+            )
+            self.assertIn("symbols", metadata)
+            completion = metadata["completion"]
+            self.assertEqual(
+                completion["reason"], "superseded_by_newer_trading_day"
+            )
+            self.assertEqual(completion["target_date"], TARGET_DATE)
+            self.assertIn("completed_at", completion)
+            self.assertIn("coverage", completion)
+            self.assertIn("exempted_failed", completion)
+            self.assertIn("exempted_pending", completion)
+            new_job = state.get_job(self.NEW_JOB_ID)
+            assert new_job is not None
+            self.assertIn(new_job["status"], {"queued", "running"})
+
+    def test_partial_job_resumed_on_non_trading_day(self) -> None:
+        """非交易日：partial 作业照旧 resume，不得取代。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-nontt-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state, environment["run_root"], status="partial"
+                )
+                self._patch_calendar(stack, is_trading_day=False)
+                create = stack.enter_context(
+                    patch.object(continuous, "run_research", Mock())
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=602, returncode=0, timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                result = continuous.run_once(worker_runner=worker)
+            create.assert_not_called()
+            self.assertEqual(result["run_id"], JOB_ID)
+            old_job = state.get_job(JOB_ID)
+            assert old_job is not None
+            self.assertNotEqual(old_job["status"], "completed")
+
+    def test_partial_job_resumed_on_same_date(self) -> None:
+        """日历日期与作业目标同日：照旧 resume。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-sameday-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state, environment["run_root"], status="partial"
+                )
+                self._patch_calendar(stack, date=TARGET_DATE)
+                create = stack.enter_context(
+                    patch.object(continuous, "run_research", Mock())
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=603, returncode=0, timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                result = continuous.run_once(worker_runner=worker)
+            create.assert_not_called()
+            self.assertEqual(result["run_id"], JOB_ID)
+            old_job = state.get_job(JOB_ID)
+            assert old_job is not None
+            self.assertNotEqual(old_job["status"], "completed")
+
+    def test_queued_and_running_jobs_not_superseded(self) -> None:
+        """queued/running 作业即使目标日更旧也不得被取代。"""
+        for status_value in ("queued", "running"):
+            with self.subTest(status=status_value):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"continuous-t14-{status_value}-",
+                    dir=ROOT / "tests",
+                ) as directory:
+                    root = pathlib.Path(directory)
+                    state = FetchState(root / "state.sqlite3")
+                    with ExitStack() as stack:
+                        environment = self._environment(stack, root, state)
+                        self._create_job(
+                            state,
+                            environment["run_root"],
+                            status=status_value,
+                        )
+                        self._patch_calendar(stack)
+                        create = stack.enter_context(
+                            patch.object(continuous, "run_research", Mock())
+                        )
+                        worker = Mock(
+                            return_value=continuous.WorkerOutcome(
+                                pid=604, returncode=0, timed_out=False,
+                                duration_seconds=1.0,
+                            )
+                        )
+                        result = continuous.run_once(worker_runner=worker)
+                    create.assert_not_called()
+                    self.assertEqual(result["run_id"], JOB_ID)
+                    old_job = state.get_job(JOB_ID)
+                    assert old_job is not None
+                    self.assertNotEqual(old_job["status"], "completed")
+
+    def test_explicit_job_id_never_superseded(self) -> None:
+        """显式 --job-id：即使 partial + 更新交易日也只 resume。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-explicit-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state, environment["run_root"], status="partial"
+                )
+                self._patch_calendar(stack)
+                create = stack.enter_context(
+                    patch.object(continuous, "run_research", Mock())
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=605, returncode=0, timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                result = continuous.run_once(
+                    job_id=JOB_ID, worker_runner=worker
+                )
+            create.assert_not_called()
+            self.assertEqual(result["run_id"], JOB_ID)
+            old_job = state.get_job(JOB_ID)
+            assert old_job is not None
+            self.assertNotEqual(old_job["status"], "completed")
+
+    def test_partial_job_resumed_on_calendar_error(self) -> None:
+        """日历错误：partial 作业照旧 resume，不得取代。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-calerr-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state, environment["run_root"], status="partial"
+                )
+                self._patch_calendar(
+                    stack,
+                    status="error",
+                    is_trading_day=False,
+                    error="calendar unavailable",
+                )
+                create = stack.enter_context(
+                    patch.object(continuous, "run_research", Mock())
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=606, returncode=0, timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                result = continuous.run_once(worker_runner=worker)
+            create.assert_not_called()
+            self.assertEqual(result["run_id"], JOB_ID)
+            old_job = state.get_job(JOB_ID)
+            assert old_job is not None
+            self.assertNotEqual(old_job["status"], "completed")
+
 
 class QueuedTargetDateTests(unittest.TestCase):
     def test_new_target_date_does_not_reuse_old_queued_job(self) -> None:
@@ -1271,6 +1530,7 @@ class PostCloseTests(unittest.TestCase):
         self.assertFalse(continuous._process_exists(999_999_999))
         self.assertFalse(continuous._process_exists(0))
         self.assertFalse(continuous._process_exists(None))
+
 
 
 if __name__ == "__main__":

@@ -1117,6 +1117,57 @@ def _calendar_today(logger: logging.Logger) -> dict[str, Any]:
     return value
 
 
+def _supersede_partial_job_if_newer_trading_day(
+    state: FetchState,
+    job: dict[str, Any],
+    calendar: dict[str, Any],
+    config: dict[str, Any],
+    logger: logging.Logger,
+) -> bool:
+    """partial 作业 + 已到更新交易日 → 按 target_completed 同款终态收尾（T14）。
+
+    收尾语义必须与 target_completed 分支一致：
+      · status='completed'（非 resumable 终态，下一 tick 不再被捡回）；
+      · finished_at 为 ISO 字符串（库内时间列为 ISO 文本，CAS 是字符串比对）；
+      · metadata 整包替换 → 必须先复制旧 metadata 再加 completion 块，否则会
+        擦掉 target_date / asset_types / asset_scope / symbols（_job_target、
+        _job_asset_types 都依赖它们）；
+      · completion.reason = 'superseded_by_newer_trading_day'。
+    不改动 completion_coverage_floor 或任何阈值语义——这只解决"partial 永不
+    收尾、新交易日永远排不上队"的调度死锁（sched-stuck-rca 2026-10-12）。
+    """
+    if calendar.get("status") != "ok" or not calendar.get("is_trading_day"):
+        return False
+    old_target = str(_job_target(job) or "")
+    calendar_date = str(calendar.get("date") or "")
+    if not old_target or not calendar_date or calendar_date <= old_target:
+        return False
+    progress = _job_progress(state, job, config)
+    completion_metadata = dict(_job_metadata(job))
+    completion_metadata["completion"] = {
+        "completed_at": _now().isoformat(),
+        "target_date": old_target,
+        "coverage": round(float(progress.get("coverage") or 0.0), 6),
+        "exempted_failed": int(progress.get("failed") or 0),
+        "exempted_pending": int(progress.get("pending") or 0),
+        "reason": "superseded_by_newer_trading_day",
+    }
+    state.update_job(
+        str(job["job_id"]),
+        status="completed",
+        finished_at=_now().isoformat(),
+        coverage=float(progress.get("coverage") or 0.0),
+        last_error=None,
+        metadata=completion_metadata,
+    )
+    _high_alert(
+        logger,
+        f"partial 作业 {job['job_id']} 目标日 {old_target} 已被更新交易日 "
+        f"{calendar_date} 取代；旧作业按 completed 收尾，新交易日作业继续创建",
+    )
+    return True
+
+
 def run_once(
     *,
     job_id: str | None = None,
@@ -1173,6 +1224,25 @@ def run_once(
             _log_progress(logger, status)
             return status
 
+        calendar: dict[str, Any] | None = None
+        if (
+            job_id is None
+            and existing_job is not None
+            and str(existing_job.get("status")) == "partial"
+        ):
+            # 2026-10-12 T14（sched-stuck-rca）：partial 表示研究已发布成功，只是
+            # 覆盖率低于 completion_coverage_floor（如节后 741 只定开债基净值滞后）。
+            # 此时若交易日历已推进到**更新的交易日**，继续 resume 只会让 claim_due
+            # 永远按旧 target 认领（data_end < target 永真），新交易日作业永远排不
+            # 上队。仅 AUTOMATIC 模式（--job-id 未指定）且状态为 partial 时收尾旧
+            # 作业并让新作业分支继续；queued/running、显式 --job-id、非交易日、
+            # 日历错误、同日或更旧日期一律保持原 resume 行为。
+            calendar = _calendar_today(logger)
+            if _supersede_partial_job_if_newer_trading_day(
+                state, existing_job, calendar, config, logger
+            ):
+                existing_job = None
+
         if existing_job:
             target_date = str(_job_target(existing_job))
             mode = str(_job_metadata(existing_job).get("mode") or "daily")
@@ -1189,7 +1259,10 @@ def run_once(
                 existing_job.get("asset_scope"),
             )
         else:
-            calendar = _calendar_today(logger)
+            # T14：partial 被取代时日历已在上面取过，禁止重复调用（同一 tick 内
+            # 日历必须是同一份）。
+            if calendar is None:
+                calendar = _calendar_today(logger)
         if not existing_job and (
             calendar.get("status") != "ok"
             or not calendar.get("is_trading_day")
