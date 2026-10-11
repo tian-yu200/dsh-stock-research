@@ -7,6 +7,10 @@ import pandas as pd
 
 DAILY_COLUMNS = ("date", "open", "high", "low", "close", "volume", "amount", "turnover")
 REQUIRED_COLUMNS = ("date", "open", "high", "low", "close", "volume")
+# 非空契约：date + OHLC 必须非空；volume 允许 NaN（T1 单位修复“不发明成交量”的
+# 语义会把不可证实的 volume/turnover 置 NaN 并保留 OHLC），amount/turnover 本就
+# 可选。见不变量 §3 的 volume-may-be-NaN 条目。
+REQUIRED_NON_NULL_COLUMNS = ("date", "open", "high", "low", "close")
 
 # 单位契约（2026-08-28 volume/turnover 单位口径切换事故后立约，见
 # quant/logs/codex-runs/step0f-unit-residual-verify.md）。
@@ -78,8 +82,11 @@ def _canonical_name(value: object) -> str:
 def normalize_daily_bars(frame: pd.DataFrame, *, source: str = "unknown") -> pd.DataFrame:
     """Return sorted, duplicate-free bars with one stable cross-source schema.
 
-    Price and volume fields are required. Amount and turnover are optional and are
-    represented by ``NaN`` when an upstream source does not provide them.
+    ``date`` + OHLC are required and must be non-null. ``volume`` is optional and
+    may be ``NaN`` (T1 unit repair keeps OHLC and sets an unprovable volume to
+    NaN rather than inventing it); a non-NaN volume must be non-negative.
+    ``amount`` and ``turnover`` are optional and are represented by ``NaN`` when
+    an upstream source does not provide them.
 
     Unit contract (see UNIT_CONTRACT): downstream CSVs use volume in shares
     (股) and turnover as a decimal fraction (小数). A single snapshot cannot
@@ -189,16 +196,16 @@ def normalize_daily_bars(frame: pd.DataFrame, *, source: str = "unknown") -> pd.
                 f"{source}: all {dropped} rows had non-positive prices"
             )
 
-    invalid_required = data.loc[:, REQUIRED_COLUMNS[1:]].isna().any(axis=1)
+    invalid_required = data.loc[:, REQUIRED_NON_NULL_COLUMNS[1:]].isna().any(axis=1)
     if invalid_required.any():
         invalid_count = int(invalid_required.sum())
         raise DailyBarSchemaError.for_source(
             source,
-            f"{invalid_count} rows have missing OHLCV values",
+            f"{invalid_count} rows have missing OHLC values",
             failure_class="invalid_required_values",
             field_anomalies={
                 column: {"invalid_rows": int(data[column].isna().sum())}
-                for column in REQUIRED_COLUMNS[1:]
+                for column in REQUIRED_NON_NULL_COLUMNS[1:]
                 if data[column].isna().any()
             },
         )
