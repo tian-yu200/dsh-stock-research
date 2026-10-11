@@ -121,10 +121,27 @@ def implied_ratio(frame):
     implied = amt / vol.replace(0, pd.NA)
     return implied / close.replace(0, pd.NA)
 def gap_threshold_for(symbol=""):
-    s = str(symbol or "")
+    s = str(symbol or "").strip()
+    # 防御：兼容 fetch_state 资产键（etf_588000）与带交易所前缀的形式（sh510300）。
+    # 裸 6 位代码（生产主路径 fetch_utils.py:320 传的是 CSV 文件名 stem）不受影响。
+    if s.lower().startswith("etf_"):
+        s = s[4:]
+    if s[:2].upper() in {"SH", "SZ", "BJ"}:
+        s = s[2:]
     if s[:1] in ("4", "8") or s[:2] == "92":
         return 0.33
     if s[:1] == "3" or s.startswith("688"):
+        return 0.23
+    # 2026-10-11 T10：SH/SZ 基金代码族（沪市 50/51/52/56/58 + 深市 15/16/18）
+    # 用 0.23。ETF 的代码前缀**看不出**标的板块（159 段同时覆盖创业板 20%、
+    # 沪深300 10% 与债券），故统一取创业板/科创板的 20% 留余量值，而不是按
+    # 前缀细分。根因见 quant/logs/codex-runs/etf-discont-rca.md：2024-10-08/09
+    # 是创业板/科创板 20% 涨跌停的真实行情日，125 行标记里 71 行落在
+    # (0.13, 0.20]、54 行 > 0.20；旧 0.13 门槛把真行情判成尺度断裂 → 全量重取
+    # 拿到同一个上游序列 → 再拒写，83 只 ETF 永不收敛。
+    # 已知残余：跨境/QDII（513 段，无涨跌停）真实 >23% 跳空仍会 raise，
+    # 属已披露的后续细化项，不在本次范围。
+    if s[:2] in {"15", "16", "18", "50", "51", "52", "56", "58"}:
         return 0.23
     if s:
         return 0.13
