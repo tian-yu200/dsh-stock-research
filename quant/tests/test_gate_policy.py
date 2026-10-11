@@ -43,6 +43,7 @@ GATE_KEYS_MUST_MATCH = (
     "max_test_drawdown",
     "max_excess_test_drawdown",
     "max_ic_std",
+    "min_excess_annualized_return",
 )
 
 # 注意：`min_train_l2_improvement` **不属于**上面任何一类——2026-09-11 复核后
@@ -467,7 +468,7 @@ def test_stability_gate_does_not_block_when_check_disabled():
 
 
 def test_stability_gate_is_fail_closed_when_metric_missing():
-    """已启用但取不到有效 ic_std → 判失败，不得静默放行。"""
+    """已启用但取不到有效 ic_std 时判失败，不得静默放行。"""
     gate = {**DEFAULTS["gate"], "max_ic_std": 0.02}
     metrics = {
         "model_available": True,
@@ -479,3 +480,60 @@ def test_stability_gate_is_fail_closed_when_metric_missing():
         "stability_ic_std": None,
     }
     assert model_gate_checks(metrics, gate)["stability_ic_std_threshold"] is False
+
+
+def test_excess_return_gate_passes_positive_excess():
+    """D1：扣费后组合年化收益不得低于等权基准（门槛 0.0，正值放行）。
+
+    T3 口径下生产等价变体 C 实测 excess_annualized_return=+0.0359
+    （net 1.32% vs 基准 -2.27%），必须通过。
+    """
+    gate = {**DEFAULTS["gate"], "min_excess_annualized_return": 0.0}
+    metrics = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+        "benchmark": {"max_drawdown": -0.15, "excess_annualized_return": 0.0359},
+    }
+    assert model_gate_checks(metrics, gate)["excess_return_threshold"] is True
+
+
+def test_excess_return_gate_blocks_negative_excess():
+    """扣费后收益跑输等权基准（-0.001）即阻断发布。"""
+    gate = {**DEFAULTS["gate"], "min_excess_annualized_return": 0.0}
+    metrics = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+        "benchmark": {"max_drawdown": -0.15, "excess_annualized_return": -0.001},
+    }
+    assert model_gate_checks(metrics, gate)["excess_return_threshold"] is False
+
+
+def test_excess_return_gate_is_fail_closed_when_metric_missing():
+    """指标缺失（无 benchmark 段 / excess 缺失或非有限）必须判失败，不得静默放行。"""
+    gate = {**DEFAULTS["gate"], "min_excess_annualized_return": 0.0}
+    base = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+    }
+    assert model_gate_checks(base, gate)["excess_return_threshold"] is False
+    assert (
+        model_gate_checks({**base, "benchmark": {"max_drawdown": -0.15}}, gate)[
+            "excess_return_threshold"
+        ]
+        is False
+    )
+    assert (
+        model_gate_checks(
+            {**base, "benchmark": {"excess_annualized_return": float("nan")}}, gate
+        )["excess_return_threshold"]
+        is False
+    )

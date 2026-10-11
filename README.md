@@ -117,6 +117,7 @@ ack_notification       确认通知
 | `min_mean_rank_ic` | 0.02 | 平均 RankIC 下限 |
 | `min_rank_ic_ir` | 0.10 | RankIC 信息比下限 |
 | `min_top_bottom_excess_return` | 0.00 | 分组多空超额收益下限 |
+| `min_excess_annualized_return` | 0.00 | 扣费后组合年化收益不得低于等权基准（指标缺失时判失败） |
 | `max_excess_test_drawdown` | 0.15 | 策略回撤超出基准的容忍度 |
 | `max_ic_std` | 0.02 | 多窗口 IC 标准差上限（稳定性检查启用时生效） |
 

@@ -53,7 +53,28 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         and abs(float(max_drawdown)) <= drawdown_limit,
         "fit_quality_threshold": fit_quality_ok,
         "stability_ic_std_threshold": _stability_ic_std_check(metrics, gate),
+        # D1(2026-10-11)：扣费后组合年化收益不得低于等权基准。衡量的是
+        # benchmark.excess_annualized_return（生产口径：target 组合 net − 等权
+        # 基准 net）。门槛 0.0 表示"不得跑输基准"，不是关闭开关；指标缺失时
+        # fail-closed，与既有可选门槛（fit_quality 启用态、stability 启用态）
+        # 的缺省语义一致。
+        "excess_return_threshold": _excess_annualized_return_check(metrics, gate),
     }
+
+
+def _excess_annualized_return_check(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> bool:
+    """D1 门槛：net-of-cost 组合年化收益不得低于等权基准（fail-closed）。
+
+    - ``min_excess_annualized_return``（生产值 0.0）是**下限**而非关闭开关：
+      0.0 = 允许持平但不允许跑输基准。
+    - ``benchmark.excess_annualized_return`` 缺失或非有限时判失败，
+      避免"配置了门槛却因缺指标而静默放行"。
+    """
+    excess = (metrics.get("benchmark") or {}).get("excess_annualized_return")
+    if not _finite(excess):
+        return False
+    threshold = float(gate.get("min_excess_annualized_return", 0.0))
+    return float(excess) >= threshold
 
 
 def _stability_ic_std_check(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> bool:

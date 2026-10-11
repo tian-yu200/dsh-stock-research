@@ -155,6 +155,9 @@ DEFAULTS: dict[str, Any] = {
         "min_top_bottom_excess_return": 0.00,
         "max_test_drawdown": 0.25,
         "max_excess_test_drawdown": 0.15,
+        # D1(2026-10-11)：扣费后组合年化收益不得低于等权基准
+        # （benchmark.excess_annualized_return ≥ 0.0；指标缺失时 fail-closed）。
+        "min_excess_annualized_return": 0.0,
         # 多窗口滚动一致性门槛：跨窗口 IC 标准差上限。仅在稳定性检查启用
         # （research.stability_windows 非空）时生效；未启用时不阻断发布。
         "max_ic_std": 0.02,

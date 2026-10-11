@@ -173,6 +173,12 @@ gate:
   min_mean_rank_ic: 0.02
   min_rank_ic_ir: 0.10
   min_top_bottom_excess_return: 0.00
+  # D1(2026-10-11)：扣费后组合年化收益不得低于等权基准。衡量对象为
+  # benchmark.excess_annualized_return（target 组合 net − 等权基准 net）。
+  # 0.0 是下限（允许持平、不允许跑输），不是关闭开关；指标缺失时判失败
+  # （fail-closed）。T3 实证：变体 C 在 25/50bps 下仍为 +0.0359，今日发布不受影响。
+  # 与 config.DEFAULTS 保持一致，由 tests/test_gate_policy.py 锁定。
+  min_excess_annualized_return: 0.0
   # 回测净值最大回撤上限；仅在指标缺少基准回撤时作为兜底绝对上限。
   max_test_drawdown: 0.25
   # 常规口径：约束"策略回撤超出基准等权回撤"的幅度不超过该容忍度。

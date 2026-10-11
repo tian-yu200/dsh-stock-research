@@ -102,6 +102,7 @@ class ResearchMetricTests(unittest.TestCase):
             "rank_ic_ir": 0.11,
             "top_bottom_excess_return": 0.001,
             "test_max_drawdown": -0.20,
+            "benchmark": {"max_drawdown": -0.15, "excess_annualized_return": 0.01},
         }
 
         self.assertTrue(all(model_gate_checks(metrics, DEFAULTS["gate"]).values()))
