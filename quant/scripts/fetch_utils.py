@@ -99,7 +99,11 @@ def install_request_timeout(seconds: float) -> None:
     original = session_class.request
 
     def request_with_timeout(self, method, url, **kwargs):
-        kwargs.setdefault("timeout", float(seconds))
+        # akshare 的东财/腾讯通道显式传 timeout=None；setdefault 对已存在的
+        # None 是 no-op，导致请求永不超时（T2 卡死根因，见 hang-rca.md §5）。
+        # 显式 None 必须被全局超时覆盖；真实数值超时保持不动。
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = float(seconds)
         return original(self, method, url, **kwargs)
 
     request_with_timeout._dsh_timeout_wrapper = True
