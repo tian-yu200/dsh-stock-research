@@ -1171,6 +1171,49 @@ class ContinuousResearchTests(unittest.TestCase):
             assert new_job is not None
             self.assertIn(new_job["status"], {"queued", "running"})
 
+    def test_partial_job_not_superseded_while_live_worker_exists(self) -> None:
+        """T14-N1：partial 作业仍有存活 worker 时不得取代，本轮照旧 resume。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-live-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state, environment["run_root"], status="partial"
+                )
+                self._patch_calendar(stack)
+                stack.enter_context(
+                    patch.object(
+                        continuous,
+                        "_find_live_worker_for_job",
+                        return_value=4242,
+                    )
+                )
+                create = stack.enter_context(
+                    patch.object(
+                        continuous,
+                        "run_research",
+                        side_effect=AssertionError(
+                            "run_research must not be called while resuming"
+                        ),
+                    )
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=607, returncode=0, timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                result = continuous.run_once(worker_runner=worker)
+            create.assert_not_called()
+            self.assertEqual(result["run_id"], JOB_ID)
+            old_job = state.get_job(JOB_ID)
+            assert old_job is not None
+            self.assertNotEqual(old_job["status"], "completed")
+
     def test_partial_job_resumed_on_non_trading_day(self) -> None:
         """非交易日：partial 作业照旧 resume，不得取代。"""
         with tempfile.TemporaryDirectory(

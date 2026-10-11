@@ -1142,6 +1142,17 @@ def _supersede_partial_job_if_newer_trading_day(
     calendar_date = str(calendar.get("date") or "")
     if not old_target or not calendar_date or calendar_date <= old_target:
         return False
+    # T14-N1：该 job 仍有存活 worker 时不得取代——收尾会把正在写的作业行改成
+    # completed 终态，与 worker 的 update_job 竞争。本轮保持 resume，下一轮
+    # worker 退出后再取代。
+    live_worker = _find_live_worker_for_job(str(job["job_id"]))
+    if live_worker is not None:
+        logger.info(
+            "phase=supersede_skip job_id=%s reason=live_worker worker_pid=%s",
+            job["job_id"],
+            live_worker,
+        )
+        return False
     progress = _job_progress(state, job, config)
     completion_metadata = dict(_job_metadata(job))
     completion_metadata["completion"] = {
