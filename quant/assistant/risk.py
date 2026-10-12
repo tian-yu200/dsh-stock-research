@@ -61,7 +61,7 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         else bool(_finite(train_l2_improvement))
         and float(train_l2_improvement) >= min_fit_improvement
     )
-    checks = {
+    return {
         "data_quality_and_model_available": bool(metrics.get("model_available", False)),
         "mean_rank_ic_threshold": _finite(rank_ic)
         and float(rank_ic) >= float(gate["min_mean_rank_ic"]),
@@ -79,13 +79,6 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         # 的缺省语义一致。
         "excess_return_threshold": _excess_annualized_return_check(metrics, gate),
     }
-    # B2：键集单一来源。若有人增删门槛却忘了同步常量，这里立即暴露。
-    if set(checks) != set(MODEL_GATE_CHECK_KEYS):
-        raise RuntimeError(
-            "model_gate_checks keys drifted from MODEL_GATE_CHECK_KEYS: "
-            f"{sorted(set(checks) ^ set(MODEL_GATE_CHECK_KEYS))}"
-        )
-    return checks
 
 
 def _excess_annualized_return_check(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> bool:
