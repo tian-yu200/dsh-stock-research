@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import ANY, Mock, patch
 
 
@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from assistant import paths, research
 from assistant.config import DEFAULTS
 import continuous_research as continuous
-from fetch_state import FetchState
+from fetch_state import FetchState, iso_now
 
 
 TARGET_DATE = "2026-08-26"
@@ -1560,6 +1560,61 @@ class PostCloseTests(unittest.TestCase):
             self.assertEqual(value["trading_date"], "2026-09-04")
             self.assertEqual(value["total_forced"], 1)
             run_once_mock.assert_not_called()
+
+    def test_postclose_reclaims_verified_through_row_same_day(self) -> None:
+        """T16 (hermes A2 端到端): 盘中 bar 被守卫丢弃后 data_end=09-04 而
+        last_success=09-05(verified_through)。postclose 强制后，同一目标日
+        09-05 必须能被 claim_due 重新认领——否则当日完整 bar 只能等次日。"""
+        with tempfile.TemporaryDirectory(prefix="postclose-t16-a2-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.register_assets("stock", ["600000"])
+            state.mark_success("stock", "600000", data_end_date="2026-09-04",
+                               verified_through="2026-09-05",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(root / "fetch_state.sqlite3")
+            with patch.object(continuous, "load_config", return_value=config),                     patch.object(continuous, "_refresh_calendar_dates",
+                                 return_value=["2026-09-04", "2026-09-05"]),                     patch.object(continuous, "run_once") as run_once_mock:
+                value = continuous.run_postclose(run_research_now=False)
+            self.assertEqual(value["trading_date"], "2026-09-05")
+            self.assertEqual(value["total_forced"], 1)
+            run_once_mock.assert_not_called()
+            # 关键断言：同一目标日立即可认领（旧实现 last_success 未回拨 → 0）
+            claimed = state.claim_due("stock", symbols=["600000"], limit=5,
+                                      target_date="2026-09-05", owner="w")
+            self.assertEqual([c["symbol"] for c in claimed], ["600000"])
+            with state._connect() as connection:
+                row = connection.execute(
+                    "SELECT last_success_date FROM assets WHERE symbol='600000'"
+                ).fetchone()
+            self.assertEqual(row[0], "2026-09-04")
+
+    def test_postclose_runs_research_when_only_last_success_blocks(self) -> None:
+        """T16: 唯一未完成行的计时器已到期、只被 last_success>=target 挡住时，
+        旧 advance_due_for_stale 计 0 → run_postclose 误判"全市场已最新"跳过研究。
+        新语义必须强制该行并继续触发 run_once。"""
+        with tempfile.TemporaryDirectory(prefix="postclose-t16-due-", dir=ROOT / "tests") as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "fetch_state.sqlite3")
+            state.register_assets("stock", ["600000"])
+            state.mark_success("stock", "600000", data_end_date="2026-09-04",
+                               verified_through="2026-09-05",
+                               source="test", rows=100, refresh_interval_seconds=86400)
+            past = iso_now(datetime.now(timezone.utc) - timedelta(hours=1))
+            with state._connect() as connection:
+                connection.execute(
+                    "UPDATE assets SET next_retry_at = ? WHERE symbol='600000'",
+                    (past,),
+                )
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(root / "fetch_state.sqlite3")
+            run_once_mock = Mock(return_value={"status": "ok", "job_id": "job-1"})
+            with patch.object(continuous, "load_config", return_value=config),                     patch.object(continuous, "_refresh_calendar_dates",
+                                 return_value=["2026-09-04", "2026-09-05"]),                     patch.object(continuous, "run_once", run_once_mock):
+                value = continuous.run_postclose()
+            self.assertEqual(value["total_forced"], 1)
+            run_once_mock.assert_called_once_with(job_id=None)
 
     def test_live_pid_is_reported_alive_by_process_probe(self) -> None:
         """2026-09-16 修复：os.kill(pid, 0) 在 Windows 上**不是**判活探针。

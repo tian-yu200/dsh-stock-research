@@ -676,26 +676,55 @@ class FetchState:
     ) -> int:
         """把 data_end_date 落后 before_date 的成功标的强制置为到期。
 
-        收盘后补数专用：mark_success 的刷新计时器（next_retry_at = 成功
-        时刻 + refresh_interval）与 A 股收盘不对齐——在数据源发布当日
-        K 线之前抓到"确认无新数据"的标的会再睡满一个周期，滞后逐日
-        复利。这里清空落后标的的 next_retry_at，让下一轮 wave 立即
-        认领。只动 status='success' 且租约已释放的行；本就已到期的行
-        不重复计数。返回本次被强制到期的标的数。
+        收盘后补数专用（2026-10-12 T16 扩展了强制的含义，claim_due 未改）：
+
+        1. 清空落后标的的 next_retry_at——mark_success 的刷新计时器与 A 股
+           收盘不对齐，在数据源发布当日 K 线之前抓到"确认无新数据"的标的
+           会再睡满一个周期，滞后逐日复利（原语义，保留）。
+        2. 新增（hermes A2 / sched-stuck-rca §1.5）：mark_success 还会把
+           last_success_date 写成 verified_through（= 作业目标日），于是
+           T15 盘中守卫丢掉当日未完成 bar 后出现 data_end=D-1 而
+           last_success=D。claim_due 的 MAX(data_end, last_success) < target
+           因此永远为假，当日完整 bar 只能等次日作业——清计时器救不了它。
+           对 last_success >= before_date 的行把 last_success_date 回拨到
+           data_end_date（verified_through 语义不变，只改本次强制），使
+           claim_due(target=before_date) 能重新认领；计时器本就已到期、
+           只被 last_success 挡住的行也由此纳入强制范围。
+
+        只动 status='success'、data_end_date 落后、租约已释放的行；
+        failed/quarantined/inactive、在途租约、data_end 已达标的的行不动。
+        返回本次实际被改动的行数（每个命中行至少有一个字段真实变化：
+        计时器被清 或 last_success 被回拨；改完再调用返回 0）。
+
+        影响：被回拨的行在作业 progress/coverage 口径里从 completed 落回
+        pending，直到补抓写入新的 data_end_date 才重新计入覆盖。
         """
         current = iso_now(now or utc_now())
         query = """
             UPDATE assets
             SET next_retry_at = NULL,
+                last_success_date = CASE
+                    WHEN COALESCE(last_success_date, '') >= ? THEN data_end_date
+                    ELSE last_success_date
+                END,
                 updated_at = ?
             WHERE status = 'success'
               AND data_end_date IS NOT NULL
               AND data_end_date < ?
               AND (lease_until IS NULL OR lease_until <= ?)
-              AND next_retry_at IS NOT NULL
-              AND next_retry_at > ?
+              AND (
+                  (next_retry_at IS NOT NULL AND next_retry_at > ?)
+                  OR COALESCE(last_success_date, '') >= ?
+              )
         """
-        params: list[Any] = [current, before_date, current, current]
+        params: list[Any] = [
+            before_date,
+            current,
+            before_date,
+            current,
+            current,
+            before_date,
+        ]
         if asset_types is not None:
             types = sorted({str(value) for value in asset_types})
             if not types:

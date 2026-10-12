@@ -872,6 +872,167 @@ class QueuedResearchTests(unittest.TestCase):
                 0,
             )
 
+    def _row(self, state: FetchState, symbol: str) -> dict:
+        with state._connect() as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT symbol, status, data_end_date, last_success_date, "
+                "next_retry_at, lease_until FROM assets WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
+        return dict(row)
+
+    def test_advance_due_for_stale_demotes_verified_through_so_same_day_reclaimable(self) -> None:
+        """T16 (2026-10-12, hermes A2): 复刻"盘中 bar 被 T15 守卫丢弃"后的状态——
+        mark_success(verified_through=D) 使 last_success=D 而 data_end 仍 D-1，
+        claim_due(target=D) 被 MAX(...) < D 拒绝，当日完整 bar 只能等次日。
+        advance_due_for_stale 必须把该行 last_success 回拨到 data_end 并清计时器，
+        使 claim_due(target=D) 立即重新认领；不改 claim_due / mark_success 语义。
+        """
+        with tempfile.TemporaryDirectory(prefix="t16-verified-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("stock", ["600519"])
+            state.mark_success(
+                "stock", "600519",
+                data_end_date="2026-10-09",
+                verified_through="2026-10-12",
+                source="test", rows=100,
+                refresh_interval_seconds=86400,
+            )
+            before = self._row(state, "600519")
+            self.assertEqual(before["data_end_date"], "2026-10-09")
+            self.assertEqual(before["last_success_date"], "2026-10-12")
+            self.assertIsNotNone(before["next_retry_at"])
+
+            forced = state.advance_due_for_stale(
+                before_date="2026-10-12", asset_types=("stock",)
+            )
+            self.assertEqual(forced, 1)
+
+            after = self._row(state, "600519")
+            self.assertIsNone(after["next_retry_at"])
+            # 核心：last_success 回拨到 data_end，MAX < target 恢复
+            self.assertEqual(after["last_success_date"], "2026-10-09")
+
+            claimed = state.claim_due(
+                "stock", symbols=["600519"], limit=5,
+                target_date="2026-10-12", owner="w",
+            )
+            self.assertEqual([c["symbol"] for c in claimed], ["600519"])
+
+            # 幂等：第二次不重复计数（无实际变化）
+            self.assertEqual(
+                state.advance_due_for_stale(
+                    before_date="2026-10-12", asset_types=("stock",)
+                ),
+                0,
+            )
+
+    def test_advance_due_for_stale_includes_row_already_due_but_blocked_by_last_success(self) -> None:
+        """T16: 计时器本就已到期、但只被 last_success>=target 挡住的行，
+        旧谓词 (next_retry_at IS NOT NULL AND next_retry_at > now) 永远匹配不到，
+        连强制都不发生；新语义必须计入并使其可认领。"""
+        with tempfile.TemporaryDirectory(prefix="t16-dued-only-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets("stock", ["000001"])
+            state.mark_success(
+                "stock", "000001",
+                data_end_date="2026-10-09",
+                verified_through="2026-10-12",
+                source="test", rows=100,
+                refresh_interval_seconds=86400,
+            )
+            past = iso_now(datetime.now(timezone.utc) - timedelta(hours=1))
+            with state._connect() as connection:
+                connection.execute(
+                    "UPDATE assets SET next_retry_at = ? WHERE symbol = '000001'",
+                    (past,),
+                )
+            self.assertIsNotNone(self._row(state, "000001")["next_retry_at"])
+
+            forced = state.advance_due_for_stale(
+                before_date="2026-10-12", asset_types=("stock",)
+            )
+            self.assertEqual(forced, 1)
+            self.assertIsNone(self._row(state, "000001")["next_retry_at"])
+            self.assertEqual(
+                self._row(state, "000001")["last_success_date"], "2026-10-09"
+            )
+            claimed = state.claim_due(
+                "stock", symbols=["000001"], limit=5,
+                target_date="2026-10-12", owner="w",
+            )
+            self.assertEqual([c["symbol"] for c in claimed], ["000001"])
+
+    def test_advance_due_for_stale_untouched_rows_and_count(self) -> None:
+        """T16: data_end>=before、租约在途、failed/quarantined/inactive 行一律不动；
+        返回值 = 实际被改动的行数，改完再调用返回 0。"""
+        with tempfile.TemporaryDirectory(prefix="t16-untouched-", dir=ROOT / "tests") as directory:
+            state = FetchState(pathlib.Path(directory) / "state.sqlite3")
+            state.register_assets(
+                "stock",
+                ["000001", "000002", "000003", "000004", "000005", "600519"],
+            )
+            # 000001：data_end 已到 before（不动）
+            state.mark_success(
+                "stock", "000001",
+                data_end_date="2026-10-12", source="test", rows=10,
+                refresh_interval_seconds=86400,
+            )
+            # 000002：落后但租约在途（不动）
+            state.mark_success(
+                "stock", "000002",
+                data_end_date="2026-10-09", verified_through="2026-10-12",
+                source="test", rows=10, refresh_interval_seconds=86400,
+            )
+            with state._connect() as connection:
+                connection.execute(
+                    "UPDATE assets SET lease_owner = 'w1', lease_until = ? "
+                    "WHERE symbol = '000002'",
+                    (iso_now(datetime.now(timezone.utc) + timedelta(minutes=10)),),
+                )
+            # 000003：failed（不动）
+            state.mark_failure(
+                "stock", "000003", error="x",
+                backoff_base_seconds=60, backoff_max_seconds=60,
+            )
+            # 000004：quarantined、000005：inactive（均不动）
+            with state._connect() as connection:
+                connection.execute(
+                    "UPDATE assets SET status = 'quarantined' WHERE symbol = '000004'"
+                )
+                connection.execute(
+                    "UPDATE assets SET status = 'inactive' WHERE symbol = '000005'"
+                )
+            # 600519：落后、租约释放、计时器在未来（应被强制）
+            state.mark_success(
+                "stock", "600519",
+                data_end_date="2026-10-09", verified_through="2026-10-12",
+                source="test", rows=10, refresh_interval_seconds=86400,
+            )
+            untouched = {
+                s: self._row(state, s)
+                for s in ("000001", "000002", "000003", "000004", "000005")
+            }
+
+            forced = state.advance_due_for_stale(
+                before_date="2026-10-12", asset_types=("stock",)
+            )
+            self.assertEqual(forced, 1)
+            for symbol, before_row in untouched.items():
+                self.assertEqual(self._row(state, symbol), before_row, symbol)
+            self.assertIsNone(self._row(state, "600519")["next_retry_at"])
+            self.assertEqual(
+                self._row(state, "600519")["last_success_date"], "2026-10-09"
+            )
+            # 幂等：没有实际改动的行不重复计数
+            self.assertEqual(
+                state.advance_due_for_stale(
+                    before_date="2026-10-12", asset_types=("stock",)
+                ),
+                0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
