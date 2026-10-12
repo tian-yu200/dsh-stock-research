@@ -1171,6 +1171,112 @@ class ContinuousResearchTests(unittest.TestCase):
             assert new_job is not None
             self.assertIn(new_job["status"], {"queued", "running"})
 
+    def test_partial_job_target_not_older_than_today_skips_calendar(self) -> None:
+        """T14-N2：partial 作业目标日 >= 今天本地日期时取代条件永假（任何日历
+        日期都 <= 今天 <= target），本 tick 不得调用 _calendar_today——否则
+        周末/节假日每 10 分钟白打一次日历网络请求。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-n2-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            today = continuous._now().date().isoformat()
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state,
+                    environment["run_root"],
+                    status="partial",
+                    target_date=today,
+                )
+                calendar = stack.enter_context(
+                    patch.object(
+                        continuous,
+                        "_calendar_today",
+                        side_effect=AssertionError(
+                            "_calendar_today must not be called when the partial "
+                            "job target is not older than today"
+                        ),
+                    )
+                )
+                create = stack.enter_context(
+                    patch.object(continuous, "run_research", Mock())
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=608, returncode=0, timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                result = continuous.run_once(worker_runner=worker)
+                latest = json.loads(
+                    pathlib.Path(continuous.LATEST_STATUS_PATH).read_text(
+                        encoding="utf-8"
+                    )
+                )
+            calendar.assert_not_called()
+            create.assert_not_called()
+            self.assertEqual(result["run_id"], JOB_ID)
+            old_job = state.get_job(JOB_ID)
+            assert old_job is not None
+            self.assertNotEqual(old_job["status"], "completed")
+            # 未发生取代：status schema 不得多出 superseded_job 键
+            self.assertNotIn("superseded_job", latest)
+
+    def test_latest_status_shows_superseded_job(self) -> None:
+        """T14-N3：取代发生的同一 tick，LATEST_STATUS 必须带 superseded_job
+        （job_id/target_date/reason），让 status()/coverage() 读者可见，
+        不必再去翻库行或 alerts.log。"""
+        with tempfile.TemporaryDirectory(
+            prefix="continuous-t14-n3-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            state = FetchState(root / "state.sqlite3")
+            with ExitStack() as stack:
+                environment = self._environment(stack, root, state)
+                self._create_job(
+                    state, environment["run_root"], status="partial"
+                )
+                self._patch_calendar(stack)
+
+                def create_job(**kwargs: object) -> dict[str, str]:
+                    self._create_job(
+                        state,
+                        environment["run_root"],
+                        status="queued",
+                        job_id=self.NEW_JOB_ID,
+                        target_date=self.NEWER_DATE,
+                    )
+                    return {"status": "queued", "job_id": self.NEW_JOB_ID}
+
+                stack.enter_context(
+                    patch.object(
+                        continuous, "run_research", side_effect=create_job
+                    )
+                )
+                worker = Mock(
+                    return_value=continuous.WorkerOutcome(
+                        pid=609, returncode=0, timed_out=False,
+                        duration_seconds=1.0,
+                    )
+                )
+                continuous.run_once(worker_runner=worker)
+                latest = json.loads(
+                    pathlib.Path(continuous.LATEST_STATUS_PATH).read_text(
+                        encoding="utf-8"
+                    )
+                )
+            self.assertEqual(
+                latest.get("superseded_job"),
+                {
+                    "job_id": JOB_ID,
+                    "target_date": TARGET_DATE,
+                    "reason": "superseded_by_newer_trading_day",
+                },
+            )
+
     def test_partial_job_not_superseded_while_live_worker_exists(self) -> None:
         """T14-N1：partial 作业仍有存活 worker 时不得取代，本轮照旧 resume。"""
         with tempfile.TemporaryDirectory(

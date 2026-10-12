@@ -1236,6 +1236,7 @@ def run_once(
             return status
 
         calendar: dict[str, Any] | None = None
+        superseded_job: dict[str, Any] | None = None
         if (
             job_id is None
             and existing_job is not None
@@ -1248,11 +1249,34 @@ def run_once(
             # 上队。仅 AUTOMATIC 模式（--job-id 未指定）且状态为 partial 时收尾旧
             # 作业并让新作业分支继续；queued/running、显式 --job-id、非交易日、
             # 日历错误、同日或更旧日期一律保持原 resume 行为。
-            calendar = _calendar_today(logger)
-            if _supersede_partial_job_if_newer_trading_day(
-                state, existing_job, calendar, config, logger
-            ):
-                existing_job = None
+            old_target = str(_job_target(existing_job) or "")
+            # T14-N2：取代条件是 calendar_date > old_target，而任何日历日期都
+            # <= 今天（本地日期）。目标日 >= 今天时条件永假，不必取日历——否则
+            # 周末/节假日每 10 分钟多打一次日历网络请求（改动前该路径不取日历）。
+            # 目标日更旧时仍必须取：是否交易日只能靠日历判定（残留调用见不变量 §12）。
+            if not old_target or old_target >= _now().date().isoformat():
+                logger.debug(
+                    "phase=supersede_skip job_id=%s target=%s reason=target_not_older_than_today",
+                    existing_job["job_id"],
+                    old_target,
+                )
+            else:
+                calendar = _calendar_today(logger)
+                if _supersede_partial_job_if_newer_trading_day(
+                    state, existing_job, calendar, config, logger
+                ):
+                    # T14-N3：取代是本 tick 的重要终态，后续所有 LATEST_STATUS
+                    # 写入都要带上，status()/coverage() 读者才看得到（否则只能
+                    # 翻库行或 alerts.log）。未取代的 tick 不带该键，schema 不变。
+                    superseded_job = {
+                        "job_id": str(existing_job["job_id"]),
+                        "target_date": old_target,
+                        "reason": "superseded_by_newer_trading_day",
+                    }
+                    existing_job = None
+        superseded_extra: dict[str, Any] = (
+            {"superseded_job": superseded_job} if superseded_job else {}
+        )
 
         if existing_job:
             target_date = str(_job_target(existing_job))
@@ -1321,6 +1345,7 @@ def run_once(
                 target_date=target_date,
                 start_time=started,
                 failure_streak=int(control.get("failure_streak", 0) or 0),
+                extra=superseded_extra,
             ),
         )
         try:
@@ -1354,6 +1379,7 @@ def run_once(
                     coverage=0.0,
                     logger=logger,
                 ),
+                extra=superseded_extra,
             )
             _save_control(control)
             _write_json(LATEST_STATUS_PATH, status)
@@ -1381,7 +1407,7 @@ def run_once(
                 ),
                 failure_streak=int(control.get("failure_streak", 0) or 0),
                 analysis_attempts=analysis_attempts,
-                extra={"action": action},
+                extra={**superseded_extra, "action": action},
             )
             _write_json(LATEST_STATUS_PATH, status)
             _log_progress(logger, status)
@@ -1398,7 +1424,7 @@ def run_once(
                 last_error=job.get("last_error"),
                 failure_streak=int(control.get("failure_streak", 0) or 0),
                 analysis_attempts=analysis_attempts,
-                extra={"action": action},
+                extra={**superseded_extra, "action": action},
             )
             _write_json(LATEST_STATUS_PATH, status)
             _log_progress(logger, status)
@@ -1449,6 +1475,7 @@ def run_once(
                 failure_streak=int(control.get("failure_streak", 0) or 0),
                 analysis_attempts=analysis_attempts,
                 extra={
+                    **superseded_extra,
                     "action": action,
                     "message": "目标交易日已完成，等待下一交易日刷新。",
                     "checkpoint_retained": True,
@@ -1468,6 +1495,7 @@ def run_once(
             start_time=started,
             failure_streak=int(control.get("failure_streak", 0) or 0),
             analysis_attempts=analysis_attempts,
+            extra=superseded_extra,
         )
         _write_json(LATEST_STATUS_PATH, status)
         _log_progress(logger, status)
@@ -1595,6 +1623,7 @@ def run_once(
             analysis_attempts=analysis_attempts,
             round_duration_seconds=(finished - started).total_seconds(),
             extra={
+                **superseded_extra,
                 "worker_result": worker_json,
                 "calendar": calendar,
                 "checkpoint_retained": True,
