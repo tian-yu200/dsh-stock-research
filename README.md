@@ -140,11 +140,11 @@ quant\.venv\Scripts\python.exe -m pytest quant\tests -q
 ### 提交前测试门禁（可选）
 
 ```powershell
-pip install pre-commit
+py -m pip install --user pre-commit
 pre-commit install
 ```
 
-安装后每次 `git commit` 会自动运行 `quant/docs/研究管线不变量.md` §8 的聚焦测试集（9 个文件，约 1 分钟），全绿才允许提交。hook 以相对路径调用主检出的 `quant\.venv\Scripts\python.exe`，并依赖主检出的 `quant\data`；在这两者缺失的 worktree 中会失败，属预期。手动全量执行：`pre-commit run --all-files`。
+pre-commit 装在**独立工具环境**（用户级 `--user`，或专用 venv），**不要装进 `quant\.venv`**——那是运行时解释器，混装工具包会污染研究环境。安装后每次 `git commit` 会自动运行 `quant/docs/研究管线不变量.md` §8 的聚焦测试集（9 个文件，约 1 分钟），全绿才允许提交。hook 经 `tasks/precommit-focused-tests.ps1` 调用**主检出**（`git rev-parse --git-common-dir` 的父目录）的 `quant\.venv\Scripts\python.exe`，在**当前检出**根目录以同一严格度运行同一组测试——主检出与 linked worktree 行为一致，均不放宽、不跳过；当前检出缺少 `quant/data/benchmarks/trade_calendar.csv` 时会立即失败并提示临时拷入主检出日历（不自动拷贝、不要提交该文件）。手动全量执行：`pre-commit run --all-files`。
 
 ## 已知局限
 

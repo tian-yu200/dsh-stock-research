@@ -1,13 +1,18 @@
-# 提交前聚焦测试门禁（T6，2026-10-10）：自动执行不变量 §8 的聚焦测试集。
-# 安装（仅需一次）：pip install pre-commit && pre-commit install —— 详见 README「测试」一节。
-# hook 用相对路径调用 quant/.venv/Scripts/python.exe：需在主检出（含 quant/.venv 与
-# quant/data）中执行；缺少这两者的 worktree 会失败，属预期（不放宽、不跳过）。
+# 提交前聚焦测试门禁（T6，2026-10-10；T17 worktree 友好，2026-10-12）：自动执行不变量 §8 的聚焦测试集。
+# 安装（仅需一次）：pre-commit 装在独立工具环境（切勿装进 quant/.venv），
+#   py -m pip install --user pre-commit   （或专用 venv）；再执行 pre-commit install —— 详见 README「测试」一节。
+# hook 经 tasks/precommit-focused-tests.ps1 解释器：用
+#   git rev-parse --path-format=absolute --git-common-dir 的父目录定位主检出的
+#   quant/.venv/Scripts/python.exe，在**当前检出**根目录运行同一组测试、同一严格度
+#   （不放宽、不跳过）。当前检出缺 quant/data/benchmarks/trade_calendar.csv 时立即
+#   失败并提示临时拷入（不自动拷贝）。.git/hooks 为所有 worktree 共享，因此主检出
+#   与 linked worktree 行为一致。
 repos:
   - repo: local
     hooks:
       - id: quant-focused-tests
         name: quant focused tests (invariants section 8)
-        entry: quant/.venv/Scripts/python.exe -m pytest quant/tests/test_market_data.py quant/tests/test_data_source_breaker.py quant/tests/test_data_source_ths.py quant/tests/test_fetch_stock_worker.py quant/tests/test_unit_guard.py quant/tests/test_assistant.py quant/tests/test_research_snapshot.py quant/tests/test_gate_policy.py quant/tests/test_backtest_tradability.py -q -p no:warnings
+        entry: powershell -NoProfile -ExecutionPolicy Bypass -File tasks/precommit-focused-tests.ps1
         language: system
         pass_filenames: false
         always_run: true
