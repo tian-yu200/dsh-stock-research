@@ -181,6 +181,10 @@ def _write_success(kind: str, code: str, frame: Any, path: pathlib.Path) -> dict
         "data_end_date": merged["date"].max().date().isoformat(),
         "rows": int(len(merged)),
     }
+    # A3：把帧上的 field_anomalies（含 T15 intraday_bar_dropped）写进 metadata，
+    # 与股票 writer 同款；不覆盖已有键。
+    if frame.attrs.get("field_anomalies"):
+        metadata["field_anomalies"] = frame.attrs["field_anomalies"]
     atomic_write_json(metadata, path.with_suffix(".meta.json"))
     return metadata
 

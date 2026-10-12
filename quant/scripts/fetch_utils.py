@@ -150,31 +150,49 @@ def drop_unfinished_bars(
     frame: pd.DataFrame,
     *,
     now: datetime | None = None,
+    date_column: object | None = None,
 ) -> tuple[pd.DataFrame, int]:
-    """丢弃尚未完成的日线行，返回 ``(过滤后的帧, 丢弃行数)``。
+    """丢弃尚未完成的日线/净值行，返回 ``(过滤后的帧, 丢弃行数)``。
 
     规则：
       * 日期 > 今天（中国日历）的行：**永远**丢弃（未来日）；
       * 日期 == 今天且当前中国时间 < 16:00：丢弃（盘中未完成 bar）；
       * 其余保留。
-    ``now`` 可注入；缺省用 ``_china_now()``。无 ``date`` 列时原样返回。
+
+    日期列通过 ``date_column`` 显式指定，或按别名（``date/日期/净值日期/
+    交易日期``）自动识别——OTC 基金的原始帧用的是 ``净值日期``。无法识别的
+    日期（``NaT``）**原样保留**，交给既有校验（``normalize_daily_bars`` /
+    ``FundNavValidationError``）处理；本函数**永不抛错**（解析失败即降级）。
+    ``now`` 可注入；缺省用 ``_china_now()``。找不到日期列时原样返回。
     """
-    if frame is None or len(frame) == 0 or "date" not in frame.columns:
+    if frame is None or len(frame) == 0:
+        return frame, 0
+    column = date_column if date_column is not None else _date_column(frame)
+    if column is None or column not in frame.columns:
         return frame, 0
     moment = now if now is not None else _china_now()
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=CHINA_TZ)
-    today = moment.astimezone(CHINA_TZ).date()
-    parsed = pd.to_datetime(frame["date"], errors="coerce")
-    row_dates = parsed.dt.date
+    local = moment.astimezone(CHINA_TZ)
+    today = pd.Timestamp(local.date())
+    try:
+        parsed = pd.to_datetime(frame[column], errors="coerce")
+    except Exception:
+        # 全垃圾/混合 dtype 等：降级为原样返回，交给既有校验。
+        return frame, 0
+    # 先对齐到日期（去时间），NaT 行（无法解析）不参与比较、保持原样。
+    try:
+        row_dates = parsed.dt.normalize()
+    except Exception:
+        row_dates = pd.to_datetime(parsed, errors="coerce")
     after_today = row_dates > today
-    drop_mask = after_today
-    if moment.astimezone(CHINA_TZ).hour < INTRADAY_CLOSE_CUTOFF_HOUR:
-        drop_mask = drop_mask | (row_dates == today)
-    dropped = int(drop_mask.fillna(False).sum())
+    drop_mask = after_today.fillna(False)
+    if local.hour < INTRADAY_CLOSE_CUTOFF_HOUR:
+        drop_mask = drop_mask | (row_dates == today).fillna(False)
+    dropped = int(drop_mask.sum())
     if dropped == 0:
         return frame, 0
-    kept = frame.loc[~drop_mask.fillna(False)].reset_index(drop=True)
+    kept = frame.loc[~drop_mask].reset_index(drop=True)
     # 保留 attrs（akshare_source/adjustment/field_anomalies 等）。
     for key, value in frame.attrs.items():
         kept.attrs[key] = value
@@ -314,9 +332,11 @@ def merge_daily_frames(
     # 已在 data_source 内合进 incoming，因此同样被拦）。
     _original_incoming = incoming
     incoming, _dropped_bars = drop_unfinished_bars(incoming)
-    # 同时记到调用方帧（writer 读的是它自己的 frame.attrs）与过滤后帧。
+    # 只记一次（B2）：写回原帧（writer 读的是它的 frame.attrs），再把同一
+    # 异常字段复制到过滤后帧，避免向 silent-exceptions.log 写两行。
     _record_dropped_bars(_original_incoming, _dropped_bars, source)
-    _record_dropped_bars(incoming, _dropped_bars, source)
+    if _dropped_bars > 0:
+        incoming.attrs["field_anomalies"] = _original_incoming.attrs.get("field_anomalies")
     if existing_path.exists():
         try:
             existing = pd.read_csv(existing_path)
@@ -481,11 +501,11 @@ def merge_otc_frames(
     *,
     source: str,
 ) -> pd.DataFrame:
-    # T15：OTC 基金日线（净值）同样拦阻盘中/未来日行。
+    # T15：OTC 基金日线（净值）同样拦阻盘中/未来日行。原始帧用 ``净值日期``，
+    # 由 ``_date_column`` 别名识别（A1）。
     _original_incoming = incoming
     incoming, _dropped_bars = drop_unfinished_bars(incoming)
     _record_dropped_bars(_original_incoming, _dropped_bars, source)
-    _record_dropped_bars(incoming, _dropped_bars, source)
     frames = []
     if existing_path.exists():
         try:

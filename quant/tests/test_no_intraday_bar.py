@@ -132,3 +132,108 @@ class ThsPatchChokePointTests(unittest.TestCase):
                 )
             self.assertEqual(merged["date"].astype(str).tolist(), [PREV])
             self.assertNotIn(12.34, merged["close"].tolist())
+
+
+def _otc_frame(dates, navs=None):
+    navs = navs or [1.0 + 0.01 * i for i in range(len(dates))]
+    return pd.DataFrame({"净值日期": dates, "单位净值": navs})
+
+
+class OtcFundTests(unittest.TestCase):
+    """A1: the guard must actually apply to OTC raw frames (净值日期/单位净值)."""
+
+    def test_otc_today_nav_dropped_before_cutoff(self):
+        from unittest import mock
+        from fetch_utils import merge_otc_frames
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "otc_110020.csv"
+            pd.DataFrame({"date": [PREV], "close": [1.0]}).to_csv(path, index=False)
+            with mock.patch("fetch_utils._china_now", return_value=_cst(2026, 10, 12, 10, 8)):
+                merged = merge_otc_frames(path, _otc_frame([TODAY], [1.5]), source="otc")
+            self.assertEqual(merged["date"].astype(str).tolist(), [PREV])
+
+    def test_otc_today_nav_kept_after_cutoff(self):
+        from unittest import mock
+        from fetch_utils import merge_otc_frames
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "otc_110020.csv"
+            pd.DataFrame({"date": [PREV], "close": [1.0]}).to_csv(path, index=False)
+            with mock.patch("fetch_utils._china_now", return_value=_cst(2026, 10, 12, 16, 30)):
+                merged = merge_otc_frames(path, _otc_frame([TODAY], [1.5]), source="otc")
+            self.assertEqual(merged["date"].astype(str).tolist(), [PREV, TODAY])
+
+    def test_otc_future_nav_always_dropped(self):
+        from unittest import mock
+        from fetch_utils import merge_otc_frames
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "otc_110020.csv"
+            pd.DataFrame({"date": [PREV], "close": [1.0]}).to_csv(path, index=False)
+            with mock.patch("fetch_utils._china_now", return_value=_cst(2026, 10, 12, 16, 30)):
+                merged = merge_otc_frames(path, _otc_frame(["2026-10-13"], [1.5]), source="otc")
+            self.assertEqual(merged["date"].astype(str).tolist(), [PREV])
+
+
+class FundMetadataTests(unittest.TestCase):
+    """A3: the fund writer must record dropped bars in .meta.json."""
+
+    def test_etf_metadata_records_dropped_anomaly(self):
+        from unittest import mock
+        from fetch_fund_data import _write_success
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "etf_510300.csv"
+            _frame([PREV]).to_csv(path, index=False)
+            with mock.patch("fetch_utils._china_now", return_value=_cst(2026, 10, 12, 10, 8)):
+                metadata = _write_success("etf", "510300", _frame([TODAY]), path)
+            self.assertIn("field_anomalies", metadata)
+            self.assertEqual(
+                metadata["field_anomalies"]["intraday_bar_dropped"]["dropped_rows"], 1
+            )
+
+    def test_otc_metadata_records_dropped_anomaly(self):
+        from unittest import mock
+        from fetch_fund_data import _write_success
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "otc_110020.csv"
+            pd.DataFrame({"date": [PREV], "close": [1.0]}).to_csv(path, index=False)
+            with mock.patch("fetch_utils._china_now", return_value=_cst(2026, 10, 12, 10, 8)):
+                metadata = _write_success("otc_fund", "110020", _otc_frame([TODAY], [1.5]), path)
+            self.assertIn("field_anomalies", metadata)
+            self.assertEqual(
+                metadata["field_anomalies"]["intraday_bar_dropped"]["dropped_rows"], 1
+            )
+
+
+class GuardNeverRaisesTests(unittest.TestCase):
+    """B1: the guard degrades, never raises; unparseable dates pass through."""
+
+    def test_all_garbage_dates_do_not_raise(self):
+        from fetch_utils import drop_unfinished_bars
+        frame = pd.DataFrame({"date": ["garbage", "junk"], "close": [1.0, 2.0]})
+        out, dropped = drop_unfinished_bars(frame, now=_cst(2026, 10, 12, 10, 8))
+        self.assertEqual(dropped, 0)
+        self.assertEqual(out["date"].tolist(), ["garbage", "junk"])
+
+    def test_mixed_frame_keeps_unparseable_row(self):
+        from fetch_utils import drop_unfinished_bars
+        frame = pd.DataFrame(
+            {"date": [PREV, "garbage", TODAY], "close": [1.0, 2.0, 3.0]}
+        )
+        out, dropped = drop_unfinished_bars(frame, now=_cst(2026, 10, 12, 10, 8))
+        self.assertEqual(dropped, 1)
+        self.assertEqual(out["date"].tolist(), [PREV, "garbage"])
+
+    def test_batch_otc_frame_dropped_before_cutoff(self):
+        # batch path builds DataFrame(..., columns=["净值日期","单位净值"]) and
+        # calls the same _write_success -> merge_otc_frames choke point.
+        from unittest import mock
+        from fetch_fund_data import _write_success
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "otc_110020.csv"
+            pd.DataFrame({"date": [PREV], "close": [1.0]}).to_csv(path, index=False)
+            frame = pd.DataFrame(
+                [(TODAY, 1.5)], columns=["净值日期", "单位净值"]
+            )
+            frame.attrs["adjustment"] = "unit_nav"
+            with mock.patch("fetch_utils._china_now", return_value=_cst(2026, 10, 12, 10, 8)):
+                metadata = _write_success("otc_fund", "110020", frame, path)
+            self.assertEqual(metadata["data_end_date"], PREV)
