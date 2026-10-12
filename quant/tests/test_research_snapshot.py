@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 
 from assistant import notifications, paths, research
 from assistant.config import DEFAULTS, config_snapshot
+from assistant.risk import MODEL_GATE_CHECK_KEYS
 
 FIXTURE_DIR = ROOT / "tests" / "fixtures" / "research_snapshot"
 RUN_ID = "20260825T100000Z-a1b2c3d4"
@@ -103,11 +104,9 @@ STOCK_SIGNAL_KEYS = _SIGNAL_BASE_KEYS | _LIQUIDITY_KEYS | {"qlib_score", "model_
 ETF_SIGNAL_KEYS = _SIGNAL_BASE_KEYS | _LIQUIDITY_KEYS
 FUND_SIGNAL_KEYS = set(_SIGNAL_BASE_KEYS)
 
-STOCK_CHECK_KEYS = {
-    "data_quality_and_model_available", "mean_rank_ic_threshold",
-    "rank_ic_ir_threshold", "top_bottom_excess_return_threshold",
-    "test_max_drawdown_threshold", "fit_quality_threshold",
-    "stability_ic_std_threshold", "excess_return_threshold",
+# B2：模型门槛键的单一来源在 risk.MODEL_GATE_CHECK_KEYS；此处只补 research.py
+# 在 model_gate_checks 之外附加的键，避免两份列表再次分叉。
+STOCK_CHECK_KEYS = set(MODEL_GATE_CHECK_KEYS) | {
     "data_quality_passed", "freshness_passed",
     "refresh_passed", "leakage_check_passed", "full_universe_screen_passed",
     "positive_signal_passed", "risk_constraints_passed",

@@ -1353,6 +1353,10 @@ def _run_qlib_stock_model(
                         "net_annualized_return"
                     ],
                     "max_drawdown": benchmark_performance["max_drawdown"],
+                    # B1：net-minus-net —— 策略组合的 net_annualized_return 减等权基准的
+                    # net_annualized_return，两者都已扣交易成本。D1 门槛
+                    # `gate.min_excess_annualized_return` 读的就是本字段（risk._excess_
+                    # annualized_return_check），改口径前必同步风险门槛。
                     "excess_annualized_return": performance[
                         "net_annualized_return"
                     ]

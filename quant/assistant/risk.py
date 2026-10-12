@@ -6,10 +6,29 @@ from typing import Any, Mapping
 
 
 def _finite(value: Any) -> bool:
+    # bool 是 int 的子类（True→1.0），str 可被 float() 强转，但两者都不是数值
+    # 指标/权重；接受它们会让 ``excess_annualized_return=True`` 或 "0.05" 之类
+    # 误填静默通过门槛。显式拒绝。
+    if isinstance(value, (bool, str)):
+        return False
     try:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+# model_gate_checks 返回的检查键的单一来源（B2）。测试（test_research_snapshot
+# 的 STOCK_CHECK_KEYS、test_gate_policy 的键集一致性）从这里派生，避免再次分叉。
+MODEL_GATE_CHECK_KEYS = (
+    "data_quality_and_model_available",
+    "mean_rank_ic_threshold",
+    "rank_ic_ir_threshold",
+    "top_bottom_excess_return_threshold",
+    "test_max_drawdown_threshold",
+    "fit_quality_threshold",
+    "stability_ic_std_threshold",
+    "excess_return_threshold",
+)
 
 
 def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, bool]:
@@ -42,7 +61,7 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         else bool(_finite(train_l2_improvement))
         and float(train_l2_improvement) >= min_fit_improvement
     )
-    return {
+    checks = {
         "data_quality_and_model_available": bool(metrics.get("model_available", False)),
         "mean_rank_ic_threshold": _finite(rank_ic)
         and float(rank_ic) >= float(gate["min_mean_rank_ic"]),
@@ -60,6 +79,13 @@ def model_gate_checks(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> di
         # 的缺省语义一致。
         "excess_return_threshold": _excess_annualized_return_check(metrics, gate),
     }
+    # B2：键集单一来源。若有人增删门槛却忘了同步常量，这里立即暴露。
+    if set(checks) != set(MODEL_GATE_CHECK_KEYS):
+        raise RuntimeError(
+            "model_gate_checks keys drifted from MODEL_GATE_CHECK_KEYS: "
+            f"{sorted(set(checks) ^ set(MODEL_GATE_CHECK_KEYS))}"
+        )
+    return checks
 
 
 def _excess_annualized_return_check(metrics: Mapping[str, Any], gate: Mapping[str, Any]) -> bool:

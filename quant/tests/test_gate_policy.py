@@ -531,9 +531,41 @@ def test_excess_return_gate_is_fail_closed_when_metric_missing():
         ]
         is False
     )
-    assert (
-        model_gate_checks(
-            {**base, "benchmark": {"excess_annualized_return": float("nan")}}, gate
-        )["excess_return_threshold"]
-        is False
-    )
+    for bad in (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "0.05",  # 字符串不可强转即失败
+        True,  # N3：bool 不是有效指标（_finite 必须拒绝）
+    ):
+        assert (
+            model_gate_checks(
+                {**base, "benchmark": {"excess_annualized_return": bad}}, gate
+            )["excess_return_threshold"]
+            is False
+        ), bad
+
+
+def test_model_gate_checks_key_set_matches_constant():
+    """B2：model_gate_checks 的返回键必须与 MODEL_GATE_CHECK_KEYS 单一来源一致。"""
+    from assistant.risk import MODEL_GATE_CHECK_KEYS
+
+    metrics = {
+        "model_available": True,
+        "mean_rank_ic": 0.05,
+        "rank_ic_ir": 0.4,
+        "top_bottom_excess_return": 0.02,
+        "test_max_drawdown": -0.20,
+        "benchmark": {"max_drawdown": -0.15, "excess_annualized_return": 0.01},
+    }
+    assert set(model_gate_checks(metrics, DEFAULTS["gate"])) == set(MODEL_GATE_CHECK_KEYS)
+
+
+def test_finite_rejects_bool():
+    """N3：_finite 必须拒绝 bool（True/False 不是数值指标）。"""
+    from assistant.risk import _finite
+
+    assert _finite(True) is False
+    assert _finite(False) is False
+    assert _finite(1.0) is True
+    assert _finite(0.0) is True
