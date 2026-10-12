@@ -128,6 +128,78 @@ def next_start_date(data_end_date: str | None, default_start: str) -> str:
     return (parsed + timedelta(days=1)).strftime("%Y%m%d")
 
 
+# --- T15：盘中未收盘日线拦阻（数据层唯一咽喉点）---
+# 2026-10-12 事故：东财 hist 在盘中（10:07 CST）返回当日未完成 bar，被当
+# 日线写入（89 个 stock CSV）。一旦落盘就永久存在（postclose 只强制
+# data_end < today；增量抓取从 data_end+1 开始）。修复只放在写盘前的
+# ``merge_daily_frames``（股票 + ETF 共用）与 ``merge_otc_frames``，不放进
+# ``normalize_daily_bars``——后者被 provider build 逐行复用，不能按"今天"过滤
+# 历史 CSV（否则次日会把合法的 10-12 行从 provider 里剔掉）。
+# 固定 UTC+8 偏移（不用 zoneinfo，Windows 无 tzdata）。
+CHINA_TZ = timezone(timedelta(hours=8))
+# 收盘截止时间（本地中国时间）：16:00 之前，当日 bar 视为未完成。
+INTRADAY_CLOSE_CUTOFF_HOUR = 16
+
+
+def _china_now() -> datetime:
+    """当前中国时间（UTC+8）。可注入（测试用 mock.patch）。"""
+    return datetime.now(CHINA_TZ)
+
+
+def drop_unfinished_bars(
+    frame: pd.DataFrame,
+    *,
+    now: datetime | None = None,
+) -> tuple[pd.DataFrame, int]:
+    """丢弃尚未完成的日线行，返回 ``(过滤后的帧, 丢弃行数)``。
+
+    规则：
+      * 日期 > 今天（中国日历）的行：**永远**丢弃（未来日）；
+      * 日期 == 今天且当前中国时间 < 16:00：丢弃（盘中未完成 bar）；
+      * 其余保留。
+    ``now`` 可注入；缺省用 ``_china_now()``。无 ``date`` 列时原样返回。
+    """
+    if frame is None or len(frame) == 0 or "date" not in frame.columns:
+        return frame, 0
+    moment = now if now is not None else _china_now()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=CHINA_TZ)
+    today = moment.astimezone(CHINA_TZ).date()
+    parsed = pd.to_datetime(frame["date"], errors="coerce")
+    row_dates = parsed.dt.date
+    after_today = row_dates > today
+    drop_mask = after_today
+    if moment.astimezone(CHINA_TZ).hour < INTRADAY_CLOSE_CUTOFF_HOUR:
+        drop_mask = drop_mask | (row_dates == today)
+    dropped = int(drop_mask.fillna(False).sum())
+    if dropped == 0:
+        return frame, 0
+    kept = frame.loc[~drop_mask.fillna(False)].reset_index(drop=True)
+    # 保留 attrs（akshare_source/adjustment/field_anomalies 等）。
+    for key, value in frame.attrs.items():
+        kept.attrs[key] = value
+    return kept, dropped
+
+
+def _record_dropped_bars(frame: pd.DataFrame, dropped: int, source: str) -> None:
+    """把丢弃行记入 field_anomalies（无 print/stderr，沿用 T5 通道）。"""
+    if dropped <= 0:
+        return
+    anomalies = dict(frame.attrs.get("field_anomalies") or {})
+    anomalies["intraday_bar_dropped"] = {"dropped_rows": int(dropped), "source": source}
+    frame.attrs["field_anomalies"] = anomalies
+    try:
+        import silent_trace
+        silent_trace.trace(
+            "fetch_utils",
+            "drop_unfinished_bars",
+            None,
+            message=f"dropped {dropped} unfinished/future bar rows ({source})",
+        )
+    except Exception:
+        pass
+
+
 def _date_column(frame: pd.DataFrame) -> object | None:
     aliases = {"date", "日期", "净值日期", "交易日期"}
     for column in frame.columns:
@@ -238,6 +310,13 @@ def merge_daily_frames(
     *,
     source: str,
 ) -> pd.DataFrame:
+    # T15：写盘前拦阻盘中未完成/未来日 bar（所有源共用；ths_patch_recent 的行
+    # 已在 data_source 内合进 incoming，因此同样被拦）。
+    _original_incoming = incoming
+    incoming, _dropped_bars = drop_unfinished_bars(incoming)
+    # 同时记到调用方帧（writer 读的是它自己的 frame.attrs）与过滤后帧。
+    _record_dropped_bars(_original_incoming, _dropped_bars, source)
+    _record_dropped_bars(incoming, _dropped_bars, source)
     if existing_path.exists():
         try:
             existing = pd.read_csv(existing_path)
@@ -402,6 +481,11 @@ def merge_otc_frames(
     *,
     source: str,
 ) -> pd.DataFrame:
+    # T15：OTC 基金日线（净值）同样拦阻盘中/未来日行。
+    _original_incoming = incoming
+    incoming, _dropped_bars = drop_unfinished_bars(incoming)
+    _record_dropped_bars(_original_incoming, _dropped_bars, source)
+    _record_dropped_bars(incoming, _dropped_bars, source)
     frames = []
     if existing_path.exists():
         try:
