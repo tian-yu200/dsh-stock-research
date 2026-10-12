@@ -39,16 +39,46 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _summary_from_line(line: str) -> dict[str, Any] | None:
+    marker = "ASSISTANT_FETCH_SUMMARY="
+    if not line.startswith(marker):
+        return None
+    try:
+        value = json.loads(line[len(marker):])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _summary(stdout: str) -> dict[str, Any] | None:
     marker = "ASSISTANT_FETCH_SUMMARY="
     for line in reversed((stdout or "").splitlines()):
         if line.startswith(marker):
-            try:
-                value = json.loads(line[len(marker):])
-            except json.JSONDecodeError:
-                return None
-            return value if isinstance(value, dict) else None
+            # 标记行存在但 JSON 坏了就直接 None（不再回看更早的标记行），
+            # 与历史行为一致。
+            return _summary_from_line(line)
     return None
+
+
+def _scan_fetch_summary(path: Path | None) -> str | None:
+    """在持久化的抓取 stdout 日志里流式全文件扫描，返回最后一条汇总标记行。
+
+    汇总行本身可超过 `_read_tail` 的 512 KiB 尾窗（全市场 `source_by_symbol`
+    约 1.1 MB 且是最后一行）：尾窗只剩该行末尾片段、前缀已丢，读尾部永远
+    解析不出汇总（2026-10-12 w17260-rca，T18 裁决 1 要求全量扫描而非加大
+    窗口）。逐行流式读取，常驻内存只有单行。
+    """
+    if path is None:
+        return None
+    try:
+        last: str | None = None
+        with open(path, "rb") as handle:
+            for raw_line in handle:
+                if raw_line.startswith(b"ASSISTANT_FETCH_SUMMARY="):
+                    last = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        return last
+    except OSError:
+        return None
 
 
 def _qlib_build_summary(stdout: str) -> dict[str, Any] | None:
@@ -521,6 +551,8 @@ def _run_bounded_command(
     config: dict[str, Any],
     heartbeat: Callable[[], None] | None = None,
     env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
  ) -> dict[str, Any]:
     # 子进程统一 UTF-8（AGENTS.md 编码安全规则）：抓取/构建/研究子进程的
     # 输出会被本进程按 UTF-8 解码，若子进程沿用 GBK 会把中文打成 U+FFFD，
@@ -537,11 +569,23 @@ def _run_bounded_command(
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         popen_options["start_new_session"] = True
-    # 输出重定向到临时文件而非 PIPE：全市场规模的子进程输出（逐标的日志、
+    # 输出重定向到文件而非 PIPE：全市场规模的子进程输出（逐标的日志、
     # tqdm 进度条）远超 64KB 管道缓冲，而带超时的 communicate 重试在
     # Windows 上无法可靠排空管道，父子进程互相等待形成死锁。
-    # 临时文件随 with 块退出自动删除，读取末尾片段即可覆盖调用方的用途。
-    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+    # 指定 stdout_path/stderr_path 时直接写进落盘文件（每轮 w+b 截断重写），
+    # 抓取子进程的完整输出要留给诊断与汇总行全量扫描（T18 裁决 2）；
+    # 未指定或落盘失败时退回临时文件（with 块退出即删，只保尾窗用途）。
+    def _open_sink(path: Path | None) -> Any:
+        if path is None:
+            return tempfile.TemporaryFile()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # w+b：子进程只写，但 _read_tail 需要读回尾窗。
+            return open(path, "w+b")
+        except OSError:
+            return tempfile.TemporaryFile()
+
+    with _open_sink(stdout_path) as out_file, _open_sink(stderr_path) as err_file:
         process = subprocess.Popen(
             command,
             cwd=str(QUANT_ROOT),
@@ -870,19 +914,41 @@ def _run_fetch_script(
         symbols=symbols,
         deadline=deadline,
     )
+    stdout_path = RESEARCH_WORKER_LOG_DIR / f"{job_id}.fetch-{asset_type}.log"
+    stderr_path = RESEARCH_WORKER_LOG_DIR / f"{job_id}.fetch-{asset_type}.stderr.log"
     completed = _run_bounded_command(
         command,
         timeout_seconds=timeout_seconds,
         config=config,
         heartbeat=heartbeat,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
     timed_out = bool(completed["timed_out"])
     stdout = str(completed["stdout"])
     stderr = str(completed["stderr"])
-    summary = _summary(stdout)
+    # 汇总行可能比 512 KiB 尾窗还长：先全扫持久化日志，尾部解析只作兜底
+    # （日志落盘失败时退回旧行为）。见 _scan_fetch_summary。
+    marker_line = _scan_fetch_summary(stdout_path)
+    summary = (
+        _summary_from_line(marker_line)
+        if marker_line is not None
+        else _summary(stdout)
+    )
+    if timed_out:
+        status: Any = "timeout"
+    elif summary:
+        status = summary.get("status")
+    elif completed["returncode"] == 0:
+        # rc==0 但汇总缺失/不可解析是通信故障、不是抓取失败：给独立状态
+        # summary_unparsed，不计入 child_failed，由覆盖度门决定是否放行
+        # （assistant/queueing 对同一形态本就按 success 处理，§7"以产物为准"）。
+        status = "summary_unparsed"
+    else:
+        status = "failed"
     return {
         "asset_type": asset_type,
-        "status": "timeout" if timed_out else (summary.get("status") if summary else "failed"),
+        "status": status,
         "returncode": completed["returncode"],
         "summary": summary,
         "stdout_tail": _captured_text(stdout)[-3000:],
@@ -1144,6 +1210,28 @@ def main(argv: list[str] | None = None) -> int:
             "failed": progress["failed"],
             "stale": progress["stale"],
         }
+        unparsed_types = [
+            str(result.get("asset_type") or "unknown")
+            for result in fetch_results
+            if result.get("status") == "summary_unparsed"
+        ]
+        if unparsed_types:
+            # summary_unparsed 是独立于 failed 的条件，必须有清晰日志行
+            # （T18 裁决 3）：ASCII-safe JSON，随 worker stdout 落进运行日志。
+            print(json.dumps(
+                {
+                    "warning": "fetch_summary_unparsed",
+                    "job_id": job_id,
+                    "asset_types": unparsed_types,
+                    "message": (
+                        "fetch child exited 0 but summary line missing or "
+                        "unparsable; recorded as summary_unparsed, the "
+                        "coverage gate decides publication"
+                    ),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ))
         if depth == "quick":
             fetch_gate_passed = True
             status_value["fetch_gate"]["passed"] = True
@@ -1200,12 +1288,17 @@ def main(argv: list[str] | None = None) -> int:
             _print_status(status_value)
             return 0
 
-        stock_refresh_performed = any(
-            result.get("asset_type") == "stock"
-            and result.get("status") not in {"cache_hit", "skipped_by_depth"}
-            for result in fetch_results
-        )
-        if stock_refresh_performed and full_universe:
+        # provider-stale-rca（2026-10-12，T18 part 5）：旧判据"本轮 stock 真
+        # 抓过"是代理指标——stock 全 cache_hit 但 CSV 被改写时不会重建，
+        # provider 指纹停在旧值（实测 cd4a3f6c vs d16e8ec1，股票信号晚一个
+        # 交易日）；且 child_failed 早退会整段跳过重建（18:06 轮）。改为全
+        # 市场轮无条件调用 build_qlib_data，指纹比较交给其 skip_if_unchanged
+        # （CSV 未变 = cache_hit 秒回，只多一次子进程启动；变了才真建）。
+        # quick 深度按既有语义跳过重活（queueing 对 quick 承诺"只读缓存数据，
+        # 不刷新行情"，滚动扫描 :1119 同样跳过）。重建门保持在 child_failed
+        # 早退之后：不发布的轮次不值得花 ~4 分钟/3-4 GB 重建，下一轮健康
+        # 抓取会经指纹门补上；重建仍走 _remaining_stage_timeout 有界超时。
+        if full_universe and depth != "quick":
             status_value["provider_strategy"] = "rebuild_if_source_changed"
             _reset_qlib_build_progress(run_dir, status_value)
             _set_phase(status_value, "qlib_build")

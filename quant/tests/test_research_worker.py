@@ -1206,8 +1206,294 @@ class ResearchWorkerTests(unittest.TestCase):
 
         self.assertFalse(result["timed_out"])
         self.assertEqual(result["returncode"], 0)
-        self.assertEqual(result["stdout"], "out\ufffd")
-        self.assertEqual(result["stderr"], "err\ufffd")
+        self.assertEqual(result["stdout"], "out�")
+        self.assertEqual(result["stderr"], "err�")
+
+    def test_fetch_summary_line_larger_than_tail_window_is_parsed(self) -> None:
+        # 2026-10-12 w17260-rca：全市场汇总行 ~1.1 MB 本身就是最后一行，
+        # 512 KiB 尾窗只剩该行的末尾片段，前缀丢失 -> 汇总解析失败被误判抓取失败。
+        with tempfile.TemporaryDirectory(
+            prefix="research-summary-line-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            config = copy.deepcopy(DEFAULTS)
+            child = (
+                "import json;"
+                "print('ASSISTANT_FETCH_SUMMARY=' + json.dumps({"
+                "'status': 'success', 'requested': 1, 'processed': 1, 'ok': 1, "
+                "'failed': 0, 'pending': 0, "
+                "'source_by_symbol': {'000001': 'A' * 700000}}, sort_keys=True))"
+            )
+            with (
+                patch.object(worker, "RESEARCH_WORKER_LOG_DIR", root / "workers"),
+                patch.object(
+                    worker,
+                    "_build_fetch_command",
+                    return_value=([sys.executable, "-c", child], 30.0, 60.0),
+                ),
+            ):
+                result = worker._run_fetch_script(
+                    pathlib.Path("scripts/fetch_stock_data.py"),
+                    asset_type="stock",
+                    config=config,
+                    time_budget=60.0,
+                    job_id="20261012T000000Z-t18scan01",
+                    target_date="2026-10-12",
+                    deadline=time.monotonic() + 60.0,
+                    symbols=None,
+                )
+
+        self.assertIsNotNone(result["summary"])
+        self.assertEqual(
+            result["summary"]["source_by_symbol"]["000001"], "A" * 700000
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["returncode"], 0)
+
+    def test_fetch_child_stdout_persisted_beyond_tail_window(self) -> None:
+        # T18 裁决 2：抓取子进程 stdout/stderr 必须持久化到
+        # logs/continuous_research/workers/<job_id>.fetch-<asset_type>*，
+        # 截断窗口只用于展示尾部，诊断时能看到完整输出。
+        with tempfile.TemporaryDirectory(
+            prefix="research-fetch-log-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            config = copy.deepcopy(DEFAULTS)
+            child = (
+                "import sys;"
+                "print(('x' * 512 + '\\n') * 1400);"
+                "print('ASSISTANT_FETCH_SUMMARY={\"status\": \"success\"}');"
+                "sys.stderr.write('child-stderr-mark\\n')"
+            )
+            with (
+                patch.object(worker, "RESEARCH_WORKER_LOG_DIR", root / "workers"),
+                patch.object(
+                    worker,
+                    "_build_fetch_command",
+                    return_value=([sys.executable, "-c", child], 30.0, 60.0),
+                ),
+            ):
+                result = worker._run_fetch_script(
+                    pathlib.Path("scripts/fetch_stock_data.py"),
+                    asset_type="stock",
+                    config=config,
+                    time_budget=60.0,
+                    job_id="20261012T000000Z-t18logs01",
+                    target_date="2026-10-12",
+                    deadline=time.monotonic() + 60.0,
+                    symbols=None,
+                )
+
+            stdout_path = root / "workers" / "20261012T000000Z-t18logs01.fetch-stock.log"
+            stderr_path = (
+                root / "workers" / "20261012T000000Z-t18logs01.fetch-stock.stderr.log"
+            )
+            self.assertTrue(stdout_path.exists())
+            self.assertTrue(stderr_path.exists())
+            self.assertGreater(stdout_path.stat().st_size, 512 * 1024)
+            head = stdout_path.read_bytes()[:20]
+            self.assertTrue(head.startswith(b"xxxx"))
+            self.assertIn(
+                "ASSISTANT_FETCH_SUMMARY=", stdout_path.read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "child-stderr-mark", stderr_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["summary"]["status"], "success")
+
+    def test_fetch_child_rc0_without_summary_reports_summary_unparsed(
+        self,
+    ) -> None:
+        # T18 裁决 3：rc==0 但汇总行不可解析是通信故障、不是抓取失败——
+        # 必须给出独立状态 summary_unparsed（连同告警日志行），由覆盖度门
+        # 决定是否放行，绝不能混同 "failed" 触发 child_failed 早退。
+        with tempfile.TemporaryDirectory(
+            prefix="research-unparsed-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "run"
+            state = FetchState(root / "state.sqlite3")
+            job_id = "20260827T000000Z-unpars01"
+            symbols = [f"{index:06d}" for index in range(21)]
+            state.register_assets("stock", symbols)
+            for symbol in symbols[:-1]:
+                state.mark_success(
+                    "stock",
+                    symbol,
+                    data_end_date="2026-08-27",
+                    source="test",
+                    rows=1,
+                    refresh_interval_seconds=86400,
+                )
+            state.create_job(
+                job_id,
+                kind="research",
+                asset_scope="stock",
+                metadata={
+                    "mode": "daily",
+                    "asset_scope": "stock",
+                    "asset_types": ["stock"],
+                    "symbols": {"stock": symbols},
+                    "full_universe": False,
+                    "target_date": "2026-08-27",
+                    "target_dates": {"stock": "2026-08-27"},
+                },
+            )
+
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(state.path)
+            config["fetch"]["max_data_age_days"] = 5
+            research_result = {
+                "run_id": job_id,
+                "status": "success",
+                "result_path": str(run_dir),
+            }
+            child = "print('fetched nothing'); print('no summary line here')"
+            stdout_buf = io.StringIO()
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"DSH_SILENT_TRACE_PATH": str(root / "silent-exceptions.log")},
+                ),
+                patch.object(worker, "RESEARCH_WORKER_LOG_DIR", root / "workers"),
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(
+                    worker,
+                    "_build_fetch_command",
+                    return_value=([sys.executable, "-c", child], 30.0, 60.0),
+                ),
+                patch.object(worker, "_run_rolling_scan"),
+                patch.object(
+                    worker,
+                    "_run_research_process",
+                    return_value=research_result,
+                ) as research,
+                contextlib.redirect_stdout(stdout_buf),
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        research.assert_called_once()
+        self.assertEqual(status["fetch_results"][0]["status"], "summary_unparsed")
+        # compact 状态只保留 dict 形态的 summary；None 不落盘（有界化惯例）。
+        self.assertNotIn("summary", status["fetch_results"][0])
+        self.assertFalse(status["fetch_gate"]["child_failed"])
+        self.assertTrue(status["fetch_gate"]["passed"])
+        self.assertIn("summary_unparsed", stdout_buf.getvalue())
+
+    def test_full_universe_cache_hit_still_builds_provider_when_source_changed(
+        self,
+    ) -> None:
+        # 2026-10-12 provider-stale-rca：重建判据原为"本轮 stock 真抓过"
+        # （代理指标）——stock 全 cache_hit 但 CSV 已被改写时 provider 停在旧
+        # 指纹（cd4a3f6c vs d16e8ec1，信号晚一个交易日）。全市场轮必须每次
+        # 调 build_qlib_data（skip_if_unchanged 在子进程内做指纹比较）。
+        with tempfile.TemporaryDirectory(
+            prefix="research-cachehit-build-",
+            dir=ROOT / "tests",
+        ) as directory:
+            root = pathlib.Path(directory)
+            run_dir = root / "run"
+            state = FetchState(root / "state.sqlite3")
+            job_id = "20261012T000000Z-t18prov"
+            symbol = "002942"
+            state.register_assets("stock", [symbol])
+            state.mark_success(
+                "stock",
+                symbol,
+                data_end_date="2026-10-12",
+                source="test",
+                rows=300,
+                refresh_interval_seconds=86400,
+            )
+            state.create_job(
+                job_id,
+                kind="research",
+                asset_scope="stock",
+                metadata={
+                    "mode": "daily",
+                    "asset_scope": "stock",
+                    "asset_types": ["stock"],
+                    "symbols": {"stock": []},
+                    "full_universe": True,
+                    "target_date": "2026-10-12",
+                    "target_dates": {"stock": "2026-10-12"},
+                },
+            )
+            config = copy.deepcopy(DEFAULTS)
+            config["fetch"]["state_db"] = str(state.path)
+            config["fetch"]["max_data_age_days"] = 5
+            research_result = {
+                "run_id": job_id,
+                "status": "success",
+                "result_path": str(run_dir),
+            }
+
+            def build_provider(command: list[str], **kwargs: Any) -> dict[str, Any]:
+                self.assertTrue(
+                    any("build_qlib_data" in str(part) for part in command)
+                )
+                progress_path = pathlib.Path(
+                    command[command.index("--progress-file") + 1]
+                )
+                progress_path.parent.mkdir(parents=True, exist_ok=True)
+                progress_path.write_text(
+                    json.dumps(
+                        {
+                            "phase": "complete",
+                            "phase_seq": 3,
+                            "completed": 1,
+                            "total": 1,
+                            "updated_at": "now",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return {
+                    "returncode": 0,
+                    "stdout": "QLIB_BUILD_SUMMARY={\"cache_hit\":false}\n",
+                    "stderr": "",
+                    "timeout_seconds": 60,
+                    "child_pid": 123,
+                    "timed_out": False,
+                }
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"DSH_SILENT_TRACE_PATH": str(root / "silent-exceptions.log")},
+                ),
+                patch.object(worker, "load_config", return_value=config),
+                patch.object(worker, "run_directory", return_value=run_dir),
+                patch.object(worker, "_run_fetch_script") as fetch,
+                patch.object(worker, "_run_rolling_scan"),
+                patch.object(
+                    worker,
+                    "_run_bounded_command",
+                    side_effect=build_provider,
+                ) as build,
+                patch.object(
+                    worker,
+                    "_run_research_process",
+                    return_value=research_result,
+                ) as research,
+            ):
+                exit_code = worker.main(["--job-id", job_id, "--time-budget", "60"])
+
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        fetch.assert_not_called()
+        build.assert_called_once()
+        research.assert_called_once()
+        self.assertEqual(status["provider_strategy"], "rebuild_if_source_changed")
+        self.assertEqual(status["qlib_build"]["cache_hit"], False)
 
 
 if __name__ == "__main__":
